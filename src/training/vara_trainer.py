@@ -125,6 +125,12 @@ class VARATrainer(ExperimentTrainer):
                 self.controller.state,
                 adaptive=adaptive_sampling and self.mode != "vanilla_pinn",
             )
+        self.run_optimizer_second_stage(
+            batch,
+            self.controller.state if local_weights_enabled else None,
+            cycle=cycles,
+            log_prefix="lbfgs_final",
+        )
         metrics = self.evaluate_and_save_final()
         metrics["J_score"] = self._j_score(metrics)
         metrics["accepted_interventions"] = self.accepted_interventions
@@ -221,6 +227,7 @@ class VARATrainer(ExperimentTrainer):
                 adaptive=accepted,
             )
 
+        self.run_optimizer_second_stage(batch, self.controller.state, cycle=cycles, log_prefix="lbfgs_final")
         metrics = self.evaluate_and_save_final()
         metrics["J_score"] = self._j_score(metrics)
         metrics["accepted_interventions"] = self.accepted_interventions
@@ -495,6 +502,7 @@ class VARATrainer(ExperimentTrainer):
         save_targeted_patch_improvement(self.local_decisions, self.local_figure_dir / "targeted_patch_improvement.png")
         save_collateral_damage_timeline(self.local_decisions, self.local_figure_dir / "collateral_damage_timeline.png")
         save_pressure_collateral_timeline(self.local_decisions, self.local_figure_dir / "pressure_collateral_timeline.png")
+        self.run_optimizer_second_stage(batch, self.local_controller.state, cycle=cycles, log_prefix="lbfgs_final")
         metrics = self.evaluate_and_save_final()
         metrics["J_score"] = self.local_controller.objective(metrics)
         metrics["accepted_interventions"] = self.accepted_interventions

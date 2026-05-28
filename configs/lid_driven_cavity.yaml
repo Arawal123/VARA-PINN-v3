@@ -25,8 +25,17 @@ model:
   activation: tanh
 
 optimizer:
-  name: adam
+  name: adam_to_lbfgs
   lr: 0.001
+  lbfgs:
+    enabled: true
+    epochs: 8
+    lr: 1.0
+    max_iter: 5
+    history_size: 25
+    line_search_fn: strong_wolfe
+    tolerance_grad: 1.0e-7
+    tolerance_change: 1.0e-9
 
 training:
   adaptive_cycles: 4
