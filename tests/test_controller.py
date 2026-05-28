@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.controllers import VARAController
+from src.controllers.patch_geometry import classify_patch
 from src.controllers.local_controller import LocalControllerConfig, LocalVARAController
 from src.diagnostics import PatchGrid, WeakRegion
 
@@ -61,3 +62,42 @@ def test_local_pair_strength_damps_after_rejection():
     controller.mark_rejected(first, {"target_local_improvement": 0.0, "max_collateral_damage": 0.0})
     second = controller.propose([wr])[0]
     assert second.strength < first.strength
+
+
+def test_default_controller_keeps_generic_action_style():
+    grid = PatchGrid(bounds=(0, 1, 0, 1), nx_patches=4, ny_patches=4)
+    wr = WeakRegion(5, "momentum_u_residual", 1.0, 0.9, grid.get_patch(5).bounds, "residual_dominant")
+    controller = LocalVARAController({"pde": 1.0}, LocalControllerConfig())
+    action = controller.propose([wr])[0]
+    assert action.action == "increase_local_momentum"
+    assert action.loss_variables == ["momentum_u", "pde"]
+    assert action.patch_type == "generic"
+    assert action.sampling_only is False
+
+
+def test_patch_classifier_labels_cavity_regions():
+    grid = PatchGrid(bounds=(0, 1, 0, 1), nx_patches=5, ny_patches=5)
+    corner = classify_patch(grid.get_patch(0).bounds)
+    lid = classify_patch(grid.get_patch(22).bounds)
+    interior = classify_patch(grid.get_patch(6).bounds, centerline_width=0.02)
+    centerline = classify_patch(grid.get_patch(12).bounds, centerline_width=0.02)
+    assert corner.patch_type == "corner"
+    assert lid.patch_type == "lid"
+    assert interior.patch_type == "interior"
+    assert centerline.patch_type == "centerline_band"
+    assert centerline.centerline_band is True
+
+
+def test_sampling_only_action_changes_priorities_not_local_weights():
+    grid = PatchGrid(bounds=(0, 1, 0, 1), nx_patches=4, ny_patches=4)
+    wr = WeakRegion(5, "centerline_pde_residual", 1.0, 1.0, grid.get_patch(5).bounds, "centerline_residual")
+    controller = LocalVARAController(
+        {"pde": 1.0},
+        LocalControllerConfig.from_dict({"benchmark": "lid_driven_cavity", "patch_type_aware": True}),
+    )
+    action = controller.propose([wr])[0]
+    before_weights = {k: dict(v) for k, v in controller.state.local_weights.items()}
+    controller.apply([action])
+    assert action.sampling_only is True
+    assert controller.state.local_weights == before_weights
+    assert controller.state.sampling_priorities[action.patch_id] > 0.0

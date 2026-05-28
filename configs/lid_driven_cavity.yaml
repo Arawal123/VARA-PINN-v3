@@ -100,7 +100,12 @@ local_controller:
   corner_boundary_hard_tolerance: 0.005
   u_boundary_hard_tolerance: 0.005
   v_boundary_hard_tolerance: 0.005
-  trial_epochs: 10
+  trial_epochs: 15
+  patch_type_aware: true
+  interior_trial_epochs: 15
+  wall_trial_epochs: 10
+  corner_trial_epochs: 5
+  sampling_only_trial_epochs: 5
   max_actions_per_cycle: 3
   initial_strength: 0.30
   damping_factor: 0.5
@@ -109,6 +114,10 @@ local_controller:
   strong_target_factor: 2.0
   wall_patch_strength_factor: 0.70
   corner_patch_strength_factor: 0.50
+  interior_pde_strength_factor: 1.15
+  centerline_patch_strength_factor: 1.0
+  strict_wall_boundary_acceptance: true
+  wall_boundary_worsen_tolerance: 0.0
   boundary_patch_margin: 1.0e-9
   rejection_recovery_epochs: 10
   local_velocity_weight_max: 1.5
@@ -141,6 +150,14 @@ sampling:
     lid_fraction: 0.45
     corner_fraction: 0.25
     corner_width: 0.12
+  cavity_focus:
+    enabled: true
+    near_wall_fraction: 0.12
+    centerline_fraction: 0.10
+    lid_fraction: 0.06
+    corner_fraction: 0.04
+    strip_width: 0.08
+    centerline_width: 0.04
 
 experiments:
   root: experiments

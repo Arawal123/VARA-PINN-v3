@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -151,9 +151,9 @@ class ExperimentTrainer:
         n_f = int(train_cfg.get("n_collocation", 1024))
         n_bc = int(train_cfg.get("n_boundary", 256))
         n_data = int(train_cfg.get("n_data", 256))
-        xy_f = self.uniform_sampler.sample(n_f)
+        xy_f = self._sample_interior(n_f)
         xy_bc = self._sample_boundary(n_bc)
-        xy_data = self.uniform_sampler.sample(n_data)
+        xy_data = self._sample_interior(n_data)
         return self.make_batch(xy_f, xy_bc, xy_data)
 
     def _sample_boundary_numpy(self, n: int) -> np.ndarray:
@@ -169,6 +169,114 @@ class ExperimentTrainer:
 
     def _sample_boundary(self, n: int) -> torch.Tensor:
         return torch.tensor(self._sample_boundary_numpy(n), dtype=torch.float32, device=self.device)
+
+    def _sample_interior(self, n: int) -> torch.Tensor:
+        return self._sample_cavity_focused_interior(n, self.uniform_sampler.sample)
+
+    def _sample_cavity_focused_interior(self, n: int, base_sampler: Callable[[int], torch.Tensor]) -> torch.Tensor:
+        if n <= 0:
+            return torch.zeros((0, 2), dtype=torch.float32, device=self.device)
+        focus_cfg = self.config.get("sampling", {}).get("cavity_focus", {})
+        if not (self._is_lid_driven_cavity() and bool(focus_cfg.get("enabled", False))):
+            return base_sampler(n)
+
+        near_wall_fraction = float(focus_cfg.get("near_wall_fraction", 0.12))
+        centerline_fraction = float(focus_cfg.get("centerline_fraction", 0.10))
+        lid_fraction = float(focus_cfg.get("lid_fraction", 0.06))
+        corner_fraction = float(focus_cfg.get("corner_fraction", 0.04))
+        fractions = np.clip(
+            np.array([near_wall_fraction, centerline_fraction, lid_fraction, corner_fraction], dtype=float),
+            0.0,
+            1.0,
+        )
+        total_focus = float(np.sum(fractions))
+        if total_focus > 0.70:
+            fractions *= 0.70 / total_focus
+        counts = np.floor(fractions * n).astype(int)
+        n_base = max(0, n - int(np.sum(counts)))
+        pieces = [base_sampler(n_base).detach().cpu().numpy()]
+        strip_width = float(focus_cfg.get("strip_width", 0.08))
+        centerline_width = float(focus_cfg.get("centerline_width", 0.04))
+        pieces.append(self._sample_near_wall_strip_numpy(int(counts[0]), strip_width))
+        pieces.append(self._sample_centerline_band_numpy(int(counts[1]), centerline_width))
+        pieces.append(self._sample_lid_strip_numpy(int(counts[2]), strip_width))
+        pieces.append(self._sample_corner_strip_numpy(int(counts[3]), strip_width))
+        out = np.vstack([piece for piece in pieces if piece.size])
+        if out.shape[0] < n:
+            out = np.vstack([out, base_sampler(n - out.shape[0]).detach().cpu().numpy()])
+        elif out.shape[0] > n:
+            out = out[:n]
+        self.uniform_sampler.rng.shuffle(out)
+        return torch.tensor(out, dtype=torch.float32, device=self.device)
+
+    def _sample_near_wall_strip_numpy(self, n: int, strip_width: float) -> np.ndarray:
+        if n <= 0:
+            return np.zeros((0, 2), dtype=float)
+        x0, x1, y0, y1 = self.benchmark.bounds
+        span = min(max(x1 - x0, 1e-12), max(y1 - y0, 1e-12))
+        w = min(max(float(strip_width) * span, 1e-9), 0.5 * span)
+        sides = self.uniform_sampler.rng.integers(0, 4, n)
+        pts = np.zeros((n, 2), dtype=float)
+        for i, side in enumerate(sides):
+            if side == 0:
+                pts[i] = [self.uniform_sampler.rng.uniform(x0, x0 + w), self.uniform_sampler.rng.uniform(y0, y1)]
+            elif side == 1:
+                pts[i] = [self.uniform_sampler.rng.uniform(x1 - w, x1), self.uniform_sampler.rng.uniform(y0, y1)]
+            elif side == 2:
+                pts[i] = [self.uniform_sampler.rng.uniform(x0, x1), self.uniform_sampler.rng.uniform(y0, y0 + w)]
+            else:
+                pts[i] = [self.uniform_sampler.rng.uniform(x0, x1), self.uniform_sampler.rng.uniform(y1 - w, y1)]
+        return pts
+
+    def _sample_centerline_band_numpy(self, n: int, centerline_width: float) -> np.ndarray:
+        if n <= 0:
+            return np.zeros((0, 2), dtype=float)
+        x0, x1, y0, y1 = self.benchmark.bounds
+        span = min(max(x1 - x0, 1e-12), max(y1 - y0, 1e-12))
+        w = min(max(float(centerline_width) * span, 1e-9), 0.5 * span)
+        x_mid = 0.5 * (x0 + x1)
+        y_mid = 0.5 * (y0 + y1)
+        vertical = self.uniform_sampler.rng.random(n) < 0.5
+        pts = np.zeros((n, 2), dtype=float)
+        v_count = int(np.sum(vertical))
+        h_count = n - v_count
+        pts[vertical, 0] = self.uniform_sampler.rng.uniform(max(x0, x_mid - w), min(x1, x_mid + w), v_count)
+        pts[vertical, 1] = self.uniform_sampler.rng.uniform(y0, y1, v_count)
+        pts[~vertical, 0] = self.uniform_sampler.rng.uniform(x0, x1, h_count)
+        pts[~vertical, 1] = self.uniform_sampler.rng.uniform(max(y0, y_mid - w), min(y1, y_mid + w), h_count)
+        return pts
+
+    def _sample_lid_strip_numpy(self, n: int, strip_width: float) -> np.ndarray:
+        if n <= 0:
+            return np.zeros((0, 2), dtype=float)
+        x0, x1, y0, y1 = self.benchmark.bounds
+        span = min(max(x1 - x0, 1e-12), max(y1 - y0, 1e-12))
+        w = min(max(float(strip_width) * span, 1e-9), y1 - y0)
+        return np.column_stack(
+            [
+                self.uniform_sampler.rng.uniform(x0, x1, n),
+                self.uniform_sampler.rng.uniform(max(y0, y1 - w), y1, n),
+            ]
+        )
+
+    def _sample_corner_strip_numpy(self, n: int, strip_width: float) -> np.ndarray:
+        if n <= 0:
+            return np.zeros((0, 2), dtype=float)
+        x0, x1, y0, y1 = self.benchmark.bounds
+        span = min(max(x1 - x0, 1e-12), max(y1 - y0, 1e-12))
+        w = min(max(float(strip_width) * span, 1e-9), 0.5 * span)
+        corners = self.uniform_sampler.rng.integers(0, 4, n)
+        pts = np.zeros((n, 2), dtype=float)
+        for i, corner in enumerate(corners):
+            if corner == 0:
+                pts[i] = [self.uniform_sampler.rng.uniform(x0, x0 + w), self.uniform_sampler.rng.uniform(y0, y0 + w)]
+            elif corner == 1:
+                pts[i] = [self.uniform_sampler.rng.uniform(x1 - w, x1), self.uniform_sampler.rng.uniform(y0, y0 + w)]
+            elif corner == 2:
+                pts[i] = [self.uniform_sampler.rng.uniform(x0, x0 + w), self.uniform_sampler.rng.uniform(y1 - w, y1)]
+            else:
+                pts[i] = [self.uniform_sampler.rng.uniform(x1 - w, x1), self.uniform_sampler.rng.uniform(y1 - w, y1)]
+        return pts
 
     def _is_lid_driven_cavity(self) -> bool:
         return str(self.config.get("benchmark", "")).lower() in {"lid_driven_cavity", "cavity"}
@@ -281,11 +389,17 @@ class ExperimentTrainer:
         n_data = int(train_cfg.get("n_data", batch["xy_data"].shape[0]))
         if adaptive:
             priorities = control_state.sampling_priorities if control_state is not None else {}
-            xy_f = self.adaptive_sampler.sample_interior(n_f, maps, coords, weak_regions, priorities)
-            xy_data = self.adaptive_sampler.sample_interior(n_data, maps, coords, weak_regions, priorities)
+            xy_f = self._sample_cavity_focused_interior(
+                n_f,
+                lambda count: self.adaptive_sampler.sample_interior(count, maps, coords, weak_regions, priorities),
+            )
+            xy_data = self._sample_cavity_focused_interior(
+                n_data,
+                lambda count: self.adaptive_sampler.sample_interior(count, maps, coords, weak_regions, priorities),
+            )
         else:
-            xy_f = self.uniform_sampler.sample(n_f)
-            xy_data = self.uniform_sampler.sample(n_data)
+            xy_f = self._sample_interior(n_f)
+            xy_data = self._sample_interior(n_data)
         xy_bc = self._sample_boundary(n_bc)
         return self.make_batch(xy_f, xy_bc, xy_data)
 
