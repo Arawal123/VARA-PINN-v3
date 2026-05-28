@@ -179,3 +179,106 @@ def test_cavity_wall_and_corner_strength_scaling():
     wr = WeakRegion(corner.patch_id, corner.variable, 1.0, 1.0, corner.bounds, "corner")
     action = controller.propose([wr])[0]
     assert action.strength == 0.25
+
+
+def test_patch_type_config_fields_load():
+    config = LocalControllerConfig.from_dict(
+        {
+            "benchmark": "lid_driven_cavity",
+            "patch_type_aware": True,
+            "domain_bounds": [0.0, 1.0, 0.0, 1.0],
+            "interior_trial_epochs": 20,
+            "wall_trial_epochs": 10,
+            "corner_trial_epochs": 5,
+            "sampling_only_trial_epochs": 7,
+            "near_wall_width": 0.08,
+            "centerline_band_width": 0.04,
+        }
+    )
+    assert config.patch_type_aware is True
+    assert config.benchmark == "lid_driven_cavity"
+    assert config.interior_trial_epochs == 20
+    assert config.wall_trial_epochs == 10
+    assert config.corner_trial_epochs == 5
+    assert config.sampling_only_trial_epochs == 7
+    assert config.near_wall_width == 0.08
+    assert config.centerline_band_width == 0.04
+
+
+def test_cavity_corner_patch_prefers_sampling_and_damps_strength():
+    from src.diagnostics import PatchGrid, WeakRegion
+
+    grid = PatchGrid(bounds=(0, 1, 0, 1), nx_patches=4, ny_patches=4)
+    controller = LocalVARAController(
+        initial_weights={},
+        config=LocalControllerConfig.from_dict(
+            {
+                "benchmark": "lid_driven_cavity",
+                "patch_type_aware": True,
+                "initial_strength": 1.0,
+                "wall_patch_strength_factor": 0.5,
+                "corner_patch_strength_factor": 0.4,
+            }
+        ),
+    )
+    wr = WeakRegion(0, "corner_pde_residual", 1.0, 1.0, grid.get_patch(0).bounds, "corner")
+    action = controller.propose([wr])[0]
+    assert action.patch_type == "corner"
+    assert action.action == "increase_local_corner_sampling"
+    assert action.sampling_only is True
+    assert action.strength == 0.2
+
+
+def test_cavity_wall_patch_rejects_boundary_worsening():
+    controller = LocalVARAController(
+        initial_weights={},
+        config=LocalControllerConfig.from_dict(
+            {
+                "benchmark": "lid_driven_cavity",
+                "patch_type_aware": True,
+                "min_improvement": 0.01,
+                "objective_weights": {"residual": 1.0, "boundary": 0.0, "u_boundary": 0.0},
+                "strict_wall_boundary_acceptance": True,
+                "wall_boundary_worsen_tolerance": 0.0,
+            }
+        ),
+    )
+    intervention = LocalIntervention(
+        variable="boundary_violation",
+        patch_id=0,
+        action="increase_local_boundary",
+        loss_variables=["bc"],
+        strength=0.5,
+        severity=1.0,
+        confidence=1.0,
+        bounds=(0.75, 1.0, 0.75, 1.0, None, None),
+        patch_type="lid",
+        action_family="boundary",
+    )
+    before_scores = np.array([[1.0]])
+    after_scores = np.array([[0.8]])
+    before_metrics = {
+        "pde_residual_mean": 1.0,
+        "boundary_condition_error": 1.0,
+        "u_boundary_rmse": 1.0,
+        "v_boundary_rmse": 1.0,
+        "unweighted_validation_loss": 1.0,
+    }
+    after_metrics = {
+        "pde_residual_mean": 0.8,
+        "boundary_condition_error": 1.01,
+        "u_boundary_rmse": 1.0,
+        "v_boundary_rmse": 1.0,
+        "unweighted_validation_loss": 0.8,
+    }
+    accepted, decision = controller.evaluate_acceptance(
+        [intervention],
+        before_scores,
+        after_scores,
+        ["boundary_violation"],
+        before_metrics,
+        after_metrics,
+        constrained=True,
+    )
+    assert accepted is False
+    assert decision["strict_wall_boundary_damage"] > 0.0

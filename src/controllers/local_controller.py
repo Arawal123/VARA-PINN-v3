@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .actions import TrainingControlState
+from .patch_geometry import PatchClassification, classify_patch
 
 
 METRIC_BY_DIAGNOSTIC = {
@@ -27,6 +28,19 @@ METRIC_BY_DIAGNOSTIC = {
     "corner_boundary_error": "corner_boundary_error",
     "boundary_violation": "boundary_condition_error",
 }
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _domain_bounds(value: Any) -> tuple[float, float, float, float]:
+    seq = list(value) if isinstance(value, (list, tuple)) else [0.0, 1.0, 0.0, 1.0]
+    if len(seq) < 4:
+        seq = [0.0, 1.0, 0.0, 1.0]
+    return (float(seq[0]), float(seq[1]), float(seq[2]), float(seq[3]))
 
 
 @dataclass
@@ -63,6 +77,20 @@ class LocalControllerConfig:
     boundary_patch_margin: float = 1e-9
     rejection_recovery_epochs: int = 0
     warmup_cycles: int = 0
+    benchmark: str = ""
+    patch_type_aware: bool = False
+    domain_bounds: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
+    near_wall_width: float = 0.10
+    centerline_band_width: float = 0.06
+    interior_pde_strength_factor: float = 1.15
+    centerline_patch_strength_factor: float = 1.0
+    sampling_only_confidence_threshold: float = 0.35
+    interior_trial_epochs: int | None = None
+    wall_trial_epochs: int | None = None
+    corner_trial_epochs: int | None = None
+    sampling_only_trial_epochs: int | None = None
+    strict_wall_boundary_acceptance: bool = True
+    wall_boundary_worsen_tolerance: float = 0.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "LocalControllerConfig":
@@ -98,6 +126,20 @@ class LocalControllerConfig:
             boundary_patch_margin=float(data.get("boundary_patch_margin", 1e-9)),
             rejection_recovery_epochs=int(data.get("rejection_recovery_epochs", 0)),
             warmup_cycles=int(data.get("warmup_cycles", 0)),
+            benchmark=str(data.get("benchmark", "")),
+            patch_type_aware=bool(data.get("patch_type_aware", False)),
+            domain_bounds=_domain_bounds(data.get("domain_bounds", (0.0, 1.0, 0.0, 1.0))),
+            near_wall_width=float(data.get("near_wall_width", data.get("strip_width", 0.10))),
+            centerline_band_width=float(data.get("centerline_band_width", data.get("centerline_width", 0.06))),
+            interior_pde_strength_factor=float(data.get("interior_pde_strength_factor", 1.15)),
+            centerline_patch_strength_factor=float(data.get("centerline_patch_strength_factor", 1.0)),
+            sampling_only_confidence_threshold=float(data.get("sampling_only_confidence_threshold", 0.35)),
+            interior_trial_epochs=_optional_int(data.get("interior_trial_epochs")),
+            wall_trial_epochs=_optional_int(data.get("wall_trial_epochs")),
+            corner_trial_epochs=_optional_int(data.get("corner_trial_epochs")),
+            sampling_only_trial_epochs=_optional_int(data.get("sampling_only_trial_epochs")),
+            strict_wall_boundary_acceptance=bool(data.get("strict_wall_boundary_acceptance", True)),
+            wall_boundary_worsen_tolerance=float(data.get("wall_boundary_worsen_tolerance", 0.0)),
         )
 
     @property
@@ -128,6 +170,13 @@ class LocalIntervention:
     severity: float
     confidence: float
     bounds: tuple[float, float, float, float, float | None, float | None]
+    patch_type: str = "generic"
+    action_family: str = "local_weight"
+    sampling_only: bool = False
+    near_wall: bool = False
+    centerline_band: bool = False
+    patch_tags: tuple[str, ...] = ()
+    trial_epochs: int | None = None
 
     def to_record(self) -> dict[str, Any]:
         return asdict(self)
@@ -166,13 +215,13 @@ class LocalVARAController:
         interventions: list[LocalIntervention] = []
         seen: set[tuple[str, int, str]] = set()
         for region in weak_regions:
-            action, loss_variables = self._action_for_variable(region.variable)
+            action, loss_variables, action_family, sampling_only, patch_class = self._action_for_region(region)
             key = (region.variable, int(region.patch_id), action)
             if key in seen:
                 continue
             seen.add(key)
             strength = self._strength(region.variable, int(region.patch_id), float(region.confidence))
-            strength *= self._geometry_strength_factor(region.bounds)
+            strength *= self._geometry_strength_factor(region.bounds, patch_class)
             interventions.append(
                 LocalIntervention(
                     variable=region.variable,
@@ -183,16 +232,25 @@ class LocalVARAController:
                     severity=float(region.severity),
                     confidence=float(region.confidence),
                     bounds=region.bounds,
+                    patch_type=patch_class.patch_type,
+                    action_family=action_family,
+                    sampling_only=sampling_only,
+                    near_wall=patch_class.near_wall,
+                    centerline_band=patch_class.centerline_band,
+                    patch_tags=patch_class.tags,
                 )
             )
             if len(interventions) >= self.config.max_actions_per_cycle:
                 break
+        for intervention in interventions:
+            intervention.trial_epochs = self.trial_epochs_for(intervention)
         return interventions
 
     def apply(self, interventions: list[LocalIntervention]) -> None:
         for intervention in interventions:
-            for loss_variable in intervention.loss_variables:
-                self._bump_local(loss_variable, intervention.patch_id, intervention.strength)
+            if not intervention.sampling_only:
+                for loss_variable in intervention.loss_variables:
+                    self._bump_local(loss_variable, intervention.patch_id, intervention.strength)
             self.state.sampling_priorities[intervention.patch_id] = (
                 self.state.sampling_priorities.get(intervention.patch_id, 0.0) + intervention.strength
             )
@@ -238,9 +296,11 @@ class LocalVARAController:
             metrics["J_after"] <= metrics["J_before"] * (1.0 + self.config.tiny_j_tolerance)
             and target_improvement >= self.config.min_improvement * self.config.strong_target_factor
         )
+        strict_patch_ok = self._strict_patch_acceptance_ok(interventions, metrics)
         accepted = (
             target_improvement >= self.config.min_improvement
             and (j_ok or tiny_j_ok)
+            and strict_patch_ok
             and metrics["max_collateral_damage"] <= self.config.collateral_tolerance
             and metrics["pressure_collateral_damage"] <= self.config.pressure_collateral_tolerance
             and metrics["continuity_collateral_damage"] <= self.config.continuity_collateral_tolerance
@@ -286,6 +346,32 @@ class LocalVARAController:
             patches.update(int(pid) for pid in weights)
         return patches
 
+    def trial_epochs_for(self, intervention: LocalIntervention | None) -> int:
+        """Return patch/action-specific trial length while preserving generic defaults."""
+        if intervention is None or not self._patch_type_policy_enabled():
+            return int(self.config.trial_epochs)
+        if intervention.sampling_only:
+            return int(self.config.sampling_only_trial_epochs or self.config.trial_epochs)
+        if intervention.patch_type == "corner":
+            return int(self.config.corner_trial_epochs or self.config.trial_epochs)
+        if intervention.patch_type in {"lid", "sidewall", "bottom_wall"} or intervention.near_wall:
+            return int(self.config.wall_trial_epochs or self.config.trial_epochs)
+        return int(self.config.interior_trial_epochs or self.config.trial_epochs)
+
+    def classify_patch(
+        self,
+        bounds: tuple[float, float, float, float, float | None, float | None],
+    ) -> PatchClassification:
+        if not self._patch_type_policy_enabled():
+            return PatchClassification("generic", False, False, ("generic",))
+        return classify_patch(
+            bounds,
+            domain_bounds=self.config.domain_bounds,
+            near_wall_width=self.config.near_wall_width,
+            centerline_width=self.config.centerline_band_width,
+            boundary_margin=self.config.boundary_patch_margin,
+        )
+
     def _bump_local(self, variable: str, patch_id: int, amount: float) -> None:
         cap = self.config.caps.get(variable, self.config.local_pde_weight_max)
         self.state.local_weights.setdefault(variable, {})
@@ -305,6 +391,42 @@ class LocalVARAController:
         if key not in self.pair_state:
             self.pair_state[key] = LocalPairState(strength=float(self.config.initial_strength))
         return self.pair_state[key]
+
+    def _patch_type_policy_enabled(self) -> bool:
+        return bool(self.config.patch_type_aware) and self.config.benchmark.lower() in {"lid_driven_cavity", "cavity"}
+
+    def _action_for_region(self, region: object) -> tuple[str, list[str], str, bool, PatchClassification]:
+        patch_class = self.classify_patch(region.bounds)
+        if not self._patch_type_policy_enabled():
+            action, loss_variables = self._action_for_variable(region.variable)
+            return action, loss_variables, self._action_family(action), False, patch_class
+        return self._cavity_action_for_region(region.variable, float(region.confidence), patch_class)
+
+    def _cavity_action_for_region(
+        self,
+        variable: str,
+        confidence: float,
+        patch_class: PatchClassification,
+    ) -> tuple[str, list[str], str, bool, PatchClassification]:
+        patch_type = patch_class.patch_type
+        if patch_type == "corner":
+            return "increase_local_corner_sampling", [], "sampling", True, patch_class
+        if patch_type == "lid":
+            if "boundary" in variable:
+                return "increase_local_boundary", ["bc"], "boundary", False, patch_class
+            return "increase_local_boundary_sampling", [], "sampling", True, patch_class
+        if patch_type in {"sidewall", "bottom_wall"}:
+            if "boundary" in variable:
+                return "increase_local_boundary", ["bc"], "boundary", False, patch_class
+            return "increase_local_boundary_sampling", [], "sampling", True, patch_class
+        if patch_class.centerline_band and "centerline" in variable:
+            return "increase_local_centerline_sampling", [], "sampling", True, patch_class
+        if confidence < self.config.sampling_only_confidence_threshold and (
+            "pde" in variable or "momentum" in variable or "continuity" in variable
+        ):
+            return "increase_local_sampling", [], "sampling", True, patch_class
+        action, loss_variables = self._action_for_variable(variable)
+        return action, loss_variables, self._action_family(action), False, patch_class
 
     def _action_for_variable(self, variable: str) -> tuple[str, list[str]]:
         if "u_error" in variable:
@@ -332,6 +454,23 @@ class LocalVARAController:
         if "boundary" in variable:
             return "increase_local_boundary", ["bc"]
         return "increase_local_pde", ["pde"]
+
+    def _action_family(self, action: str) -> str:
+        if "sampling" in action:
+            return "sampling"
+        if "boundary" in action:
+            return "boundary"
+        if "momentum" in action:
+            return "momentum"
+        if "divergence" in action:
+            return "continuity"
+        if "pressure" in action:
+            return "pressure"
+        if "velocity" in action:
+            return "velocity"
+        if "vorticity" in action:
+            return "vorticity"
+        return "pde"
 
     def _target_improvement(
         self,
@@ -396,6 +535,17 @@ class LocalVARAController:
             "u_boundary": self._relative_damage(before_metrics, after_metrics, "u_boundary_rmse"),
             "v_boundary": self._relative_damage(before_metrics, after_metrics, "v_boundary_rmse"),
         }
+        wall_boundary_damage = 0.0
+        lid_u_boundary_damage = 0.0
+        corner_wall_damage = 0.0
+        if self._patch_type_policy_enabled():
+            wall_types = {"lid", "sidewall", "bottom_wall", "corner"}
+            if any(intervention.patch_type in wall_types for intervention in interventions):
+                wall_boundary_damage = max(hard_damages["boundary"], hard_damages["u_boundary"], hard_damages["v_boundary"])
+            if any(intervention.patch_type == "lid" for intervention in interventions):
+                lid_u_boundary_damage = max(hard_damages["boundary"], hard_damages["u_boundary"])
+            if any(intervention.patch_type == "corner" for intervention in interventions):
+                corner_wall_damage = max(hard_damages["boundary"], hard_damages["corner_boundary"])
         return {
             "target_local_improvement": float(target_improvement),
             "J_before": self.objective(before_metrics),
@@ -412,7 +562,26 @@ class LocalVARAController:
             "corner_boundary_hard_damage": hard_damages["corner_boundary"],
             "u_boundary_hard_damage": hard_damages["u_boundary"],
             "v_boundary_hard_damage": hard_damages["v_boundary"],
+            "strict_wall_boundary_damage": float(wall_boundary_damage),
+            "strict_lid_u_boundary_damage": float(lid_u_boundary_damage),
+            "strict_corner_boundary_damage": float(corner_wall_damage),
         }
+
+    def _strict_patch_acceptance_ok(self, interventions: list[LocalIntervention], metrics: dict[str, Any]) -> bool:
+        if not (self._patch_type_policy_enabled() and self.config.strict_wall_boundary_acceptance):
+            return True
+        tolerance = float(self.config.wall_boundary_worsen_tolerance)
+        wall_types = {"lid", "sidewall", "bottom_wall", "corner"}
+        if any(intervention.patch_type in wall_types for intervention in interventions):
+            if float(metrics.get("strict_wall_boundary_damage", 0.0)) > tolerance:
+                return False
+        if any(intervention.patch_type == "lid" for intervention in interventions):
+            if float(metrics.get("strict_lid_u_boundary_damage", 0.0)) > tolerance:
+                return False
+        if any(intervention.patch_type == "corner" for intervention in interventions):
+            if float(metrics.get("strict_corner_boundary_damage", 0.0)) > tolerance:
+                return False
+        return True
 
     def _relative_damage(self, before_metrics: dict[str, float], after_metrics: dict[str, float], name: str) -> float:
         before = self._metric(before_metrics, name)
@@ -421,7 +590,23 @@ class LocalVARAController:
             return 0.0
         return float(max(0.0, (after - before) / (abs(before) + 1e-12)))
 
-    def _geometry_strength_factor(self, bounds: tuple[float, float, float, float, float | None, float | None]) -> float:
+    def _geometry_strength_factor(
+        self,
+        bounds: tuple[float, float, float, float, float | None, float | None],
+        patch_class: PatchClassification | None = None,
+    ) -> float:
+        if self._patch_type_policy_enabled() and patch_class is not None:
+            factor = 1.0
+            if patch_class.patch_type == "centerline_band":
+                factor *= float(self.config.centerline_patch_strength_factor)
+            elif patch_class.patch_type == "interior":
+                factor *= float(self.config.interior_pde_strength_factor)
+            if patch_class.patch_type == "corner":
+                factor *= float(self.config.wall_patch_strength_factor)
+                factor *= float(self.config.corner_patch_strength_factor)
+            elif patch_class.patch_type in {"lid", "sidewall", "bottom_wall"} or patch_class.near_wall:
+                factor *= float(self.config.wall_patch_strength_factor)
+            return max(1e-4, float(factor))
         if not bounds:
             return 1.0
         x0, x1, y0, y1 = (float(bounds[i]) for i in range(4))

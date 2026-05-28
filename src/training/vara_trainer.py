@@ -66,9 +66,16 @@ class VARATrainer(ExperimentTrainer):
         self.rejected_interventions = 0
         self.rollback_count = 0
         self._last_decision: dict[str, Any] | None = None
+        local_controller_cfg = dict(config.get("local_controller", {}))
+        local_controller_cfg.setdefault("benchmark", config.get("benchmark", ""))
+        local_controller_cfg.setdefault("domain_bounds", list(self.benchmark.bounds))
+        cavity_focus_cfg = config.get("sampling", {}).get("cavity_focus", {})
+        if cavity_focus_cfg:
+            local_controller_cfg.setdefault("near_wall_width", cavity_focus_cfg.get("strip_width", 0.10))
+            local_controller_cfg.setdefault("centerline_band_width", cavity_focus_cfg.get("centerline_width", 0.06))
         self.local_controller = LocalVARAController(
             initial_weights=config.get("training", {}).get("weights", {}),
-            config=LocalControllerConfig.from_dict(config.get("local_controller", {})),
+            config=LocalControllerConfig.from_dict(local_controller_cfg),
         )
         self.local_patch_score_logger = CSVLogger(self.run_dir / "patch_scores.csv")
         self.local_action_logger = JSONListLogger(self.run_dir / "local_actions.json")
@@ -318,13 +325,16 @@ class VARATrainer(ExperimentTrainer):
                     old_local_weights = deepcopy(controller_snapshot["local_weights"])
                     old_sampling = deepcopy(controller_snapshot["sampling_priorities"])
                     strength_before = self._pair_strength(intervention.variable, intervention.patch_id)
+                    candidate_trial_epochs = self.local_controller.trial_epochs_for(intervention)
 
                     self.local_controller.apply([intervention])
+                    proposed_local_weights = deepcopy(self.local_controller.state.local_weights)
+                    proposed_sampling = deepcopy(self.local_controller.state.sampling_priorities)
                     self.train_epochs(
                         batch,
                         self.local_controller.state,
                         cycle=cycle,
-                        epochs_override=trial_epochs,
+                        epochs_override=candidate_trial_epochs,
                         log_prefix=f"local_trial_{candidate_id}",
                     )
                     _, _, raw_candidate_after, _, _, _, _, coords_candidate_after = self._diagnose_local(
@@ -387,12 +397,19 @@ class VARATrainer(ExperimentTrainer):
                         rejection_reason=rejection_reason,
                         strength_before=strength_before,
                         strength_after=strength_after,
+                        trial_epochs=candidate_trial_epochs,
                     )
                     self.local_controller.record_decision([intervention], decision)
                     self.local_decisions.append(decision)
                     action_record = intervention.to_record()
                     action_record["candidate_id"] = candidate_id
                     action_record["accepted"] = bool(accepted)
+                    action_record["local_weights_before"] = old_local_weights
+                    action_record["local_weights_after"] = proposed_local_weights
+                    action_record["kept_local_weights_after"] = deepcopy(self.local_controller.state.local_weights)
+                    action_record["sampling_priorities_before"] = old_sampling
+                    action_record["sampling_priorities_after"] = proposed_sampling
+                    action_record["kept_sampling_priorities_after"] = deepcopy(self.local_controller.state.sampling_priorities)
                     cycle_action_records.append(action_record)
                     self.local_action_logger.log(
                         {"cycle": cycle, "mode": self.mode, "candidate_id": candidate_id, "actions": [action_record], "decision": decision}
@@ -428,7 +445,14 @@ class VARATrainer(ExperimentTrainer):
                 )[1]
                 self.accepted_interventions += len(interventions)
                 accepted_interventions = list(interventions)
-                action_records = [intervention.to_record() for intervention in interventions]
+                action_records = []
+                for intervention in interventions:
+                    action_record = intervention.to_record()
+                    action_record["local_weights_before"] = old_local_weights
+                    action_record["local_weights_after"] = deepcopy(self.local_controller.state.local_weights)
+                    action_record["sampling_priorities_before"] = old_sampling
+                    action_record["sampling_priorities_after"] = deepcopy(self.local_controller.state.sampling_priorities)
+                    action_records.append(action_record)
                 cycle_action_records.extend(action_records)
                 decision = self._build_local_decision(
                     cycle=cycle,
@@ -487,7 +511,7 @@ class VARATrainer(ExperimentTrainer):
     def _validation_metrics(self, coords: np.ndarray) -> dict[str, float]:
         from src.evaluation.metrics import evaluate_on_grid
 
-        return evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        return evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady, include_profile_reference=False)
 
     def _diagnose_local(
         self,
@@ -554,6 +578,7 @@ class VARATrainer(ExperimentTrainer):
         rejection_reason: str = "",
         strength_before: float | None = None,
         strength_after: float | None = None,
+        trial_epochs: int | None = None,
     ) -> dict[str, Any]:
         target_before, target_after = self._target_patch_scores(interventions, raw_before, raw_after, diagnostic_names)
         first = interventions[0] if interventions else None
@@ -568,14 +593,25 @@ class VARATrainer(ExperimentTrainer):
             "rejection_reason": rejection_reason,
             "variable": first.variable if first is not None else "",
             "patch_id": first.patch_id if first is not None else None,
+            "patch_type": first.patch_type if first is not None else "",
+            "action_family": first.action_family if first is not None else "",
+            "sampling_only": bool(first.sampling_only) if first is not None else False,
+            "near_wall": bool(first.near_wall) if first is not None else False,
+            "centerline_band": bool(first.centerline_band) if first is not None else False,
+            "trial_epochs": trial_epochs,
             "selected_pairs": [intervention.to_record() for intervention in interventions],
             "targeted_variables": [intervention.variable for intervention in interventions],
             "targeted_patches": [intervention.patch_id for intervention in interventions],
+            "targeted_patch_types": [intervention.patch_type for intervention in interventions],
+            "action_families": [intervention.action_family for intervention in interventions],
+            "sampling_only_actions": [bool(intervention.sampling_only) for intervention in interventions],
             "active_patches": sorted(self.local_controller.active_patches()),
             "local_weights_before": old_local_weights,
             "local_weights_after": deepcopy(self.local_controller.state.local_weights),
             "sampling_before": old_sampling,
             "sampling_after": deepcopy(self.local_controller.state.sampling_priorities),
+            "sampling_priorities_before": old_sampling,
+            "sampling_priorities_after": deepcopy(self.local_controller.state.sampling_priorities),
             "action_type": ",".join(intervention.action for intervention in interventions),
             "intervention_strength": max([intervention.strength for intervention in interventions], default=0.0),
             "strength_before": strength_before,
@@ -642,6 +678,10 @@ class VARATrainer(ExperimentTrainer):
             "candidate_id": decision.get("candidate_id"),
             "variable": decision.get("variable"),
             "patch_id": decision.get("patch_id"),
+            "patch_type": decision.get("patch_type"),
+            "action_family": decision.get("action_family"),
+            "sampling_only": decision.get("sampling_only"),
+            "trial_epochs": decision.get("trial_epochs"),
             "accepted": decision["accepted"],
             "rejected": decision["rejected"],
             "rollback_triggered": decision["rollback_triggered"],
@@ -701,6 +741,9 @@ class VARATrainer(ExperimentTrainer):
             "corner_boundary_hard_damage": decision.get("corner_boundary_hard_damage"),
             "u_boundary_hard_damage": decision.get("u_boundary_hard_damage"),
             "v_boundary_hard_damage": decision.get("v_boundary_hard_damage"),
+            "strict_wall_boundary_damage": decision.get("strict_wall_boundary_damage"),
+            "strict_lid_u_boundary_damage": decision.get("strict_lid_u_boundary_damage"),
+            "strict_corner_boundary_damage": decision.get("strict_corner_boundary_damage"),
         }
 
     def _log_local_weights(self, cycle: int) -> None:
@@ -726,19 +769,25 @@ class VARATrainer(ExperimentTrainer):
         n_bc = int(train_cfg.get("n_boundary", 256))
         n_data = int(train_cfg.get("n_data", 256))
         if adaptive:
-            xy_f = self.adaptive_sampler.sample_interior(
+            xy_f = self._sample_cavity_focused_interior(
                 n_f,
-                maps,
-                coords,
-                weak_regions,
-                self.local_controller.state.sampling_priorities,
+                lambda count: self.adaptive_sampler.sample_interior(
+                    count,
+                    maps,
+                    coords,
+                    weak_regions,
+                    self.local_controller.state.sampling_priorities,
+                ),
             )
-            xy_data = self.adaptive_sampler.sample_interior(
+            xy_data = self._sample_cavity_focused_interior(
                 n_data,
-                maps,
-                coords,
-                weak_regions,
-                self.local_controller.state.sampling_priorities,
+                lambda count: self.adaptive_sampler.sample_interior(
+                    count,
+                    maps,
+                    coords,
+                    weak_regions,
+                    self.local_controller.state.sampling_priorities,
+                ),
             )
             boundary_frac = float(self.config.get("sampling", {}).get("mixture", {}).get("boundary", 0.05))
             n_focus = int(n_bc * boundary_frac)
@@ -754,8 +803,8 @@ class VARATrainer(ExperimentTrainer):
             else:
                 xy_bc = self._sample_boundary(n_bc)
         else:
-            xy_f = self.uniform_sampler.sample(n_f)
-            xy_data = self.uniform_sampler.sample(n_data)
+            xy_f = self._sample_interior(n_f)
+            xy_data = self._sample_interior(n_data)
             xy_bc = self._sample_boundary(n_bc)
         return self.make_batch(xy_f, xy_bc, xy_data)
 
@@ -813,6 +862,12 @@ class VARATrainer(ExperimentTrainer):
             reasons.append("u_boundary_hard_damage_too_high")
         if float(decision_metrics.get("v_boundary_hard_damage", 0.0)) > cfg.v_boundary_hard_tolerance:
             reasons.append("v_boundary_hard_damage_too_high")
+        if float(decision_metrics.get("strict_wall_boundary_damage", 0.0)) > cfg.wall_boundary_worsen_tolerance:
+            reasons.append("wall_boundary_worsened")
+        if float(decision_metrics.get("strict_lid_u_boundary_damage", 0.0)) > cfg.wall_boundary_worsen_tolerance:
+            reasons.append("lid_u_boundary_worsened")
+        if float(decision_metrics.get("strict_corner_boundary_damage", 0.0)) > cfg.wall_boundary_worsen_tolerance:
+            reasons.append("corner_boundary_worsened")
         return ",".join(reasons) if reasons else "constraint_failed"
 
     def _j_score(self, metrics: dict[str, float]) -> float:

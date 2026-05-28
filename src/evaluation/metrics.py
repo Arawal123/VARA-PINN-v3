@@ -39,6 +39,7 @@ def evaluate_on_grid(
     coords_np: np.ndarray,
     device: torch.device,
     steady: bool = True,
+    include_profile_reference: bool = True,
 ) -> dict[str, float]:
     """Compute global evaluation metrics without using them for adaptation."""
     start = time.time()
@@ -159,7 +160,8 @@ def evaluate_on_grid(
                 "unweighted_data_loss": data_loss,
             }
         )
-    metrics.update(_cavity_profile_metrics(model, benchmark, device))
+    if include_profile_reference:
+        metrics.update(_cavity_profile_metrics(model, benchmark, device))
     if benchmark.__class__.__name__.lower().startswith("liddrivencavity"):
         metrics.update(
             _cavity_residual_geometry_metrics(
