@@ -71,20 +71,6 @@ BENCHMARK_DEFAULTS: dict[str, dict[str, Any]] = {
             ],
         },
         "training": {"n_data": 0},
-        "optimizer": {
-            "name": "adam_to_lbfgs",
-            "lr": 0.001,
-            "lbfgs": {
-                "enabled": True,
-                "epochs": 8,
-                "lr": 1.0,
-                "max_iter": 5,
-                "history_size": 25,
-                "line_search_fn": "strong_wolfe",
-                "tolerance_grad": 1.0e-7,
-                "tolerance_change": 1.0e-9,
-            },
-        },
         "local_controller": {
             "objective_weights": {
                 "u": 0.0,
@@ -302,13 +288,6 @@ def run_named_benchmark(
                     "max_actions_per_cycle": 2,
                     "warmup_cycles": 1 if is_cavity else 0,
                     "rejection_recovery_epochs": 2 if is_cavity else 0,
-                },
-                "optimizer": {
-                    "lbfgs": {
-                        "epochs": 1 if is_cavity else 0,
-                        "max_iter": 2,
-                        "history_size": 10,
-                    },
                 },
                 "validation": {"nx": 16, "ny": 16},
                 "test": {"nx": 20, "ny": 20},

@@ -28,7 +28,6 @@ from src.physics.rectangular_benchmarks import (
 )
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
 from src.training.checkpointing import save_checkpoint
-from src.training.lbfgs_utils import make_lbfgs_closure
 from src.utils.config import save_config
 from src.utils.device import get_device
 from src.utils.io import ensure_dir, save_json
@@ -54,8 +53,6 @@ class ExperimentTrainer:
         self.model = build_mlp_from_config(config, self.benchmark.bounds).to(self.device)
         optim_cfg = config.get("optimizer", {})
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(optim_cfg.get("lr", 1e-3)))
-        self.optimizer_stage = "adam"
-        self.lbfgs_steps_completed = 0
         self.global_step = 0
         self.best_score = math.inf
 
@@ -322,13 +319,32 @@ class ExperimentTrainer:
         self.model.train()
         for local_epoch in range(epochs):
             self.optimizer.zero_grad(set_to_none=True)
-            total, losses, local_logs = self._training_objective(
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            if "pressure_poisson" in active_aux_losses:
+                pointwise["pressure_poisson"] = pressure_poisson_residual(
+                    self.model, batch["xy_f"], self.benchmark.nu
+                ).pow(2)
+            if "vorticity_transport" in active_aux_losses and not self.steady:
+                pointwise["vorticity_transport"] = vorticity_transport_residual(
+                    self.model, batch["xy_f"], self.benchmark.nu, steady=False
+                ).pow(2)
+            losses = compute_global_losses(pointwise)
+            total = weighted_sum(losses, weights)
+            local_loss, local_logs = compute_local_weighted_loss(
+                pointwise,
                 batch,
-                weights,
+                self.patch_grid,
                 local_weights,
-                active_aux_losses,
-                pressure_anchor_patches,
+                entropy_weight=float(self.config.get("controller", {}).get("entropy_weight", 0.0)),
             )
+            total = total + local_loss
+            if pressure_anchor_patches:
+                patch_ids = self.patch_grid.assign_torch(batch["xy_f"])
+                pred_f = self.model(batch["xy_f"])
+                for pid, strength in pressure_anchor_patches.items():
+                    mask = patch_ids == int(pid)
+                    if torch.any(mask):
+                        total = total + float(strength) * pressure_anchor_loss(pred_f[mask, 2:3], 0.0)
             total.backward()
             grad_norm = self._grad_norm()
             self.optimizer.step()
@@ -342,148 +358,6 @@ class ExperimentTrainer:
                 self.loss_logger.log({"cycle": cycle, "phase": log_prefix or "main", "epoch": self.global_step, **last_losses})
             self.global_step += 1
         return last_losses
-
-    def run_optimizer_second_stage(
-        self,
-        batch: dict[str, Any],
-        control_state: Any | None = None,
-        cycle: int = -1,
-        log_prefix: str = "lbfgs",
-    ) -> dict[str, float]:
-        """Run an optional Adam-to-LBFGS final refinement on the current batch."""
-        if not self._optimizer_second_stage_enabled():
-            return {}
-        cfg = self._lbfgs_config()
-        steps = max(0, int(cfg.get("epochs", cfg.get("steps", 0))))
-        if steps <= 0:
-            return {}
-
-        train_cfg = self.config.get("training", {})
-        log_every = max(1, int(cfg.get("log_every", train_cfg.get("log_every", 25))))
-        weights = dict(train_cfg.get("weights", {}))
-        local_weights = {}
-        active_aux_losses: set[str] = set()
-        pressure_anchor_patches: dict[int, float] = {}
-        if control_state is not None:
-            weights = control_state.global_weights
-            local_weights = control_state.local_weights
-            active_aux_losses = control_state.active_aux_losses
-            pressure_anchor_patches = control_state.pressure_anchor_patches
-
-        lbfgs = torch.optim.LBFGS(
-            self.model.parameters(),
-            lr=float(cfg.get("lr", 1.0)),
-            max_iter=int(cfg.get("max_iter", 5)),
-            max_eval=int(cfg.get("max_eval", int(cfg.get("max_iter", 5)) * 2)),
-            tolerance_grad=float(cfg.get("tolerance_grad", 1e-7)),
-            tolerance_change=float(cfg.get("tolerance_change", 1e-9)),
-            history_size=int(cfg.get("history_size", 25)),
-            line_search_fn=cfg.get("line_search_fn", "strong_wolfe"),
-        )
-        self.optimizer = lbfgs
-        self.optimizer_stage = "lbfgs"
-        last_losses: dict[str, float] = {}
-        closure_logs: dict[str, float] = {}
-
-        def loss_fn() -> torch.Tensor:
-            nonlocal closure_logs
-            total, losses, local_logs = self._training_objective(
-                batch,
-                weights,
-                local_weights,
-                active_aux_losses,
-                pressure_anchor_patches,
-            )
-            closure_logs = {k: float(v.detach().cpu()) for k, v in losses.items()}
-            closure_logs.update(local_logs)
-            closure_logs["total"] = float(total.detach().cpu())
-            return total
-
-        self.model.train()
-        for local_step in range(steps):
-            closure = make_lbfgs_closure(lbfgs, loss_fn)
-            loss = lbfgs.step(closure)
-            grad_norm = self._grad_norm()
-            last_losses = dict(closure_logs)
-            if "total" not in last_losses:
-                last_losses["total"] = float(loss.detach().cpu()) if hasattr(loss, "detach") else float(loss)
-            last_losses["grad_norm"] = grad_norm
-            last_losses["optimizer_stage"] = self.optimizer_stage
-            self.last_losses = dict(last_losses)
-            if local_step % log_every == 0 or local_step == steps - 1:
-                self.loss_logger.log(
-                    {
-                        "cycle": cycle,
-                        "phase": log_prefix,
-                        "epoch": self.global_step,
-                        "lbfgs_step": local_step,
-                        **last_losses,
-                    }
-                )
-            self.global_step += 1
-            self.lbfgs_steps_completed += 1
-        return last_losses
-
-    def _optimizer_second_stage_enabled(self) -> bool:
-        optim_cfg = self.config.get("optimizer", {})
-        name = str(optim_cfg.get("name", "")).lower()
-        schedule = optim_cfg.get("schedule", {})
-        if isinstance(schedule, dict):
-            schedule_name = str(schedule.get("type", schedule.get("name", ""))).lower()
-        else:
-            schedule_name = str(schedule).lower()
-        lbfgs_cfg = optim_cfg.get("lbfgs", {})
-        return (
-            name in {"adam_to_lbfgs", "adam+lbfgs"}
-            or schedule_name in {"adam_to_lbfgs", "adam+lbfgs"}
-            or bool(lbfgs_cfg.get("enabled", False))
-        )
-
-    def _lbfgs_config(self) -> dict[str, Any]:
-        optim_cfg = self.config.get("optimizer", {})
-        cfg = dict(optim_cfg.get("lbfgs", {}))
-        cfg.setdefault("epochs", 0)
-        cfg.setdefault("lr", 1.0)
-        cfg.setdefault("max_iter", 5)
-        cfg.setdefault("history_size", 25)
-        cfg.setdefault("line_search_fn", "strong_wolfe")
-        return cfg
-
-    def _training_objective(
-        self,
-        batch: dict[str, Any],
-        weights: dict[str, float],
-        local_weights: dict[str, dict[int, float]],
-        active_aux_losses: set[str],
-        pressure_anchor_patches: dict[int, float],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
-        pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
-        if "pressure_poisson" in active_aux_losses:
-            pointwise["pressure_poisson"] = pressure_poisson_residual(
-                self.model, batch["xy_f"], self.benchmark.nu
-            ).pow(2)
-        if "vorticity_transport" in active_aux_losses and not self.steady:
-            pointwise["vorticity_transport"] = vorticity_transport_residual(
-                self.model, batch["xy_f"], self.benchmark.nu, steady=False
-            ).pow(2)
-        losses = compute_global_losses(pointwise)
-        total = weighted_sum(losses, weights)
-        local_loss, local_logs = compute_local_weighted_loss(
-            pointwise,
-            batch,
-            self.patch_grid,
-            local_weights,
-            entropy_weight=float(self.config.get("controller", {}).get("entropy_weight", 0.0)),
-        )
-        total = total + local_loss
-        if pressure_anchor_patches:
-            patch_ids = self.patch_grid.assign_torch(batch["xy_f"])
-            pred_f = self.model(batch["xy_f"])
-            for pid, strength in pressure_anchor_patches.items():
-                mask = patch_ids == int(pid)
-                if torch.any(mask):
-                    total = total + float(strength) * pressure_anchor_loss(pred_f[mask, 2:3], 0.0)
-        return total, losses, local_logs
 
     def _grad_norm(self) -> float:
         total = 0.0
@@ -533,8 +407,6 @@ class ExperimentTrainer:
         X, Y, coords = self.test_grid()
         metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
         metrics["final_total_loss"] = float(self.last_losses.get("total", float("nan")))
-        metrics["optimizer_stage"] = self.optimizer_stage
-        metrics["lbfgs_steps_completed"] = int(self.lbfgs_steps_completed)
         metrics["reference_kind"] = getattr(self.benchmark, "reference_kind", "analytical")
         metrics["has_reference"] = bool(getattr(self.benchmark, "has_reference", True))
         metrics["run_type"] = str(self.config.get("run_type", "full"))
