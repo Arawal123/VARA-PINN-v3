@@ -85,6 +85,11 @@ BENCHMARK_DEFAULTS: dict[str, dict[str, Any]] = {
                 "line_search_fn": "strong_wolfe",
                 "batch_multiplier": 2.0,
                 "residual_fraction": 0.30,
+                "collateral_tolerances": {
+                    "pde_residual_mean": 0.10,
+                    "momentum_residual_mean": 0.18,
+                    "boundary_condition_error": 0.02,
+                },
                 "weights": {
                     "pde": 0.5,
                     "momentum_u": 1.0,
