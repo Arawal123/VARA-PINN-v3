@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,9 @@ from src.physics.rectangular_benchmarks import (
     PoiseuilleChannelFlow,
 )
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
+from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.checkpointing import save_checkpoint
+from src.training.lbfgs_utils import make_lbfgs_closure
 from src.utils.config import save_config
 from src.utils.device import get_device
 from src.utils.io import ensure_dir, save_json
@@ -53,6 +56,9 @@ class ExperimentTrainer:
         self.model = build_mlp_from_config(config, self.benchmark.bounds).to(self.device)
         optim_cfg = config.get("optimizer", {})
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(optim_cfg.get("lr", 1e-3)))
+        self.optimizer_stage = "adam"
+        self.final_repair_status: dict[str, Any] = {}
+        self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
 
@@ -211,32 +217,13 @@ class ExperimentTrainer:
         self.model.train()
         for local_epoch in range(epochs):
             self.optimizer.zero_grad(set_to_none=True)
-            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
-            if "pressure_poisson" in active_aux_losses:
-                pointwise["pressure_poisson"] = pressure_poisson_residual(
-                    self.model, batch["xy_f"], self.benchmark.nu
-                ).pow(2)
-            if "vorticity_transport" in active_aux_losses and not self.steady:
-                pointwise["vorticity_transport"] = vorticity_transport_residual(
-                    self.model, batch["xy_f"], self.benchmark.nu, steady=False
-                ).pow(2)
-            losses = compute_global_losses(pointwise)
-            total = weighted_sum(losses, weights)
-            local_loss, local_logs = compute_local_weighted_loss(
-                pointwise,
+            total, losses, local_logs = self._training_objective(
                 batch,
-                self.patch_grid,
+                weights,
                 local_weights,
-                entropy_weight=float(self.config.get("controller", {}).get("entropy_weight", 0.0)),
+                active_aux_losses,
+                pressure_anchor_patches,
             )
-            total = total + local_loss
-            if pressure_anchor_patches:
-                patch_ids = self.patch_grid.assign_torch(batch["xy_f"])
-                pred_f = self.model(batch["xy_f"])
-                for pid, strength in pressure_anchor_patches.items():
-                    mask = patch_ids == int(pid)
-                    if torch.any(mask):
-                        total = total + float(strength) * pressure_anchor_loss(pred_f[mask, 2:3], 0.0)
             total.backward()
             grad_norm = self._grad_norm()
             self.optimizer.step()
@@ -251,12 +238,230 @@ class ExperimentTrainer:
             self.global_step += 1
         return last_losses
 
+    def _training_objective(
+        self,
+        batch: dict[str, Any],
+        weights: dict[str, float],
+        local_weights: dict[str, dict[int, float]],
+        active_aux_losses: set[str],
+        pressure_anchor_patches: dict[int, float],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
+        """Build the train objective used by Adam and guarded repair stages."""
+        pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+        if "pressure_poisson" in active_aux_losses:
+            pointwise["pressure_poisson"] = pressure_poisson_residual(
+                self.model, batch["xy_f"], self.benchmark.nu
+            ).pow(2)
+        if "vorticity_transport" in active_aux_losses and not self.steady:
+            pointwise["vorticity_transport"] = vorticity_transport_residual(
+                self.model, batch["xy_f"], self.benchmark.nu, steady=False
+            ).pow(2)
+        losses = compute_global_losses(pointwise)
+        total = weighted_sum(losses, weights)
+        local_loss, local_logs = compute_local_weighted_loss(
+            pointwise,
+            batch,
+            self.patch_grid,
+            local_weights,
+            entropy_weight=float(self.config.get("controller", {}).get("entropy_weight", 0.0)),
+        )
+        total = total + local_loss
+        if pressure_anchor_patches:
+            patch_ids = self.patch_grid.assign_torch(batch["xy_f"])
+            pred_f = self.model(batch["xy_f"])
+            for pid, strength in pressure_anchor_patches.items():
+                mask = patch_ids == int(pid)
+                if torch.any(mask):
+                    total = total + float(strength) * pressure_anchor_loss(pred_f[mask, 2:3], 0.0)
+        return total, losses, local_logs
+
+    def run_final_physics_repair(self, cycle: int = -1, log_prefix: str = "final_repair") -> dict[str, Any]:
+        """Run a guarded global-physics LBFGS repair stage.
+
+        VARA can leave useful local interventions behind, but LBFGS is too sharp
+        to safely optimize those local weights directly. This stage therefore
+        builds a fresh global batch, ignores local controller weights, and keeps
+        the result only when validation score improves.
+        """
+        cfg = self._final_repair_config()
+        if not bool(cfg.get("enabled", False)):
+            self.final_repair_status = {"enabled": False, "accepted": False}
+            return self.final_repair_status
+
+        steps = max(0, int(cfg.get("epochs", cfg.get("steps", 0))))
+        if steps <= 0:
+            self.final_repair_status = {"enabled": True, "accepted": False, "reason": "zero_steps"}
+            return self.final_repair_status
+
+        _, _, validation_coords = self.validation_grid()
+        before_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
+        score_name, before_score = self._repair_score(before_metrics)
+        model_snapshot = self._model_snapshot()
+        optimizer_snapshot = deepcopy(self.optimizer.state_dict())
+        previous_optimizer = self.optimizer
+        previous_stage = self.optimizer_stage
+
+        repair_batch = self._make_final_repair_batch(cfg)
+        repair_weights = self._repair_weights(cfg)
+        lbfgs = torch.optim.LBFGS(
+            self.model.parameters(),
+            lr=float(cfg.get("lr", 0.5)),
+            max_iter=int(cfg.get("max_iter", 5)),
+            max_eval=int(cfg.get("max_eval", int(cfg.get("max_iter", 5)) * 2)),
+            tolerance_grad=float(cfg.get("tolerance_grad", 1e-7)),
+            tolerance_change=float(cfg.get("tolerance_change", 1e-9)),
+            history_size=int(cfg.get("history_size", 20)),
+            line_search_fn=cfg.get("line_search_fn", "strong_wolfe"),
+        )
+        self.optimizer = lbfgs
+        self.optimizer_stage = "final_repair_lbfgs"
+        last_logs: dict[str, float] = {}
+        log_every = max(1, int(cfg.get("log_every", self.config.get("training", {}).get("log_every", 25))))
+
+        def loss_fn() -> torch.Tensor:
+            nonlocal last_logs
+            total, losses, local_logs = self._training_objective(
+                repair_batch,
+                repair_weights,
+                {},
+                set(),
+                {},
+            )
+            last_logs = {k: float(v.detach().cpu()) for k, v in losses.items()}
+            last_logs.update(local_logs)
+            last_logs["total"] = float(total.detach().cpu())
+            return total
+
+        self.model.train()
+        for step in range(steps):
+            closure = make_lbfgs_closure(lbfgs, loss_fn)
+            loss = lbfgs.step(closure)
+            if "total" not in last_logs:
+                last_logs["total"] = float(loss.detach().cpu()) if hasattr(loss, "detach") else float(loss)
+            last_logs["grad_norm"] = self._grad_norm()
+            last_logs["optimizer_stage"] = self.optimizer_stage
+            self.last_losses = dict(last_logs)
+            if step % log_every == 0 or step == steps - 1:
+                self.loss_logger.log(
+                    {
+                        "cycle": cycle,
+                        "phase": log_prefix,
+                        "epoch": self.global_step,
+                        "repair_step": step,
+                        **last_logs,
+                    }
+                )
+            self.global_step += 1
+
+        after_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
+        _, after_score = self._repair_score(after_metrics)
+        tolerance = float(cfg.get("acceptance_tolerance", 0.0))
+        accepted = bool(after_score <= before_score * (1.0 + tolerance))
+        reason = "accepted" if accepted else "validation_score_worsened"
+        if not accepted:
+            self._restore_model_snapshot(model_snapshot)
+            self.optimizer = previous_optimizer
+            self.optimizer.load_state_dict(optimizer_snapshot)
+            self.optimizer_stage = previous_stage
+
+        self.final_repair_status = {
+            "enabled": True,
+            "accepted": accepted,
+            "reason": reason,
+            "score_name": score_name,
+            "pre_repair_score": float(before_score),
+            "post_repair_score": float(after_score),
+            "epochs": steps,
+            "batch_n_collocation": int(repair_batch["xy_f"].shape[0]),
+            "batch_n_boundary": int(repair_batch["xy_bc"].shape[0]),
+            "global_only": True,
+        }
+        self.metrics_logger.log({"cycle": cycle, "phase": log_prefix, **self.final_repair_status})
+        return self.final_repair_status
+
+    def _final_repair_config(self) -> dict[str, Any]:
+        optim_cfg = self.config.get("optimizer", {})
+        cfg = dict(optim_cfg.get("final_repair", {}))
+        cfg.setdefault("enabled", False)
+        cfg.setdefault("epochs", 0)
+        cfg.setdefault("lr", 0.5)
+        cfg.setdefault("max_iter", 5)
+        cfg.setdefault("history_size", 20)
+        cfg.setdefault("line_search_fn", "strong_wolfe")
+        cfg.setdefault("batch_multiplier", 2.0)
+        cfg.setdefault("residual_fraction", 0.25)
+        return cfg
+
+    def _repair_weights(self, cfg: dict[str, Any]) -> dict[str, float]:
+        weights = dict(self.config.get("training", {}).get("weights", {}))
+        weights.update({str(k): float(v) for k, v in dict(cfg.get("weights", {})).items()})
+        return weights
+
+    def _make_final_repair_batch(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        train_cfg = self.config.get("training", {})
+        multiplier = max(1.0, float(cfg.get("batch_multiplier", 2.0)))
+        n_f = max(1, int(round(int(train_cfg.get("n_collocation", 1024)) * multiplier)))
+        n_bc = max(1, int(round(int(train_cfg.get("n_boundary", 256)) * multiplier)))
+        n_data = max(0, int(round(int(train_cfg.get("n_data", 0)) * multiplier)))
+        residual_fraction = float(np.clip(float(cfg.get("residual_fraction", 0.25)), 0.0, 0.9))
+        n_residual = int(round(n_f * residual_fraction))
+        n_uniform = n_f - n_residual
+        pieces = [self.uniform_sampler.sample(n_uniform).detach().cpu().numpy()]
+        if n_residual > 0:
+            _, _, coords = self.validation_grid()
+            builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
+            maps = builder.build(coords, mode=self.config.get("diagnostics", {}).get("mode", "full_reference"))
+            score = maps.get("aggregate_pde_residual", maps.get("pde_residual"))
+            if score is not None:
+                pieces.append(sample_from_score_grid(coords, score, n_residual, self.repair_rng))
+            else:
+                pieces.append(self.uniform_sampler.sample(n_residual).detach().cpu().numpy())
+        xy_f_np = np.vstack([p for p in pieces if p.size])
+        self.repair_rng.shuffle(xy_f_np)
+        xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)
+        xy_bc = self._sample_boundary(n_bc)
+        xy_data = self.uniform_sampler.sample(n_data)
+        return self.make_batch(xy_f, xy_bc, xy_data)
+
+    def _repair_score(self, metrics: dict[str, Any]) -> tuple[str, float]:
+        preferred = self._final_repair_config().get("score_metric")
+        candidates = [
+            str(preferred) if preferred else "",
+            "cavity_benchmark_score",
+            "unweighted_validation_loss",
+            "pde_residual_mean",
+        ]
+        for name in candidates:
+            if not name:
+                continue
+            value = metrics.get(name)
+            if value is None:
+                continue
+            numeric = float(value)
+            if math.isfinite(numeric):
+                return name, numeric
+        fallback = 0.0
+        used = []
+        for name in ["pde_residual_mean", "continuity_residual_mean", "momentum_residual_mean", "boundary_condition_error"]:
+            value = metrics.get(name)
+            if value is not None and math.isfinite(float(value)):
+                fallback += float(value)
+                used.append(name)
+        return "+".join(used) if used else "zero", float(fallback)
+
     def _grad_norm(self) -> float:
         total = 0.0
         for p in self.model.parameters():
             if p.grad is not None:
                 total += float(torch.sum(p.grad.detach() ** 2).cpu())
         return float(math.sqrt(total))
+
+    def _model_snapshot(self) -> dict[str, torch.Tensor]:
+        return {name: value.detach().cpu().clone() for name, value in self.model.state_dict().items()}
+
+    def _restore_model_snapshot(self, snapshot: dict[str, torch.Tensor]) -> None:
+        device_snapshot = {name: value.to(self.device) for name, value in snapshot.items()}
+        self.model.load_state_dict(device_snapshot)
 
     def diagnose(self) -> tuple[dict[str, np.ndarray], np.ndarray, list[str], list[Any], np.ndarray, np.ndarray, np.ndarray]:
         X, Y, coords = self.validation_grid()
@@ -293,6 +498,9 @@ class ExperimentTrainer:
         X, Y, coords = self.test_grid()
         metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
         metrics["final_total_loss"] = float(self.last_losses.get("total", float("nan")))
+        metrics["optimizer_stage"] = self.optimizer_stage
+        for key, value in self.final_repair_status.items():
+            metrics[f"final_repair_{key}"] = value
         metrics["reference_kind"] = getattr(self.benchmark, "reference_kind", "analytical")
         metrics["has_reference"] = bool(getattr(self.benchmark, "has_reference", True))
         metrics["run_type"] = str(self.config.get("run_type", "full"))

@@ -27,6 +27,28 @@ model:
 optimizer:
   name: adam
   lr: 0.001
+  final_repair:
+    enabled: true
+    score_metric: cavity_benchmark_score
+    acceptance_tolerance: 0.0
+    epochs: 8
+    lr: 0.5
+    max_iter: 5
+    history_size: 20
+    line_search_fn: strong_wolfe
+    batch_multiplier: 2.0
+    residual_fraction: 0.30
+    weights:
+      pde: 0.5
+      momentum_u: 1.0
+      momentum_v: 1.0
+      continuity: 1.5
+      bc: 6.0
+      u: 0.0
+      v: 0.0
+      p: 0.0
+      omega: 0.0
+      pressure_gradient: 0.0
 
 training:
   adaptive_cycles: 4
