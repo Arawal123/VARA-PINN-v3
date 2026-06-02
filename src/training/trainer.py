@@ -356,14 +356,8 @@ class ExperimentTrainer:
         after_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
         _, after_score = self._repair_score(after_metrics)
         tolerance = float(cfg.get("acceptance_tolerance", 0.0))
-        score_ok = bool(after_score <= before_score * (1.0 + tolerance))
-        collateral_ok, collateral_report = self._repair_collateral_ok(before_metrics, after_metrics, cfg)
-        accepted = bool(score_ok and collateral_ok)
-        reason = "accepted"
-        if not score_ok:
-            reason = "validation_score_worsened"
-        elif not collateral_ok:
-            reason = "collateral_damage_exceeded"
+        accepted = bool(after_score <= before_score * (1.0 + tolerance))
+        reason = "accepted" if accepted else "validation_score_worsened"
         if not accepted:
             self._restore_model_snapshot(model_snapshot)
             self.optimizer = previous_optimizer
@@ -377,13 +371,10 @@ class ExperimentTrainer:
             "score_name": score_name,
             "pre_repair_score": float(before_score),
             "post_repair_score": float(after_score),
-            "score_ok": score_ok,
-            "collateral_ok": collateral_ok,
             "epochs": steps,
             "batch_n_collocation": int(repair_batch["xy_f"].shape[0]),
             "batch_n_boundary": int(repair_batch["xy_bc"].shape[0]),
             "global_only": True,
-            **collateral_report,
         }
         self.metrics_logger.log({"cycle": cycle, "phase": log_prefix, **self.final_repair_status})
         return self.final_repair_status
@@ -399,51 +390,7 @@ class ExperimentTrainer:
         cfg.setdefault("line_search_fn", "strong_wolfe")
         cfg.setdefault("batch_multiplier", 2.0)
         cfg.setdefault("residual_fraction", 0.25)
-        cfg.setdefault("collateral_tolerances", {})
         return cfg
-
-    def _repair_collateral_ok(
-        self,
-        before_metrics: dict[str, Any],
-        after_metrics: dict[str, Any],
-        cfg: dict[str, Any],
-    ) -> tuple[bool, dict[str, float | str]]:
-        tolerances = dict(cfg.get("collateral_tolerances", {}))
-        if not tolerances:
-            return True, {
-                "collateral_metric_status": "disabled",
-                "collateral_max_damage": 0.0,
-            }
-        ok = True
-        max_damage = 0.0
-        worst_metric = ""
-        report: dict[str, float | str] = {"collateral_metric_status": "ok"}
-        for metric_name, tolerance in tolerances.items():
-            before = self._finite_metric(before_metrics, str(metric_name))
-            after = self._finite_metric(after_metrics, str(metric_name))
-            if before is None or after is None:
-                report[f"collateral_{metric_name}_damage"] = float("nan")
-                continue
-            damage = max(0.0, (after - before) / (abs(before) + 1e-12))
-            report[f"collateral_{metric_name}_damage"] = float(damage)
-            report[f"collateral_{metric_name}_tolerance"] = float(tolerance)
-            if damage > max_damage:
-                max_damage = float(damage)
-                worst_metric = str(metric_name)
-            if damage > float(tolerance):
-                ok = False
-        if not ok:
-            report["collateral_metric_status"] = f"failed:{worst_metric}"
-        report["collateral_max_damage"] = float(max_damage)
-        report["collateral_worst_metric"] = worst_metric
-        return ok, report
-
-    def _finite_metric(self, metrics: dict[str, Any], name: str) -> float | None:
-        try:
-            value = float(metrics.get(name))
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
 
     def _repair_weights(self, cfg: dict[str, Any]) -> dict[str, float]:
         weights = dict(self.config.get("training", {}).get("weights", {}))
