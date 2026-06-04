@@ -1,0 +1,4 @@
+mode: rar_pinn
+description: "Residual adaptive refinement baseline without variable-region controller, local weights, or rollback."
+rar:
+  residual_fraction: 0.50
