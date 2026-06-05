@@ -33,3 +33,34 @@ def save_field_panel(
         fig.colorbar(im, ax=ax)
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def save_prediction_reference_error_panel(
+    X: np.ndarray,
+    Y: np.ndarray,
+    field_triplets: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    path: str | Path,
+) -> None:
+    """Save prediction/reference/error columns for several fields."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_rows = len(field_triplets)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(12.6, 3.2 * n_rows), constrained_layout=True)
+    if n_rows == 1:
+        axes = np.asarray([axes])
+    for row, (name, (pred, ref, err)) in enumerate(field_triplets.items()):
+        for col, (title, values, cmap) in enumerate(
+            [
+                (f"{name} pred", pred, "viridis"),
+                (f"{name} ref", ref, "viridis"),
+                (f"{name} abs error", err, "magma"),
+            ]
+        ):
+            ax = axes[row, col]
+            im = ax.pcolormesh(X, Y, values, shading="auto", cmap=cmap)
+            ax.set_title(title)
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            fig.colorbar(im, ax=ax)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)

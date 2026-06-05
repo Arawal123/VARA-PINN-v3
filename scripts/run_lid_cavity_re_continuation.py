@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -40,6 +41,17 @@ METRICS = [
     "unweighted_validation_loss",
     "final_total_loss",
 ]
+FULL_FIELD_METRICS = [
+    "u_rel_l2",
+    "v_rel_l2",
+    "p_rel_l2_centered",
+    "omega_rel_l2",
+    "u_rmse",
+    "v_rmse",
+    "p_rmse_centered",
+    "omega_rmse",
+    "unweighted_data_loss",
+]
 
 
 def main() -> None:
@@ -51,6 +63,7 @@ def main() -> None:
     parser.add_argument("--method", choices=["vanilla", "vara", "both"], default="both")
     parser.add_argument("--reference", choices=["ghia", "external", "none"], default="ghia")
     parser.add_argument("--reference_path", default=None)
+    parser.add_argument("--full_field_reference_map", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -74,6 +87,7 @@ def run_continuation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     if args.quick:
         base = _quick_config(base)
 
+    full_field_reference_map = _load_full_field_reference_map(getattr(args, "full_field_reference_map", None))
     methods = ["vanilla", "vara"] if args.method == "both" else [args.method]
     long_rows: list[dict[str, Any]] = []
     comparison_rows: list[dict[str, Any]] = []
@@ -84,11 +98,19 @@ def run_continuation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         for reynolds in args.reynolds:
             re_dir = _re_dir(out, seed, reynolds)
             reference_info = _reference_for_re(float(reynolds), args.reference, args.reference_path)
+            full_field_reference_path = _full_field_reference_for_re(float(reynolds), full_field_reference_map)
+            reference_info["full_field_reference_path"] = full_field_reference_path
+            profile_available = _has_profile_reference(float(reynolds), reference_info)
+            full_field_available = full_field_reference_path is not None
             reference_rows.append(
                 {
                     "seed": int(seed),
                     "reynolds": float(reynolds),
                     "ghia_profile_available": _has_builtin_ghia(float(reynolds)),
+                    "profile_reference_available": profile_available,
+                    "full_field_reference_available": full_field_available,
+                    "full_field_reference_path": str(full_field_reference_path) if full_field_reference_path else None,
+                    "quantitative_reference_level": _quantitative_reference_level(profile_available, full_field_available),
                     "reference": reference_info["reference"],
                     "reference_path": reference_info.get("reference_path"),
                 }
@@ -143,6 +165,7 @@ def run_continuation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     wide_df.to_csv(summary_dir / "improvement_percent_by_re.csv", index=False)
     reference_df.to_csv(summary_dir / "available_reference_metrics_by_re.csv", index=False)
     _save_summary_montages(out, summary_dir)
+    _save_summary_bar_plots(compare_df, summary_dir)
     return {
         "continuation_results_long": long_df,
         "vara_vs_vanilla_by_re": compare_df,
@@ -200,8 +223,10 @@ def _config_for_run(
             "reynolds": float(reynolds),
             "reference": reference_info["reference"],
             "reference_path": reference_info.get("reference_path"),
-            "profile_only": True,
-            "full_field_reference_path": None,
+            "profile_only": reference_info.get("full_field_reference_path") is None,
+            "full_field_reference_path": (
+                str(reference_info["full_field_reference_path"]) if reference_info.get("full_field_reference_path") else None
+            ),
         }
     )
     cfg["experiments"] = {
@@ -228,13 +253,111 @@ def _reference_for_re(reynolds: float, reference: str, reference_path: str | Non
     return {"reference": "none", "reference_path": None}
 
 
+def _load_full_field_reference_map(path: str | None) -> dict[float, Path]:
+    if not path:
+        return {}
+    map_path = Path(path)
+    if not map_path.exists() and not map_path.is_absolute():
+        repo_candidate = ROOT / map_path
+        if repo_candidate.exists():
+            map_path = repo_candidate
+    if not map_path.exists():
+        raise FileNotFoundError(f"Full-field reference map not found: {path}")
+
+    suffix = map_path.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(map_path)
+        required = {"re", "full_field_reference_path"}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"Full-field reference map is missing columns: {sorted(missing)}")
+        rows = df[["re", "full_field_reference_path"]].to_dict("records")
+    elif suffix == ".json":
+        with map_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        rows = _json_reference_rows(payload)
+    else:
+        raise ValueError("--full_field_reference_map must be a CSV or JSON file.")
+
+    out: dict[float, Path] = {}
+    for row in rows:
+        reynolds = float(row["re"])
+        raw_path = row["full_field_reference_path"]
+        resolved = _resolve_reference_path(raw_path, map_path.parent)
+        if not resolved.exists():
+            raise FileNotFoundError(f"Full-field reference for Re={reynolds:g} not found: {resolved}")
+        out[reynolds] = resolved
+    return out
+
+
+def _json_reference_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and "references" in payload:
+        payload = payload["references"]
+    if isinstance(payload, dict):
+        return [{"re": key, "full_field_reference_path": value} for key, value in payload.items()]
+    if isinstance(payload, list):
+        rows = []
+        for item in payload:
+            if not isinstance(item, dict):
+                raise ValueError("JSON full-field reference map list entries must be objects.")
+            path = item.get("full_field_reference_path", item.get("path"))
+            if "re" not in item or path is None:
+                raise ValueError("JSON full-field reference map entries must include re and full_field_reference_path.")
+            rows.append({"re": item["re"], "full_field_reference_path": path})
+        return rows
+    raise ValueError("JSON full-field reference map must be an object, a list, or an object with a references list.")
+
+
+def _resolve_reference_path(raw_path: str | Path, map_dir: Path) -> Path:
+    path = Path(str(raw_path))
+    if path.is_absolute():
+        return path
+    candidates = [ROOT / path, map_dir / path, path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return ROOT / path
+
+
+def _full_field_reference_for_re(reynolds: float, reference_map: dict[float, Path]) -> Path | None:
+    for mapped_re, path in reference_map.items():
+        if np.isclose(float(reynolds), float(mapped_re)):
+            return path
+    return None
+
+
+def _has_profile_reference(reynolds: float, reference_info: dict[str, Any]) -> bool:
+    reference = str(reference_info.get("reference", "none")).lower()
+    if reference == "ghia":
+        return _has_builtin_ghia(reynolds)
+    if reference == "external":
+        return reference_info.get("reference_path") is not None
+    return False
+
+
+def _quantitative_reference_level(profile_available: bool, full_field_available: bool) -> str:
+    if profile_available and full_field_available:
+        return "profile+full_field"
+    if profile_available:
+        return "profile_only"
+    if full_field_available:
+        return "full_field_only"
+    return "residual_only"
+
+
 def _has_builtin_ghia(reynolds: float) -> bool:
     return any(np.isclose(float(reynolds), value) for value in GHIA_REYNOLDS)
 
 
 def _comparison_rows(seed: int, reynolds: float, vanilla: dict[str, Any], vara: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
-    for metric in METRICS:
+    metric_names = list(METRICS)
+    for metric in FULL_FIELD_METRICS:
+        v = _to_float(vanilla.get(metric))
+        a = _to_float(vara.get(metric))
+        if np.isfinite(v) or np.isfinite(a):
+            metric_names.append(metric)
+    for metric in metric_names:
         v = _to_float(vanilla.get(metric))
         a = _to_float(vara.get(metric))
         improvement = (v - a) / abs(v) * 100.0 if np.isfinite(v) and v != 0.0 and np.isfinite(a) else np.nan
@@ -270,7 +393,21 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
     comparison_dir = re_dir / "comparison"
     comparison_dir.mkdir(parents=True, exist_ok=True)
     rows = _comparison_rows(int(vanilla["seed"]), float(vanilla["reynolds"]), vanilla, vara)
-    pd.DataFrame(rows).to_csv(comparison_dir / "metrics_comparison.csv", index=False)
+    comparison_df = pd.DataFrame(rows)
+    comparison_df.to_csv(comparison_dir / "metrics_comparison.csv", index=False)
+    _save_metric_comparison_bar(
+        comparison_df,
+        METRICS,
+        comparison_dir / "metric_comparison_bar.png",
+        f"Re={float(vanilla['reynolds']):g} Vanilla vs VARA metrics (lower is better)",
+    )
+    if comparison_df["metric"].isin(FULL_FIELD_METRICS).any():
+        _save_metric_comparison_bar(
+            comparison_df,
+            FULL_FIELD_METRICS,
+            comparison_dir / "full_field_metric_comparison_bar.png",
+            f"Re={float(vanilla['reynolds']):g} full-field CFD metrics (lower is better)",
+        )
     _save_image_grid(
         [
             (Path(vanilla["method_dir"]) / "figures" / "streamlines.png", "Vanilla streamlines"),
@@ -293,6 +430,17 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
         cols=2,
         title=f"Re={float(vanilla['reynolds']):g} residuals",
     )
+    error_items = [
+        (Path(vanilla["method_dir"]) / "figures" / "error_fields.png", "Vanilla full-field errors"),
+        (Path(vara["method_dir"]) / "figures" / "error_fields.png", "VARA full-field errors"),
+    ]
+    if any(path.exists() for path, _ in error_items):
+        _save_image_grid(
+            error_items,
+            comparison_dir / "full_field_error_side_by_side.png",
+            cols=2,
+            title=f"Re={float(vanilla['reynolds']):g} full-field errors",
+        )
 
 
 def _save_summary_montages(out: Path, summary_dir: Path) -> None:
@@ -307,6 +455,95 @@ def _save_summary_montages(out: Path, summary_dir: Path) -> None:
         for path in sorted(out.glob("seed_*/re_*/comparison/streamlines_side_by_side.png"))
     ]
     _save_image_grid(side_by_side, summary_dir / "streamline_montage_side_by_side.png", cols=2, title="Vanilla vs VARA streamlines")
+
+
+def _save_summary_bar_plots(compare_df: pd.DataFrame, summary_dir: Path) -> None:
+    _save_improvement_by_re_bar(
+        compare_df,
+        METRICS,
+        summary_dir / "metric_improvement_by_re_bar.png",
+        "VARA improvement over Vanilla by Reynolds number",
+    )
+    if not compare_df.empty and compare_df["metric"].isin(FULL_FIELD_METRICS).any():
+        _save_improvement_by_re_bar(
+            compare_df,
+            FULL_FIELD_METRICS,
+            summary_dir / "full_field_metric_improvement_by_re_bar.png",
+            "Full-field CFD metric improvement over Vanilla by Reynolds number",
+        )
+
+
+def _save_metric_comparison_bar(metric_df: pd.DataFrame, metrics: list[str], path: Path, title: str) -> None:
+    subset = metric_df[metric_df["metric"].isin(metrics)].copy()
+    if subset.empty:
+        return
+    subset["vanilla"] = pd.to_numeric(subset["vanilla"], errors="coerce")
+    subset["vara"] = pd.to_numeric(subset["vara"], errors="coerce")
+    subset["improvement_percent"] = pd.to_numeric(subset["improvement_percent"], errors="coerce")
+    subset = subset[np.isfinite(subset["vanilla"]) & np.isfinite(subset["vara"])]
+    if subset.empty:
+        return
+
+    x = np.arange(len(subset))
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(max(10.0, 1.2 * len(subset)), 5.5), constrained_layout=True)
+    ax.bar(x - width / 2, subset["vanilla"], width, label="Vanilla", color="#6b7280")
+    ax.bar(x + width / 2, subset["vara"], width, label="VARA", color="#16a34a")
+    for i, row in enumerate(subset.itertuples(index=False)):
+        improvement = getattr(row, "improvement_percent")
+        if np.isfinite(improvement):
+            top = max(float(getattr(row, "vanilla")), float(getattr(row, "vara")))
+            ax.text(i, top * 1.03 if top != 0.0 else 0.03, f"{improvement:+.1f}%", ha="center", va="bottom", fontsize=8)
+    ax.set_title(title)
+    ax.set_ylabel("metric value")
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(metric).replace("_", "\n") for metric in subset["metric"]], rotation=0, fontsize=8)
+    ax.legend()
+    ax.text(
+        0.0,
+        -0.18,
+        "Positive annotation means VARA is lower than Vanilla.",
+        transform=ax.transAxes,
+        fontsize=9,
+        va="top",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def _save_improvement_by_re_bar(compare_df: pd.DataFrame, metrics: list[str], path: Path, title: str) -> None:
+    if compare_df.empty:
+        return
+    subset = compare_df[compare_df["metric"].isin(metrics)].copy()
+    if subset.empty:
+        return
+    subset["improvement_percent"] = pd.to_numeric(subset["improvement_percent"], errors="coerce")
+    table = subset.pivot_table(index="reynolds", columns="metric", values="improvement_percent", aggfunc="mean")
+    metric_names = [metric for metric in metrics if metric in table.columns and np.isfinite(table[metric]).any()]
+    if not metric_names:
+        return
+
+    cols = 2
+    rows = int(np.ceil(len(metric_names) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(6.4 * cols, 3.6 * rows), constrained_layout=True)
+    axes_arr = np.asarray(axes).reshape(-1)
+    re_labels = [f"{float(re):g}" for re in table.index]
+    for ax, metric in zip(axes_arr, metric_names):
+        values = pd.to_numeric(table[metric], errors="coerce").to_numpy(dtype=float)
+        colors = ["#16a34a" if np.isfinite(value) and value >= 0 else "#dc2626" for value in values]
+        ax.bar(re_labels, values, color=colors)
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_title(metric.replace("_", " "))
+        ax.set_xlabel("Re")
+        ax.set_ylabel("VARA improvement %")
+        ax.tick_params(axis="x", rotation=45)
+    for ax in axes_arr[len(metric_names) :]:
+        ax.axis("off")
+    fig.suptitle(f"{title}\nPositive means lower error/loss/residual for VARA.", fontsize=14)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
 
 
 def _save_image_grid(items: list[tuple[Path, str]], path: Path, cols: int, title: str) -> None:

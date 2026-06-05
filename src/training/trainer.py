@@ -37,7 +37,7 @@ from src.utils.io import ensure_dir, save_json
 from src.utils.logging import CSVLogger, JSONListLogger, make_run_id
 from src.utils.seed import set_seed
 from src.visualization.controller_plots import save_intervention_timeline, save_patch_score_map
-from src.visualization.fields import save_field_panel
+from src.visualization.fields import save_field_panel, save_prediction_reference_error_panel
 from src.visualization.heatmaps import save_heatmap
 from src.visualization.streamlines import save_streamlines
 
@@ -585,6 +585,40 @@ class ExperimentTrainer:
                     "omega ref": maps["omega_ref"].reshape(shape),
                 },
                 self.figure_dir / "reference_fields.png",
+            )
+            error_fields = {
+                "u error": maps["u_error"].reshape(shape),
+                "v error": maps["v_error"].reshape(shape),
+                "p error centered": maps["p_error_mean_centered"].reshape(shape),
+                "omega error": maps["omega_error"].reshape(shape),
+            }
+            save_field_panel(X, Y, error_fields, self.figure_dir / "error_fields.png", cmap="magma")
+            save_prediction_reference_error_panel(
+                X,
+                Y,
+                {
+                    "u": (
+                        maps["u_pred"].reshape(shape),
+                        maps["u_ref"].reshape(shape),
+                        maps["u_error"].reshape(shape),
+                    ),
+                    "v": (
+                        maps["v_pred"].reshape(shape),
+                        maps["v_ref"].reshape(shape),
+                        maps["v_error"].reshape(shape),
+                    ),
+                    "p": (
+                        maps["p_pred"].reshape(shape),
+                        maps["p_ref"].reshape(shape),
+                        maps["p_error_mean_centered"].reshape(shape),
+                    ),
+                    "omega": (
+                        maps["omega_pred"].reshape(shape),
+                        maps["omega_ref"].reshape(shape),
+                        maps["omega_error"].reshape(shape),
+                    ),
+                },
+                self.figure_dir / "prediction_reference_error.png",
             )
         heatmap_names = [
             "u_error",
