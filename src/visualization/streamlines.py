@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -19,4 +22,3 @@ def save_streamlines(X: np.ndarray, Y: np.ndarray, U: np.ndarray, V: np.ndarray,
     ax.set_title("Streamlines")
     fig.savefig(path, dpi=180)
     plt.close(fig)
-

@@ -2,7 +2,6 @@ from pathlib import Path
 import sys
 
 import numpy as np
-import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -94,30 +93,3 @@ def test_final_physics_repair_runs_global_guarded_stage(tmp_path):
     assert status["batch_n_boundary"] == 8
     assert np.isfinite(status["pre_repair_score"])
     assert np.isfinite(status["post_repair_score"])
-
-
-def test_repair_collateral_guard_accepts_bounded_damage(tmp_path):
-    trainer = VARATrainer(_tiny_cavity_config(tmp_path, enabled=False), mode="vanilla_pinn")
-    ok, report = trainer._repair_collateral_ok(
-        {"pde_residual_mean": 1.0, "momentum_residual_mean": 2.0},
-        {"pde_residual_mean": 1.05, "momentum_residual_mean": 2.20},
-        {"collateral_tolerances": {"pde_residual_mean": 0.10, "momentum_residual_mean": 0.18}},
-    )
-
-    assert ok is True
-    assert report["collateral_metric_status"] == "ok"
-    assert report["collateral_pde_residual_mean_damage"] == pytest.approx(0.05)
-    assert report["collateral_momentum_residual_mean_damage"] == pytest.approx(0.10)
-
-
-def test_repair_collateral_guard_rejects_excessive_damage(tmp_path):
-    trainer = VARATrainer(_tiny_cavity_config(tmp_path, enabled=False), mode="vanilla_pinn")
-    ok, report = trainer._repair_collateral_ok(
-        {"pde_residual_mean": 1.0, "momentum_residual_mean": 2.0},
-        {"pde_residual_mean": 1.12, "momentum_residual_mean": 2.10},
-        {"collateral_tolerances": {"pde_residual_mean": 0.10, "momentum_residual_mean": 0.18}},
-    )
-
-    assert ok is False
-    assert report["collateral_metric_status"] == "failed:pde_residual_mean"
-    assert report["collateral_max_damage"] == pytest.approx(0.12)

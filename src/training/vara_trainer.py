@@ -17,6 +17,7 @@ from src.controllers import (
     VARAController,
 )
 from src.diagnostics import DiagnosticMapBuilder
+from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.trainer import ExperimentTrainer
 from src.utils.io import ensure_dir, save_json
 from src.utils.logging import CSVLogger, JSONListLogger
@@ -86,6 +87,8 @@ class VARATrainer(ExperimentTrainer):
         self.local_weight_records: list[dict[str, Any]] = []
 
     def run(self) -> dict[str, float]:
+        if self.mode == "rar_pinn":
+            return self._run_rar()
         if self.mode in {"local_vara", "local_constrained_vara"}:
             return self._run_local(constrained=self.mode == "local_constrained_vara")
         if self.mode == "full_vara_constrained":
@@ -132,6 +135,72 @@ class VARATrainer(ExperimentTrainer):
         metrics["rejected_interventions"] = self.rejected_interventions
         metrics["rollback_count"] = self.rollback_count
         return metrics
+
+    def _run_rar(self) -> dict[str, float]:
+        """Residual adaptive refinement baseline without VARA controller logic."""
+        train_cfg = self.config.get("training", {})
+        cycles = int(train_cfg.get("adaptive_cycles", 2))
+        batch = self.initial_batch()
+        rng = np.random.default_rng(self.seed + 424242)
+
+        for cycle in range(cycles):
+            self.train_epochs(batch, None, cycle=cycle, log_prefix="rar_main")
+            maps, scores, names, _weak_regions, X, Y, coords = self.diagnose()
+            metrics = self._validation_metrics(coords)
+            self.metrics_logger.log({"cycle": cycle, "phase": "rar_after", **metrics})
+            self.score_logger.log({"cycle": cycle, "diagnostics": names, "scores": scores})
+            self.weak_logger.log({"cycle": cycle, "weak_regions": []})
+            save_patch_score_map(scores, names, self.figure_dir / f"patch_scores_cycle_{cycle:03d}.png")
+            record = {"cycle": cycle, "stage": "rar_residual_refinement", "weak_regions": [], "actions": []}
+            self.action_logger.log(record)
+            self.actions_logger.log(record)
+            self.action_records.append(record)
+            self.maybe_checkpoint(cycle, metrics)
+            batch = self._resample_rar_batch(maps, coords, rng)
+
+        self.run_final_physics_repair(cycle=cycles, log_prefix="final_physics_repair")
+        metrics = self.evaluate_and_save_final()
+        metrics["J_score"] = self._j_score(metrics)
+        metrics["accepted_interventions"] = 0
+        metrics["rejected_interventions"] = 0
+        metrics["rollback_count"] = 0
+        metrics["number_of_active_patches"] = 0
+        metrics["most_frequently_targeted_variable"] = None
+        metrics["most_frequently_targeted_patch"] = None
+        pd.DataFrame([metrics]).to_csv(self.run_dir / "summary_table.csv", index=False)
+        pd.DataFrame([metrics]).to_csv(self.table_dir / "summary.csv", index=False)
+        save_json(metrics, self.run_dir / "summary.json")
+        return metrics
+
+    def _resample_rar_batch(
+        self,
+        maps: dict[str, np.ndarray],
+        coords: np.ndarray,
+        rng: np.random.Generator,
+    ) -> dict[str, Any]:
+        """Resample collocation points from PDE residuals only, with no controller state."""
+        train_cfg = self.config.get("training", {})
+        rar_cfg = self.config.get("rar", {})
+        n_f = int(train_cfg.get("n_collocation", 1024))
+        n_bc = int(train_cfg.get("n_boundary", 256))
+        n_data = int(train_cfg.get("n_data", 256))
+        residual_fraction = float(np.clip(float(rar_cfg.get("residual_fraction", 0.5)), 0.0, 1.0))
+        n_residual = int(round(n_f * residual_fraction))
+        n_uniform = n_f - n_residual
+        pieces = []
+        if n_uniform > 0:
+            pieces.append(self.uniform_sampler.sample(n_uniform).detach().cpu().numpy())
+        score = maps.get("aggregate_pde_residual", maps.get("pde_residual"))
+        if n_residual > 0 and score is not None:
+            pieces.append(sample_from_score_grid(coords, score, n_residual, rng))
+        elif n_residual > 0:
+            pieces.append(self.uniform_sampler.sample(n_residual).detach().cpu().numpy())
+        xy_f_np = np.vstack([piece for piece in pieces if piece.size])
+        rng.shuffle(xy_f_np)
+        xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)
+        xy_bc = self._sample_boundary(n_bc)
+        xy_data = self.uniform_sampler.sample(n_data)
+        return self.make_batch(xy_f, xy_bc, xy_data)
 
     def _run_constrained(self) -> dict[str, float]:
         """Constrained VARA: try, evaluate, accept/rollback, then continue."""

@@ -29,7 +29,7 @@ from src.physics.rectangular_benchmarks import (
 )
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
 from src.sampling.residual_sampler import sample_from_score_grid
-from src.training.checkpointing import save_checkpoint
+from src.training.checkpointing import load_checkpoint, save_checkpoint
 from src.training.lbfgs_utils import make_lbfgs_closure
 from src.utils.config import save_config
 from src.utils.device import get_device
@@ -37,7 +37,7 @@ from src.utils.io import ensure_dir, save_json
 from src.utils.logging import CSVLogger, JSONListLogger, make_run_id
 from src.utils.seed import set_seed
 from src.visualization.controller_plots import save_intervention_timeline, save_patch_score_map
-from src.visualization.fields import save_field_panel
+from src.visualization.fields import save_field_panel, save_prediction_reference_error_panel
 from src.visualization.heatmaps import save_heatmap
 from src.visualization.streamlines import save_streamlines
 
@@ -58,6 +58,7 @@ class ExperimentTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(optim_cfg.get("lr", 1e-3)))
         self.optimizer_stage = "adam"
         self.final_repair_status: dict[str, Any] = {}
+        self.warm_start_status = self._maybe_load_warm_start(config)
         self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
@@ -90,11 +91,18 @@ class ExperimentTrainer:
         exp_cfg = config.get("experiments", {})
         root = Path(exp_cfg.get("root", "experiments"))
         self.run_id = exp_cfg.get("run_id") or make_run_id(config.get("benchmark", "kovasznay"), mode, self.seed)
-        self.run_dir = ensure_dir(root / "logs" / self.run_id)
-        self.checkpoint_dir = ensure_dir(root / "checkpoints" / self.run_id)
-        self.figure_dir = ensure_dir(root / "figures" / self.run_id)
-        self.table_dir = ensure_dir(root / "tables" / self.run_id)
-        self.metrics_dir = ensure_dir(root / "metrics" / self.run_id)
+        if bool(exp_cfg.get("flat_layout", False)):
+            self.run_dir = ensure_dir(root / "logs")
+            self.checkpoint_dir = ensure_dir(root / "checkpoints")
+            self.figure_dir = ensure_dir(root / "figures")
+            self.table_dir = ensure_dir(root / "tables")
+            self.metrics_dir = ensure_dir(root / "metrics")
+        else:
+            self.run_dir = ensure_dir(root / "logs" / self.run_id)
+            self.checkpoint_dir = ensure_dir(root / "checkpoints" / self.run_id)
+            self.figure_dir = ensure_dir(root / "figures" / self.run_id)
+            self.table_dir = ensure_dir(root / "tables" / self.run_id)
+            self.metrics_dir = ensure_dir(root / "metrics" / self.run_id)
         save_config(config, self.run_dir / "config_snapshot.yaml")
 
         self.metrics_logger = CSVLogger(self.run_dir / "metrics.csv")
@@ -116,6 +124,30 @@ class ExperimentTrainer:
             self.seed + 2,
             mixture=sampler_cfg.get("mixture"),
         )
+
+    def _maybe_load_warm_start(self, config: dict[str, Any]) -> dict[str, Any]:
+        checkpoint = config.get("warm_start_checkpoint")
+        if not checkpoint:
+            return {"enabled": False, "loaded": False}
+        path = Path(checkpoint)
+        if not path.exists():
+            raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
+        warm_cfg = config.get("warm_start", {})
+        load_optimizer = bool(warm_cfg.get("load_optimizer", False))
+        try:
+            payload = load_checkpoint(path, self.model, self.optimizer if load_optimizer else None)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Could not warm-start from {path}. Check that the model architecture matches the checkpoint."
+            ) from exc
+        return {
+            "enabled": True,
+            "loaded": True,
+            "checkpoint": str(path),
+            "load_optimizer": load_optimizer,
+            "source_epoch": payload.get("epoch"),
+            "source_cycle": payload.get("cycle"),
+        }
 
     def _build_benchmark(self, config: dict[str, Any]) -> Any:
         name = config.get("benchmark", "kovasznay").lower()
@@ -464,14 +496,8 @@ class ExperimentTrainer:
         after_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
         _, after_score = self._repair_score(after_metrics)
         tolerance = float(cfg.get("acceptance_tolerance", 0.0))
-        score_ok = bool(after_score <= before_score * (1.0 + tolerance))
-        collateral_ok, collateral_report = self._repair_collateral_ok(before_metrics, after_metrics, cfg)
-        accepted = bool(score_ok and collateral_ok)
-        reason = "accepted"
-        if not score_ok:
-            reason = "validation_score_worsened"
-        elif not collateral_ok:
-            reason = "collateral_damage_exceeded"
+        accepted = bool(after_score <= before_score * (1.0 + tolerance))
+        reason = "accepted" if accepted else "validation_score_worsened"
         if not accepted:
             self._restore_model_snapshot(model_snapshot)
             self.optimizer = previous_optimizer
@@ -485,13 +511,10 @@ class ExperimentTrainer:
             "score_name": score_name,
             "pre_repair_score": float(before_score),
             "post_repair_score": float(after_score),
-            "score_ok": score_ok,
-            "collateral_ok": collateral_ok,
             "epochs": steps,
             "batch_n_collocation": int(repair_batch["xy_f"].shape[0]),
             "batch_n_boundary": int(repair_batch["xy_bc"].shape[0]),
             "global_only": True,
-            **collateral_report,
         }
         self.metrics_logger.log({"cycle": cycle, "phase": log_prefix, **self.final_repair_status})
         return self.final_repair_status
@@ -507,51 +530,7 @@ class ExperimentTrainer:
         cfg.setdefault("line_search_fn", "strong_wolfe")
         cfg.setdefault("batch_multiplier", 2.0)
         cfg.setdefault("residual_fraction", 0.25)
-        cfg.setdefault("collateral_tolerances", {})
         return cfg
-
-    def _repair_collateral_ok(
-        self,
-        before_metrics: dict[str, Any],
-        after_metrics: dict[str, Any],
-        cfg: dict[str, Any],
-    ) -> tuple[bool, dict[str, float | str]]:
-        tolerances = dict(cfg.get("collateral_tolerances", {}))
-        if not tolerances:
-            return True, {
-                "collateral_metric_status": "disabled",
-                "collateral_max_damage": 0.0,
-            }
-        ok = True
-        max_damage = 0.0
-        worst_metric = ""
-        report: dict[str, float | str] = {"collateral_metric_status": "ok"}
-        for metric_name, tolerance in tolerances.items():
-            before = self._finite_metric(before_metrics, str(metric_name))
-            after = self._finite_metric(after_metrics, str(metric_name))
-            if before is None or after is None:
-                report[f"collateral_{metric_name}_damage"] = float("nan")
-                continue
-            damage = max(0.0, (after - before) / (abs(before) + 1e-12))
-            report[f"collateral_{metric_name}_damage"] = float(damage)
-            report[f"collateral_{metric_name}_tolerance"] = float(tolerance)
-            if damage > max_damage:
-                max_damage = float(damage)
-                worst_metric = str(metric_name)
-            if damage > float(tolerance):
-                ok = False
-        if not ok:
-            report["collateral_metric_status"] = f"failed:{worst_metric}"
-        report["collateral_max_damage"] = float(max_damage)
-        report["collateral_worst_metric"] = worst_metric
-        return ok, report
-
-    def _finite_metric(self, metrics: dict[str, Any], name: str) -> float | None:
-        try:
-            value = float(metrics.get(name))
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
 
     def _repair_weights(self, cfg: dict[str, Any]) -> dict[str, float]:
         weights = dict(self.config.get("training", {}).get("weights", {}))
@@ -668,6 +647,8 @@ class ExperimentTrainer:
         metrics["optimizer_stage"] = self.optimizer_stage
         for key, value in self.final_repair_status.items():
             metrics[f"final_repair_{key}"] = value
+        for key, value in self.warm_start_status.items():
+            metrics[f"warm_start_{key}"] = value
         metrics["reference_kind"] = getattr(self.benchmark, "reference_kind", "analytical")
         metrics["has_reference"] = bool(getattr(self.benchmark, "has_reference", True))
         metrics["run_type"] = str(self.config.get("run_type", "full"))
@@ -719,8 +700,56 @@ class ExperimentTrainer:
                 },
                 self.figure_dir / "reference_fields.png",
             )
-        for name in ["u_error", "v_error", "p_error_mean_centered", "omega_error", "pde_residual"]:
-            save_heatmap(maps[name].reshape(shape), X, Y, self.figure_dir / f"{name}.png", name)
+            error_fields = {
+                "u error": maps["u_error"].reshape(shape),
+                "v error": maps["v_error"].reshape(shape),
+                "p error centered": maps["p_error_mean_centered"].reshape(shape),
+                "omega error": maps["omega_error"].reshape(shape),
+            }
+            save_field_panel(X, Y, error_fields, self.figure_dir / "error_fields.png", cmap="magma")
+            save_prediction_reference_error_panel(
+                X,
+                Y,
+                {
+                    "u": (
+                        maps["u_pred"].reshape(shape),
+                        maps["u_ref"].reshape(shape),
+                        maps["u_error"].reshape(shape),
+                    ),
+                    "v": (
+                        maps["v_pred"].reshape(shape),
+                        maps["v_ref"].reshape(shape),
+                        maps["v_error"].reshape(shape),
+                    ),
+                    "p": (
+                        maps["p_pred"].reshape(shape),
+                        maps["p_ref"].reshape(shape),
+                        maps["p_error_mean_centered"].reshape(shape),
+                    ),
+                    "omega": (
+                        maps["omega_pred"].reshape(shape),
+                        maps["omega_ref"].reshape(shape),
+                        maps["omega_error"].reshape(shape),
+                    ),
+                },
+                self.figure_dir / "prediction_reference_error.png",
+            )
+        heatmap_names = [
+            "u_error",
+            "v_error",
+            "p_error_mean_centered",
+            "omega_error",
+            "pde_residual",
+            "continuity_residual",
+            "momentum_u_residual",
+            "momentum_v_residual",
+        ]
+        for name in heatmap_names:
+            if name in maps:
+                save_heatmap(maps[name].reshape(shape), X, Y, self.figure_dir / f"{name}.png", name)
+        if "momentum_u_residual" in maps and "momentum_v_residual" in maps:
+            momentum = np.sqrt(maps["momentum_u_residual"] ** 2 + maps["momentum_v_residual"] ** 2)
+            save_heatmap(momentum.reshape(shape), X, Y, self.figure_dir / "momentum_residual.png", "momentum_residual")
         save_streamlines(
             X,
             Y,

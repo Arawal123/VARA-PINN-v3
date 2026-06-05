@@ -21,7 +21,7 @@ pde:
 model:
   input_dim: 2
   output_dim: 3
-  hidden_layers: [64, 64, 64]
+  hidden_layers: [96, 96, 96]
   activation: tanh
 
 optimizer:
@@ -51,11 +51,11 @@ optimizer:
       pressure_gradient: 0.0
 
 training:
-  adaptive_cycles: 4
-  epochs_per_cycle: 100
+  adaptive_cycles: 5
+  epochs_per_cycle: 150
   log_every: 25
-  n_collocation: 2048
-  n_boundary: 768
+  n_collocation: 3072
+  n_boundary: 1024
   n_data: 0
   weights:
     pde: 1.0
@@ -70,12 +70,12 @@ training:
     pressure_gradient: 0.0
 
 validation:
-  nx: 48
-  ny: 48
-
-test:
   nx: 64
   ny: 64
+
+test:
+  nx: 96
+  ny: 96
 
 diagnostics:
   mode: residual_only
@@ -122,12 +122,7 @@ local_controller:
   corner_boundary_hard_tolerance: 0.005
   u_boundary_hard_tolerance: 0.005
   v_boundary_hard_tolerance: 0.005
-  trial_epochs: 15
-  patch_type_aware: true
-  interior_trial_epochs: 15
-  wall_trial_epochs: 10
-  corner_trial_epochs: 5
-  sampling_only_trial_epochs: 5
+  trial_epochs: 10
   max_actions_per_cycle: 3
   initial_strength: 0.30
   damping_factor: 0.5
@@ -136,10 +131,6 @@ local_controller:
   strong_target_factor: 2.0
   wall_patch_strength_factor: 0.70
   corner_patch_strength_factor: 0.50
-  interior_pde_strength_factor: 1.15
-  centerline_patch_strength_factor: 1.0
-  strict_wall_boundary_acceptance: true
-  wall_boundary_worsen_tolerance: 0.0
   boundary_patch_margin: 1.0e-9
   rejection_recovery_epochs: 10
   local_velocity_weight_max: 1.5
@@ -162,24 +153,16 @@ local_controller:
 
 sampling:
   mixture:
-    uniform: 0.45
-    pde_residual: 0.25
+    uniform: 0.40
+    pde_residual: 0.28
     pressure_vorticity: 0.08
-    velocity: 0.10
-    boundary: 0.12
+    velocity: 0.08
+    boundary: 0.16
   cavity_boundary:
     enabled: true
-    lid_fraction: 0.45
-    corner_fraction: 0.25
-    corner_width: 0.12
-  cavity_focus:
-    enabled: true
-    near_wall_fraction: 0.12
-    centerline_fraction: 0.10
-    lid_fraction: 0.06
-    corner_fraction: 0.04
-    strip_width: 0.08
-    centerline_width: 0.04
+    lid_fraction: 0.50
+    corner_fraction: 0.30
+    corner_width: 0.14
 
 experiments:
-  root: experiments
+  root: experiments/lid_cavity_re_continuation_comparison

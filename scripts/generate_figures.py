@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -31,4 +34,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

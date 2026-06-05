@@ -20,6 +20,7 @@ MODES = [
     "region_only_adaptive",
     "variable_only_adaptive",
     "residual_adaptive_sampling",
+    "rar_pinn",
     "global_vorticity_loss",
     "global_pressure_correction",
 ]
@@ -39,4 +40,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
