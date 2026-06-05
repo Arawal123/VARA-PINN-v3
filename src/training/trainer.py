@@ -29,7 +29,7 @@ from src.physics.rectangular_benchmarks import (
 )
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
 from src.sampling.residual_sampler import sample_from_score_grid
-from src.training.checkpointing import save_checkpoint
+from src.training.checkpointing import load_checkpoint, save_checkpoint
 from src.training.lbfgs_utils import make_lbfgs_closure
 from src.utils.config import save_config
 from src.utils.device import get_device
@@ -58,6 +58,7 @@ class ExperimentTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(optim_cfg.get("lr", 1e-3)))
         self.optimizer_stage = "adam"
         self.final_repair_status: dict[str, Any] = {}
+        self.warm_start_status = self._maybe_load_warm_start(config)
         self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
@@ -90,11 +91,18 @@ class ExperimentTrainer:
         exp_cfg = config.get("experiments", {})
         root = Path(exp_cfg.get("root", "experiments"))
         self.run_id = exp_cfg.get("run_id") or make_run_id(config.get("benchmark", "kovasznay"), mode, self.seed)
-        self.run_dir = ensure_dir(root / "logs" / self.run_id)
-        self.checkpoint_dir = ensure_dir(root / "checkpoints" / self.run_id)
-        self.figure_dir = ensure_dir(root / "figures" / self.run_id)
-        self.table_dir = ensure_dir(root / "tables" / self.run_id)
-        self.metrics_dir = ensure_dir(root / "metrics" / self.run_id)
+        if bool(exp_cfg.get("flat_layout", False)):
+            self.run_dir = ensure_dir(root / "logs")
+            self.checkpoint_dir = ensure_dir(root / "checkpoints")
+            self.figure_dir = ensure_dir(root / "figures")
+            self.table_dir = ensure_dir(root / "tables")
+            self.metrics_dir = ensure_dir(root / "metrics")
+        else:
+            self.run_dir = ensure_dir(root / "logs" / self.run_id)
+            self.checkpoint_dir = ensure_dir(root / "checkpoints" / self.run_id)
+            self.figure_dir = ensure_dir(root / "figures" / self.run_id)
+            self.table_dir = ensure_dir(root / "tables" / self.run_id)
+            self.metrics_dir = ensure_dir(root / "metrics" / self.run_id)
         save_config(config, self.run_dir / "config_snapshot.yaml")
 
         self.metrics_logger = CSVLogger(self.run_dir / "metrics.csv")
@@ -116,6 +124,30 @@ class ExperimentTrainer:
             self.seed + 2,
             mixture=sampler_cfg.get("mixture"),
         )
+
+    def _maybe_load_warm_start(self, config: dict[str, Any]) -> dict[str, Any]:
+        checkpoint = config.get("warm_start_checkpoint")
+        if not checkpoint:
+            return {"enabled": False, "loaded": False}
+        path = Path(checkpoint)
+        if not path.exists():
+            raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
+        warm_cfg = config.get("warm_start", {})
+        load_optimizer = bool(warm_cfg.get("load_optimizer", False))
+        try:
+            payload = load_checkpoint(path, self.model, self.optimizer if load_optimizer else None)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Could not warm-start from {path}. Check that the model architecture matches the checkpoint."
+            ) from exc
+        return {
+            "enabled": True,
+            "loaded": True,
+            "checkpoint": str(path),
+            "load_optimizer": load_optimizer,
+            "source_epoch": payload.get("epoch"),
+            "source_cycle": payload.get("cycle"),
+        }
 
     def _build_benchmark(self, config: dict[str, Any]) -> Any:
         name = config.get("benchmark", "kovasznay").lower()
@@ -501,6 +533,8 @@ class ExperimentTrainer:
         metrics["optimizer_stage"] = self.optimizer_stage
         for key, value in self.final_repair_status.items():
             metrics[f"final_repair_{key}"] = value
+        for key, value in self.warm_start_status.items():
+            metrics[f"warm_start_{key}"] = value
         metrics["reference_kind"] = getattr(self.benchmark, "reference_kind", "analytical")
         metrics["has_reference"] = bool(getattr(self.benchmark, "has_reference", True))
         metrics["run_type"] = str(self.config.get("run_type", "full"))
@@ -552,8 +586,22 @@ class ExperimentTrainer:
                 },
                 self.figure_dir / "reference_fields.png",
             )
-        for name in ["u_error", "v_error", "p_error_mean_centered", "omega_error", "pde_residual"]:
-            save_heatmap(maps[name].reshape(shape), X, Y, self.figure_dir / f"{name}.png", name)
+        heatmap_names = [
+            "u_error",
+            "v_error",
+            "p_error_mean_centered",
+            "omega_error",
+            "pde_residual",
+            "continuity_residual",
+            "momentum_u_residual",
+            "momentum_v_residual",
+        ]
+        for name in heatmap_names:
+            if name in maps:
+                save_heatmap(maps[name].reshape(shape), X, Y, self.figure_dir / f"{name}.png", name)
+        if "momentum_u_residual" in maps and "momentum_v_residual" in maps:
+            momentum = np.sqrt(maps["momentum_u_residual"] ** 2 + maps["momentum_v_residual"] ** 2)
+            save_heatmap(momentum.reshape(shape), X, Y, self.figure_dir / "momentum_residual.png", "momentum_residual")
         save_streamlines(
             X,
             Y,

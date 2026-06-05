@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -17,4 +20,3 @@ def save_ablation_bar(table: pd.DataFrame, metric: str, path: str | Path) -> Non
     ax.set_xticklabels(table["mode"], rotation=30, ha="right")
     fig.savefig(path, dpi=180)
     plt.close(fig)
-

@@ -1,0 +1,168 @@
+benchmark: lid_driven_cavity
+seed: 0
+deterministic: true
+device: auto
+
+benchmark_params:
+  reynolds: 100.0
+  x_min: 0.0
+  x_max: 1.0
+  y_min: 0.0
+  y_max: 1.0
+  lid_velocity: 1.0
+  reference: ghia
+  reference_path: null
+  full_field_reference_path: null
+  profile_only: true
+
+pde:
+  steady: true
+
+model:
+  input_dim: 2
+  output_dim: 3
+  hidden_layers: [96, 96, 96]
+  activation: tanh
+
+optimizer:
+  name: adam
+  lr: 0.001
+  final_repair:
+    enabled: true
+    score_metric: cavity_benchmark_score
+    acceptance_tolerance: 0.0
+    epochs: 8
+    lr: 0.5
+    max_iter: 5
+    history_size: 20
+    line_search_fn: strong_wolfe
+    batch_multiplier: 2.0
+    residual_fraction: 0.30
+    weights:
+      pde: 0.5
+      momentum_u: 1.0
+      momentum_v: 1.0
+      continuity: 1.5
+      bc: 6.0
+      u: 0.0
+      v: 0.0
+      p: 0.0
+      omega: 0.0
+      pressure_gradient: 0.0
+
+training:
+  adaptive_cycles: 5
+  epochs_per_cycle: 150
+  log_every: 25
+  n_collocation: 3072
+  n_boundary: 1024
+  n_data: 0
+  weights:
+    pde: 1.0
+    momentum_u: 1.0
+    momentum_v: 1.0
+    continuity: 1.0
+    bc: 5.0
+    u: 0.0
+    v: 0.0
+    p: 0.0
+    omega: 0.0
+    pressure_gradient: 0.0
+
+validation:
+  nx: 64
+  ny: 64
+
+test:
+  nx: 96
+  ny: 96
+
+diagnostics:
+  mode: residual_only
+  variables:
+    - continuity_residual
+    - momentum_u_residual
+    - momentum_v_residual
+    - aggregate_pde_residual
+    - centerline_pde_residual
+    - centerline_continuity_residual
+    - corner_pde_residual
+    - corner_boundary_error
+    - boundary_violation
+  aggregation: mean
+  aggregation_percentile: 90.0
+  normalization: percentile
+  ema_rho: 0.7
+
+patches:
+  nx_patches: 4
+  ny_patches: 4
+  nt_patches: 1
+
+weak_regions:
+  percentile_threshold: 75.0
+  top_k_per_variable: 1
+  min_active_patches: 1
+  max_active_patches: 6
+  persistence_cycles: 1
+
+local_controller:
+  enabled: true
+  constrained: true
+  min_improvement: 0.005
+  collateral_tolerance: 0.10
+  pressure_collateral_tolerance: 0.05
+  continuity_collateral_tolerance: 0.05
+  boundary_collateral_tolerance: 0.005
+  validation_loss_tolerance: 0.010
+  pde_hard_tolerance: 0.005
+  boundary_hard_tolerance: 0.002
+  validation_loss_hard_tolerance: 0.005
+  centerline_pde_hard_tolerance: 0.025
+  corner_boundary_hard_tolerance: 0.005
+  u_boundary_hard_tolerance: 0.005
+  v_boundary_hard_tolerance: 0.005
+  trial_epochs: 10
+  max_actions_per_cycle: 3
+  initial_strength: 0.30
+  damping_factor: 0.5
+  warmup_cycles: 2
+  tiny_j_tolerance: 0.002
+  strong_target_factor: 2.0
+  wall_patch_strength_factor: 0.70
+  corner_patch_strength_factor: 0.50
+  boundary_patch_margin: 1.0e-9
+  rejection_recovery_epochs: 10
+  local_velocity_weight_max: 1.5
+  local_pressure_weight_max: 1.5
+  local_omega_weight_max: 1.5
+  local_pde_weight_max: 1.5
+  local_bc_weight_max: 5.0
+  objective_weights:
+    residual: 0.5
+    continuity: 1.75
+    momentum: 0.75
+    boundary: 3.0
+    unweighted_validation: 0.75
+    centerline_pde: 0.75
+    centerline_continuity: 0.50
+    corner_pde: 0.25
+    corner_boundary: 1.00
+    u_boundary: 0.50
+    v_boundary: 0.75
+
+sampling:
+  mixture:
+    uniform: 0.40
+    pde_residual: 0.28
+    pressure_vorticity: 0.08
+    velocity: 0.08
+    boundary: 0.16
+  cavity_boundary:
+    enabled: true
+    lid_fraction: 0.50
+    corner_fraction: 0.30
+    corner_width: 0.14
+
+experiments:
+  root: experiments/lid_cavity_re_continuation_comparison
