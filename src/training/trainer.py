@@ -575,17 +575,19 @@ class ExperimentTrainer:
             self.figure_dir / "predicted_fields.png",
         )
         if getattr(self.benchmark, "has_reference", True):
+            reference_fields = {
+                "u ref": maps["u_ref"].reshape(shape),
+                "v ref": maps["v_ref"].reshape(shape),
+                "p ref centered": maps["p_ref"].reshape(shape),
+                "omega ref": maps["omega_ref"].reshape(shape),
+            }
             save_field_panel(
                 X,
                 Y,
-                {
-                    "u ref": maps["u_ref"].reshape(shape),
-                    "v ref": maps["v_ref"].reshape(shape),
-                    "p ref centered": maps["p_ref"].reshape(shape),
-                    "omega ref": maps["omega_ref"].reshape(shape),
-                },
+                reference_fields,
                 self.figure_dir / "reference_fields.png",
             )
+            save_field_panel(X, Y, reference_fields, self.figure_dir / "cfd_reference_fields.png")
             error_fields = {
                 "u error": maps["u_error"].reshape(shape),
                 "v error": maps["v_error"].reshape(shape),
@@ -593,32 +595,40 @@ class ExperimentTrainer:
                 "omega error": maps["omega_error"].reshape(shape),
             }
             save_field_panel(X, Y, error_fields, self.figure_dir / "error_fields.png", cmap="magma")
+            save_field_panel(X, Y, error_fields, self.figure_dir / "cfd_prediction_error_fields.png", cmap="magma")
+            prediction_reference_error_fields = {
+                "u": (
+                    maps["u_pred"].reshape(shape),
+                    maps["u_ref"].reshape(shape),
+                    maps["u_error"].reshape(shape),
+                ),
+                "v": (
+                    maps["v_pred"].reshape(shape),
+                    maps["v_ref"].reshape(shape),
+                    maps["v_error"].reshape(shape),
+                ),
+                "p": (
+                    maps["p_pred"].reshape(shape),
+                    maps["p_ref"].reshape(shape),
+                    maps["p_error_mean_centered"].reshape(shape),
+                ),
+                "omega": (
+                    maps["omega_pred"].reshape(shape),
+                    maps["omega_ref"].reshape(shape),
+                    maps["omega_error"].reshape(shape),
+                ),
+            }
             save_prediction_reference_error_panel(
                 X,
                 Y,
-                {
-                    "u": (
-                        maps["u_pred"].reshape(shape),
-                        maps["u_ref"].reshape(shape),
-                        maps["u_error"].reshape(shape),
-                    ),
-                    "v": (
-                        maps["v_pred"].reshape(shape),
-                        maps["v_ref"].reshape(shape),
-                        maps["v_error"].reshape(shape),
-                    ),
-                    "p": (
-                        maps["p_pred"].reshape(shape),
-                        maps["p_ref"].reshape(shape),
-                        maps["p_error_mean_centered"].reshape(shape),
-                    ),
-                    "omega": (
-                        maps["omega_pred"].reshape(shape),
-                        maps["omega_ref"].reshape(shape),
-                        maps["omega_error"].reshape(shape),
-                    ),
-                },
+                prediction_reference_error_fields,
                 self.figure_dir / "prediction_reference_error.png",
+            )
+            save_prediction_reference_error_panel(
+                X,
+                Y,
+                prediction_reference_error_fields,
+                self.figure_dir / "cfd_prediction_reference_error.png",
             )
         heatmap_names = [
             "u_error",

@@ -21,6 +21,13 @@ if str(ROOT) not in sys.path:
 
 
 METRICS = [
+    "u_full_rel_l2",
+    "v_full_rel_l2",
+    "velocity_full_rel_l2",
+    "p_full_rel_l2_centered",
+    "omega_full_rel_l2",
+    "velocity_mag_rmse",
+    "velocity_mag_mae",
     "u_rel_l2",
     "v_rel_l2",
     "p_rel_l2_centered",
@@ -142,6 +149,10 @@ def collect_rows(results_dir: Path) -> list[dict]:
             "most_frequently_targeted_patch": data.get("most_frequently_targeted_patch"),
             "collapsed": bool(data.get("collapsed", False)),
             "cavity_profile_reference_source": data.get("cavity_profile_reference_source", ""),
+            "full_field_reference_path": data.get("full_field_reference_path", ""),
+            "has_p_full_field_reference": data.get("has_p_full_field_reference", False),
+            "has_omega_full_field_reference": data.get("has_omega_full_field_reference", False),
+            "omega_full_field_reference_source": data.get("omega_full_field_reference_source", ""),
         }
         for metric in METRICS:
             row[metric] = data.get(metric, np.nan)
@@ -187,6 +198,20 @@ def build_cavity_table(methodwise: pd.DataFrame) -> pd.DataFrame:
         "run_type",
         "method",
         "n_runs",
+        "u_full_rel_l2_mean",
+        "u_full_rel_l2_std",
+        "v_full_rel_l2_mean",
+        "v_full_rel_l2_std",
+        "velocity_full_rel_l2_mean",
+        "velocity_full_rel_l2_std",
+        "p_full_rel_l2_centered_mean",
+        "p_full_rel_l2_centered_std",
+        "omega_full_rel_l2_mean",
+        "omega_full_rel_l2_std",
+        "velocity_mag_rmse_mean",
+        "velocity_mag_rmse_std",
+        "velocity_mag_mae_mean",
+        "velocity_mag_mae_std",
         "u_centerline_rmse_mean",
         "u_centerline_rmse_std",
         "v_centerline_rmse_mean",
@@ -275,6 +300,13 @@ def save_bar_plots(methodwise: pd.DataFrame, fig_dir: Path) -> None:
         vanilla = []
         vara = []
         for metric in [
+            "u_full_rel_l2",
+            "v_full_rel_l2",
+            "velocity_full_rel_l2",
+            "p_full_rel_l2_centered",
+            "omega_full_rel_l2",
+            "velocity_mag_rmse",
+            "velocity_mag_mae",
             "u_rmse",
             "v_rmse",
             "p_rmse_centered",

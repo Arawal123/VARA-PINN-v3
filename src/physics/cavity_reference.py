@@ -80,11 +80,45 @@ def interpolate_full_field(reference: dict[str, np.ndarray], xy: np.ndarray) -> 
     order = np.lexsort((x, y))
     out: dict[str, np.ndarray] = {}
     for name in ["u", "v", "p", "omega"]:
-        values = np.asarray(reference.get(name, np.zeros_like(x)), dtype=float).reshape(-1)[order].reshape(ny, nx)
+        values = np.asarray(reference.get(name, np.full_like(x, np.nan)), dtype=float).reshape(-1)[order].reshape(ny, nx)
         out[name] = _interp2(xu, yu, values, xy[:, 0], xy[:, 1]).reshape(-1, 1)
     out["speed"] = np.sqrt(out["u"] ** 2 + out["v"] ** 2)
     out["p_x"] = np.zeros_like(out["u"])
     out["p_y"] = np.zeros_like(out["u"])
+    out["has_p_reference"] = bool(reference.get("has_p_reference", np.isfinite(reference.get("p", [])).any()))
+    out["has_omega_reference"] = bool(reference.get("has_omega_reference", np.isfinite(reference.get("omega", [])).any()))
+    out["omega_reference_source"] = str(reference.get("omega_reference_source", "provided"))
+    out["source_path"] = str(reference.get("source_path", ""))
+    return out
+
+
+def validate_full_field_against_ghia(path: str | Path, reynolds: float) -> dict[str, float | str]:
+    """Compare a full-field CFD reference against built-in Ghia centerline profiles."""
+    reference = load_full_field_reference(path)
+    profile = load_lid_cavity_profile_reference("ghia", reynolds)
+    out: dict[str, float | str] = {
+        "reynolds": float(reynolds),
+        "full_field_reference_path": str(path),
+        "ghia_reference_source": profile.source,
+    }
+    if profile.has_u:
+        u_xy = np.column_stack([np.full(len(profile.u_profile), 0.5), profile.u_profile["y"].to_numpy(dtype=float)])
+        pred = interpolate_full_field(reference, u_xy)["u"]
+        ref = profile.u_profile["u_ref"].to_numpy(dtype=float).reshape(-1, 1)
+        out["cfd_vs_ghia_u_centerline_rmse"] = _rmse_np(pred, ref)
+        out["cfd_vs_ghia_u_centerline_rel_l2"] = _relative_l2_np(pred, ref)
+    else:
+        out["cfd_vs_ghia_u_centerline_rmse"] = float("nan")
+        out["cfd_vs_ghia_u_centerline_rel_l2"] = float("nan")
+    if profile.has_v:
+        v_xy = np.column_stack([profile.v_profile["x"].to_numpy(dtype=float), np.full(len(profile.v_profile), 0.5)])
+        pred = interpolate_full_field(reference, v_xy)["v"]
+        ref = profile.v_profile["v_ref"].to_numpy(dtype=float).reshape(-1, 1)
+        out["cfd_vs_ghia_v_centerline_rmse"] = _rmse_np(pred, ref)
+        out["cfd_vs_ghia_v_centerline_rel_l2"] = _relative_l2_np(pred, ref)
+    else:
+        out["cfd_vs_ghia_v_centerline_rmse"] = float("nan")
+        out["cfd_vs_ghia_v_centerline_rel_l2"] = float("nan")
     return out
 
 
@@ -134,9 +168,51 @@ def _columns_to_field_dict(columns: dict[str, Any], source: Path) -> dict[str, n
     n = len(out["x"])
     if any(len(values) != n for values in out.values()):
         raise ValueError(f"Full-field reference {source} has inconsistent column lengths.")
-    out.setdefault("p", np.zeros(n, dtype=float))
-    out.setdefault("omega", np.zeros(n, dtype=float))
+    out["has_p_reference"] = bool("p" in out and np.isfinite(out["p"]).any())
+    if "p" not in out:
+        out["p"] = np.full(n, np.nan, dtype=float)
+    provided_omega = bool("omega" in out and np.isfinite(out["omega"]).any())
+    if not provided_omega:
+        computed = _compute_structured_vorticity(out)
+        out["omega"] = computed if computed is not None else np.full(n, np.nan, dtype=float)
+        out["omega_reference_source"] = "computed_from_velocity" if computed is not None else "missing"
+    else:
+        out["omega_reference_source"] = "provided"
+    out["has_omega_reference"] = bool(np.isfinite(out["omega"]).any())
+    out["source_path"] = str(source)
     return out
+
+
+def _compute_structured_vorticity(columns: dict[str, np.ndarray]) -> np.ndarray | None:
+    x = np.asarray(columns["x"], dtype=float).reshape(-1)
+    y = np.asarray(columns["y"], dtype=float).reshape(-1)
+    u = np.asarray(columns["u"], dtype=float).reshape(-1)
+    v = np.asarray(columns["v"], dtype=float).reshape(-1)
+    xu = np.unique(x)
+    yu = np.unique(y)
+    nx, ny = len(xu), len(yu)
+    if nx < 2 or ny < 2 or nx * ny != x.size:
+        return None
+    order = np.lexsort((x, y))
+    u_grid = u[order].reshape(ny, nx)
+    v_grid = v[order].reshape(ny, nx)
+    du_dy = np.gradient(u_grid, yu, axis=0, edge_order=1)
+    dv_dx = np.gradient(v_grid, xu, axis=1, edge_order=1)
+    omega_grid = dv_dx - du_dy
+    inverse = np.empty_like(order)
+    inverse[order] = np.arange(order.size)
+    return omega_grid.reshape(-1)[inverse]
+
+
+def _relative_l2_np(pred: np.ndarray, true: np.ndarray, min_reference_norm: float = 1e-8) -> float:
+    ref_norm = float(np.linalg.norm(true))
+    if ref_norm < min_reference_norm:
+        return float("nan")
+    return float(np.linalg.norm(pred - true) / ref_norm)
+
+
+def _rmse_np(pred: np.ndarray, true: np.ndarray) -> float:
+    return float(np.sqrt(np.nanmean((pred - true) ** 2)))
 
 
 def _interp2(xu: np.ndarray, yu: np.ndarray, values: np.ndarray, xq: np.ndarray, yq: np.ndarray) -> np.ndarray:

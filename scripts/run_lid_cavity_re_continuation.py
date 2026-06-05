@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.benchmark_runner import BENCHMARK_DEFAULTS, METHOD_TO_MODE
+from src.physics.cavity_reference import load_full_field_reference, validate_full_field_against_ghia
 from src.training.vara_trainer import VARATrainer
 from src.utils.config import deep_update, load_config, save_config
 from src.utils.io import save_json
@@ -42,6 +43,13 @@ METRICS = [
     "final_total_loss",
 ]
 FULL_FIELD_METRICS = [
+    "u_full_rel_l2",
+    "v_full_rel_l2",
+    "velocity_full_rel_l2",
+    "p_full_rel_l2_centered",
+    "omega_full_rel_l2",
+    "velocity_mag_rmse",
+    "velocity_mag_mae",
     "u_rel_l2",
     "v_rel_l2",
     "p_rel_l2_centered",
@@ -102,6 +110,7 @@ def run_continuation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
             reference_info["full_field_reference_path"] = full_field_reference_path
             profile_available = _has_profile_reference(float(reynolds), reference_info)
             full_field_available = full_field_reference_path is not None
+            full_field_meta = _full_field_reference_metadata(full_field_reference_path) if full_field_available else {}
             reference_rows.append(
                 {
                     "seed": int(seed),
@@ -110,6 +119,9 @@ def run_continuation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     "profile_reference_available": profile_available,
                     "full_field_reference_available": full_field_available,
                     "full_field_reference_path": str(full_field_reference_path) if full_field_reference_path else None,
+                    "has_p_reference": full_field_meta.get("has_p_reference", False),
+                    "has_omega_reference": full_field_meta.get("has_omega_reference", False),
+                    "omega_reference_source": full_field_meta.get("omega_reference_source", ""),
                     "quantitative_reference_level": _quantitative_reference_level(profile_available, full_field_available),
                     "reference": reference_info["reference"],
                     "reference_path": reference_info.get("reference_path"),
@@ -164,6 +176,7 @@ def run_continuation(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     compare_df.to_csv(summary_dir / "vara_vs_vanilla_by_re.csv", index=False)
     wide_df.to_csv(summary_dir / "improvement_percent_by_re.csv", index=False)
     reference_df.to_csv(summary_dir / "available_reference_metrics_by_re.csv", index=False)
+    _save_cfd_reference_validation(full_field_reference_map, summary_dir)
     _save_summary_montages(out, summary_dir)
     _save_summary_bar_plots(compare_df, summary_dir)
     return {
@@ -326,6 +339,26 @@ def _full_field_reference_for_re(reynolds: float, reference_map: dict[float, Pat
     return None
 
 
+def _full_field_reference_metadata(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    reference = load_full_field_reference(path)
+    return {
+        "has_p_reference": bool(reference.get("has_p_reference", False)),
+        "has_omega_reference": bool(reference.get("has_omega_reference", False)),
+        "omega_reference_source": str(reference.get("omega_reference_source", "")),
+    }
+
+
+def _save_cfd_reference_validation(reference_map: dict[float, Path], summary_dir: Path) -> None:
+    rows = []
+    for reynolds, path in sorted(reference_map.items()):
+        if _has_builtin_ghia(reynolds):
+            rows.append(validate_full_field_against_ghia(path, reynolds))
+    if rows:
+        pd.DataFrame(rows).to_csv(summary_dir / "cfd_reference_vs_ghia_validation.csv", index=False)
+
+
 def _has_profile_reference(reynolds: float, reference_info: dict[str, Any]) -> bool:
     reference = str(reference_info.get("reference", "none")).lower()
     if reference == "ghia":
@@ -408,6 +441,12 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
             comparison_dir / "full_field_metric_comparison_bar.png",
             f"Re={float(vanilla['reynolds']):g} full-field CFD metrics (lower is better)",
         )
+        _save_metric_comparison_bar(
+            comparison_df,
+            FULL_FIELD_METRICS,
+            comparison_dir / "cfd_metric_comparison_bar.png",
+            f"Re={float(vanilla['reynolds']):g} CFD reference metrics (lower is better)",
+        )
     _save_image_grid(
         [
             (Path(vanilla["method_dir"]) / "figures" / "streamlines.png", "Vanilla streamlines"),
@@ -431,8 +470,8 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
         title=f"Re={float(vanilla['reynolds']):g} residuals",
     )
     error_items = [
-        (Path(vanilla["method_dir"]) / "figures" / "error_fields.png", "Vanilla full-field errors"),
-        (Path(vara["method_dir"]) / "figures" / "error_fields.png", "VARA full-field errors"),
+        (Path(vanilla["method_dir"]) / "figures" / "cfd_prediction_error_fields.png", "Vanilla CFD errors"),
+        (Path(vara["method_dir"]) / "figures" / "cfd_prediction_error_fields.png", "VARA CFD errors"),
     ]
     if any(path.exists() for path, _ in error_items):
         _save_image_grid(
@@ -440,6 +479,12 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
             comparison_dir / "full_field_error_side_by_side.png",
             cols=2,
             title=f"Re={float(vanilla['reynolds']):g} full-field errors",
+        )
+        _save_image_grid(
+            error_items,
+            comparison_dir / "cfd_error_side_by_side.png",
+            cols=2,
+            title=f"Re={float(vanilla['reynolds']):g} CFD full-field errors",
         )
 
 
@@ -470,6 +515,12 @@ def _save_summary_bar_plots(compare_df: pd.DataFrame, summary_dir: Path) -> None
             FULL_FIELD_METRICS,
             summary_dir / "full_field_metric_improvement_by_re_bar.png",
             "Full-field CFD metric improvement over Vanilla by Reynolds number",
+        )
+        _save_improvement_by_re_bar(
+            compare_df,
+            FULL_FIELD_METRICS,
+            summary_dir / "cfd_metric_improvement_by_re_bar.png",
+            "CFD metric improvement over Vanilla by Reynolds number",
         )
 
 

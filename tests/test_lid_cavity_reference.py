@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.evaluation.metrics import evaluate_on_grid
-from src.physics.cavity_reference import load_lid_cavity_profile_reference
+from src.physics.cavity_reference import load_full_field_reference, load_lid_cavity_profile_reference, validate_full_field_against_ghia
 from src.physics.rectangular_benchmarks import LidDrivenCavityQualitative
 
 
@@ -62,3 +62,63 @@ def test_cavity_profile_metrics_are_finite():
     assert np.isfinite(metrics["centerline_profile_score"])
     assert np.isfinite(metrics["cavity_benchmark_score"])
     assert np.isnan(metrics["u_rel_l2"])
+
+
+def test_full_field_reference_missing_pressure_preserves_nan_and_computes_omega(tmp_path):
+    path = tmp_path / "full_field_no_pressure.npz"
+    x = np.linspace(0.0, 1.0, 6)
+    y = np.linspace(0.0, 1.0, 6)
+    X, Y = np.meshgrid(x, y)
+    np.savez(path, x=X.reshape(-1), y=Y.reshape(-1), u=Y.reshape(-1), v=(-X).reshape(-1))
+
+    ref = load_full_field_reference(path)
+
+    assert not ref["has_p_reference"]
+    assert np.isnan(ref["p"]).all()
+    assert ref["has_omega_reference"]
+    assert ref["omega_reference_source"] == "computed_from_velocity"
+    assert np.isfinite(ref["omega"]).all()
+
+
+def test_full_field_cfd_metrics_are_evaluation_only_and_named(tmp_path):
+    path = tmp_path / "full_field_velocity_only.npz"
+    x = np.linspace(0.0, 1.0, 5)
+    y = np.linspace(0.0, 1.0, 5)
+    X, Y = np.meshgrid(x, y)
+    np.savez(path, x=X.reshape(-1), y=Y.reshape(-1), u=Y.reshape(-1), v=(-X).reshape(-1))
+    model = torch.nn.Sequential(torch.nn.Linear(2, 8), torch.nn.Tanh(), torch.nn.Linear(8, 3))
+    bench = LidDrivenCavityQualitative(
+        reynolds=100,
+        reference="none",
+        full_field_reference_path=str(path),
+        profile_only=False,
+        has_reference=True,
+        reference_kind="full_field_cfd",
+    )
+    _, _, coords = bench.grid(5, 5)
+
+    metrics = evaluate_on_grid(model, bench, coords, torch.device("cpu"), steady=True)
+
+    assert np.isfinite(metrics["u_full_rel_l2"])
+    assert np.isfinite(metrics["v_full_rel_l2"])
+    assert np.isfinite(metrics["velocity_full_rel_l2"])
+    assert np.isfinite(metrics["velocity_mag_rmse"])
+    assert np.isfinite(metrics["velocity_mag_mae"])
+    assert np.isnan(metrics["p_full_rel_l2_centered"])
+    assert np.isfinite(metrics["omega_full_rel_l2"])
+    assert not metrics["has_p_full_field_reference"]
+    assert metrics["has_omega_full_field_reference"]
+
+
+def test_full_field_reference_can_be_validated_against_ghia(tmp_path):
+    path = tmp_path / "flat_full_field.npz"
+    x = np.linspace(0.0, 1.0, 8)
+    y = np.linspace(0.0, 1.0, 8)
+    X, Y = np.meshgrid(x, y)
+    np.savez(path, x=X.reshape(-1), y=Y.reshape(-1), u=np.zeros(X.size), v=np.zeros(X.size))
+
+    metrics = validate_full_field_against_ghia(path, 100)
+
+    assert metrics["reynolds"] == 100.0
+    assert np.isfinite(metrics["cfd_vs_ghia_u_centerline_rmse"])
+    assert np.isfinite(metrics["cfd_vs_ghia_v_centerline_rmse"])

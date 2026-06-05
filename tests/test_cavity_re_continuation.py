@@ -8,6 +8,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from scripts.evaluate_checkpoint import evaluate_results_dir
 from scripts.run_lid_cavity_re_continuation import run_continuation
 
 
@@ -130,3 +131,18 @@ def test_lid_cavity_re_continuation_uses_full_field_reference_map(tmp_path):
     assert np.isfinite(full_field_rows["vanilla"]).all()
     assert np.isfinite(full_field_rows["vara"]).all()
     assert (summary / "full_field_metric_improvement_by_re_bar.png").exists()
+
+    posthoc_args = Namespace(
+        results_dir=str(out),
+        full_field_reference_map=str(reference_map),
+        output_dir=None,
+        merge_into_summary=True,
+        device="cpu",
+    )
+    posthoc = evaluate_results_dir(posthoc_args)
+    assert not posthoc.empty
+    assert (out / "seed_0" / "re_0100" / "vanilla" / "logs" / "cfd_reference_metrics.json").exists()
+    assert (out / "seed_0" / "re_0100" / "vara" / "logs" / "cfd_reference_metrics.csv").exists()
+    updated_comparison = pd.read_csv(summary / "vara_vs_vanilla_by_re.csv")
+    assert "u_full_rel_l2" in set(updated_comparison["metric"])
+    assert (summary / "cfd_reference_vs_ghia_validation.csv").exists()

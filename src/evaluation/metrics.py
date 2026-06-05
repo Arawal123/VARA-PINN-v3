@@ -71,14 +71,25 @@ def evaluate_on_grid(
         "p_rel_l2_centered": float("nan"),
         "speed_rel_l2": float("nan"),
         "omega_rel_l2": float("nan"),
+        "u_full_rel_l2": float("nan"),
+        "v_full_rel_l2": float("nan"),
+        "velocity_full_rel_l2": float("nan"),
+        "p_full_rel_l2_centered": float("nan"),
+        "omega_full_rel_l2": float("nan"),
         "u_rmse": float("nan"),
         "v_rmse": float("nan"),
         "p_rmse_centered": float("nan"),
         "omega_rmse": float("nan"),
+        "velocity_mag_rmse": float("nan"),
+        "velocity_mag_mae": float("nan"),
         "u_mae": float("nan"),
         "v_mae": float("nan"),
         "p_mae_centered": float("nan"),
         "omega_mae": float("nan"),
+        "has_p_full_field_reference": False,
+        "has_omega_full_field_reference": False,
+        "omega_full_field_reference_source": "",
+        "full_field_reference_path": "",
         "u_reference_norm": float("nan"),
         "v_reference_norm": float("nan"),
         "p_reference_norm": float("nan"),
@@ -126,36 +137,54 @@ def evaluate_on_grid(
         "num_eval_points": int(coords_np.shape[0]),
     }
     if has_reference and ref is not None:
+        has_p_ref = bool(ref.get("has_p_reference", np.isfinite(ref.get("p", np.array([]))).any()))
+        has_omega_ref = bool(ref.get("has_omega_reference", np.isfinite(ref.get("omega", np.array([]))).any()))
         p_ref_c = center_pressure(ref["p"])
-        p_grad_err = np.sqrt(
-            (residuals["p_x"].detach().cpu().numpy() - ref.get("p_x", 0.0)) ** 2
-            + (residuals["p_y"].detach().cpu().numpy() - ref.get("p_y", 0.0)) ** 2
+        p_grad_err = (
+            np.sqrt(
+                (residuals["p_x"].detach().cpu().numpy() - ref.get("p_x", 0.0)) ** 2
+                + (residuals["p_y"].detach().cpu().numpy() - ref.get("p_y", 0.0)) ** 2
+            )
+            if has_p_ref
+            else np.full_like(u, np.nan)
         )
+        speed_ref = ref.get("speed", np.sqrt(ref["u"] ** 2 + ref["v"] ** 2))
         u_mse = float(np.mean((u - ref["u"]) ** 2))
         v_mse = float(np.mean((v - ref["v"]) ** 2))
-        p_mse = float(np.mean((p_c - p_ref_c) ** 2))
-        omega_mse = float(np.mean((omega - ref["omega"]) ** 2))
-        data_loss = u_mse + v_mse + p_mse + omega_mse
+        p_mse = float(np.mean((p_c - p_ref_c) ** 2)) if has_p_ref else float("nan")
+        omega_mse = float(np.mean((omega - ref["omega"]) ** 2)) if has_omega_ref else float("nan")
+        data_loss = _finite_sum([u_mse, v_mse, p_mse, omega_mse])
         metrics.update(
             {
                 "u_rel_l2": relative_l2(u, ref["u"]),
                 "v_rel_l2": relative_l2(v, ref["v"]),
-                "p_rel_l2_centered": relative_l2(p_c, p_ref_c),
-                "speed_rel_l2": relative_l2(speed, ref.get("speed", np.sqrt(ref["u"] ** 2 + ref["v"] ** 2))),
-                "omega_rel_l2": relative_l2(omega, ref["omega"]),
+                "p_rel_l2_centered": relative_l2(p_c, p_ref_c) if has_p_ref else float("nan"),
+                "speed_rel_l2": relative_l2(speed, speed_ref),
+                "omega_rel_l2": relative_l2(omega, ref["omega"]) if has_omega_ref else float("nan"),
+                "u_full_rel_l2": relative_l2(u, ref["u"]),
+                "v_full_rel_l2": relative_l2(v, ref["v"]),
+                "velocity_full_rel_l2": relative_l2(speed, speed_ref),
+                "p_full_rel_l2_centered": relative_l2(p_c, p_ref_c) if has_p_ref else float("nan"),
+                "omega_full_rel_l2": relative_l2(omega, ref["omega"]) if has_omega_ref else float("nan"),
                 "u_rmse": rmse(u, ref["u"]),
                 "v_rmse": rmse(v, ref["v"]),
-                "p_rmse_centered": rmse(p_c, p_ref_c),
-                "omega_rmse": rmse(omega, ref["omega"]),
+                "p_rmse_centered": rmse(p_c, p_ref_c) if has_p_ref else float("nan"),
+                "omega_rmse": rmse(omega, ref["omega"]) if has_omega_ref else float("nan"),
+                "velocity_mag_rmse": rmse(speed, speed_ref),
+                "velocity_mag_mae": mae(speed, speed_ref),
                 "u_mae": mae(u, ref["u"]),
                 "v_mae": mae(v, ref["v"]),
-                "p_mae_centered": mae(p_c, p_ref_c),
-                "omega_mae": mae(omega, ref["omega"]),
+                "p_mae_centered": mae(p_c, p_ref_c) if has_p_ref else float("nan"),
+                "omega_mae": mae(omega, ref["omega"]) if has_omega_ref else float("nan"),
+                "has_p_full_field_reference": has_p_ref,
+                "has_omega_full_field_reference": has_omega_ref,
+                "omega_full_field_reference_source": str(ref.get("omega_reference_source", "")),
+                "full_field_reference_path": str(ref.get("source_path", "")),
                 "u_reference_norm": float(np.linalg.norm(ref["u"])),
                 "v_reference_norm": float(np.linalg.norm(ref["v"])),
-                "p_reference_norm": float(np.linalg.norm(p_ref_c)),
-                "omega_reference_norm": float(np.linalg.norm(ref["omega"])),
-                "pressure_gradient_error": float(np.mean(p_grad_err)),
+                "p_reference_norm": float(np.linalg.norm(p_ref_c)) if has_p_ref else float("nan"),
+                "omega_reference_norm": float(np.linalg.norm(ref["omega"])) if has_omega_ref else float("nan"),
+                "pressure_gradient_error": float(np.mean(p_grad_err)) if has_p_ref else float("nan"),
                 "unweighted_data_loss": data_loss,
             }
         )
