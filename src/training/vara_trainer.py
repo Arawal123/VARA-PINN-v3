@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import time
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,11 @@ from src.controllers import (
     VARAController,
 )
 from src.diagnostics import DiagnosticMapBuilder
+from src.losses.base_losses import compute_global_losses, compute_pointwise_losses, weighted_sum
+from src.losses.modern_baselines import (
+    loss_gradient_norm,
+    self_adaptive_objective,
+)
 from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.trainer import ExperimentTrainer
 from src.utils.io import ensure_dir, save_json
@@ -80,8 +86,15 @@ class VARATrainer(ExperimentTrainer):
         self.local_weight_records: list[dict[str, Any]] = []
 
     def run(self) -> dict[str, float]:
+        self.compute_tracker.start()
         if self.mode == "rar_pinn":
             return self._run_rar()
+        if self.mode == "self_adaptive_attention_pinn":
+            return self._run_uniform_baseline(self._train_self_adaptive_epochs)
+        if self.mode == "gradient_balanced_pinn":
+            return self._run_uniform_baseline(self._train_gradient_balanced_epochs)
+        if self.mode == "gradient_enhanced_pinn":
+            return self._run_uniform_baseline(self.train_epochs)
         if self.mode in {"local_vara", "local_constrained_vara"}:
             return self._run_local(constrained=self.mode == "local_constrained_vara")
         if self.mode == "full_vara_constrained":
@@ -95,6 +108,8 @@ class VARATrainer(ExperimentTrainer):
 
         for cycle in range(cycles):
             self.train_epochs(batch, self.controller.state if local_weights_enabled else None, cycle=cycle)
+            if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+                break
             maps, scores, names, weak_regions, X, Y, coords = self.diagnose()
             acceptance = self.controller.evaluate_pending(scores)
             if acceptance is not None:
@@ -129,6 +144,180 @@ class VARATrainer(ExperimentTrainer):
         metrics["rollback_count"] = self.rollback_count
         return metrics
 
+    def _run_uniform_baseline(self, epoch_runner: Any) -> dict[str, float]:
+        """Run an independent non-controller baseline on uniform samples."""
+        train_cfg = self.config.get("training", {})
+        cycles = int(train_cfg.get("adaptive_cycles", 2))
+        batch = self.initial_batch()
+        for cycle in range(cycles):
+            epoch_runner(batch, None, cycle=cycle, log_prefix=self.mode)
+            if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+                break
+            maps, scores, names, _weak_regions, _x, _y, coords = self.diagnose()
+            metrics = self._validation_metrics(coords)
+            self.metrics_logger.log({"cycle": cycle, "phase": self.mode, **metrics})
+            self.score_logger.log({"cycle": cycle, "diagnostics": names, "scores": scores})
+            self.weak_logger.log({"cycle": cycle, "weak_regions": []})
+            record = {"cycle": cycle, "stage": self.mode, "weak_regions": [], "actions": []}
+            self.action_logger.log(record)
+            self.actions_logger.log(record)
+            self.action_records.append(record)
+            self.maybe_checkpoint(cycle, metrics)
+            batch = self.resample_batch(batch, maps, coords, [], None, adaptive=False)
+
+        self.run_final_physics_repair(cycle=cycles, log_prefix="final_physics_repair")
+        metrics = self.evaluate_and_save_final()
+        metrics["J_score"] = self._j_score(metrics)
+        metrics["accepted_interventions"] = 0
+        metrics["rejected_interventions"] = 0
+        metrics["rollback_count"] = 0
+        metrics["number_of_active_patches"] = 0
+        metrics["most_frequently_targeted_variable"] = None
+        metrics["most_frequently_targeted_patch"] = None
+        pd.DataFrame([metrics]).to_csv(self.run_dir / "summary_table.csv", index=False)
+        pd.DataFrame([metrics]).to_csv(self.table_dir / "summary.csv", index=False)
+        save_json(metrics, self.run_dir / "summary.json")
+        return metrics
+
+    def _train_self_adaptive_epochs(
+        self,
+        batch: dict[str, Any],
+        _control_state: Any | None = None,
+        cycle: int = 0,
+        epochs_override: int | None = None,
+        log_prefix: str = "",
+    ) -> dict[str, float]:
+        """Train the soft-attention self-adaptive PINN baseline."""
+        train_cfg = self.config.get("training", {})
+        cfg = self.config.get("self_adaptive_attention", {})
+        epochs = int(epochs_override if epochs_override is not None else train_cfg.get("epochs_per_cycle", 100))
+        log_every = max(1, int(train_cfg.get("log_every", 25)))
+        scalar_weights = dict(train_cfg.get("weights", {}))
+        interior_logits = torch.zeros(
+            int(batch["xy_f"].shape[0]),
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        boundary_logits = torch.zeros(
+            int(batch["xy_bc"].shape[0]),
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        attention_optimizer = torch.optim.Adam(
+            [interior_logits, boundary_logits],
+            lr=float(cfg.get("attention_lr", 0.01)),
+        )
+        last_losses: dict[str, float] = {}
+        self.model.train()
+        phase_start = time.perf_counter()
+        for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+                break
+            self.optimizer.zero_grad(set_to_none=True)
+            attention_optimizer.zero_grad(set_to_none=True)
+            self.compute_tracker.record_objective(batch)
+            total, losses, attention_logs = self_adaptive_objective(
+                self.model,
+                batch,
+                self.benchmark,
+                self.steady,
+                scalar_weights,
+                interior_logits,
+                boundary_logits,
+                maximum_attention=float(cfg.get("maximum_attention", 20.0)),
+            )
+            total.backward()
+            grad_norm = self._grad_norm()
+            self.optimizer.step()
+            for logits in (interior_logits, boundary_logits):
+                if logits.grad is not None:
+                    logits.grad.mul_(-1.0)
+            attention_optimizer.step()
+            with torch.no_grad():
+                limit = float(cfg.get("logit_limit", 8.0))
+                interior_logits.clamp_(-limit, limit)
+                boundary_logits.clamp_(-limit, limit)
+            self.compute_tracker.record_optimizer_step()
+            self.compute_tracker.record_auxiliary_optimizer_step()
+            last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
+            last_losses.update(attention_logs)
+            last_losses["total"] = float(total.detach().cpu())
+            last_losses["grad_norm"] = grad_norm
+            self.last_losses = dict(last_losses)
+            if local_epoch % log_every == 0 or local_epoch == epochs - 1:
+                self.loss_logger.log(
+                    {"cycle": cycle, "phase": log_prefix or self.mode, "epoch": self.global_step, **last_losses}
+                )
+            self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
+        return last_losses
+
+    def _train_gradient_balanced_epochs(
+        self,
+        batch: dict[str, Any],
+        _control_state: Any | None = None,
+        cycle: int = 0,
+        epochs_override: int | None = None,
+        log_prefix: str = "",
+    ) -> dict[str, float]:
+        """Train with gradient-statistics loss balancing."""
+        train_cfg = self.config.get("training", {})
+        cfg = self.config.get("gradient_balancing", {})
+        epochs = int(epochs_override if epochs_override is not None else train_cfg.get("epochs_per_cycle", 100))
+        log_every = max(1, int(train_cfg.get("log_every", 25)))
+        update_every = max(1, int(cfg.get("update_every", 10)))
+        ema = float(cfg.get("ema", 0.9))
+        minimum = float(cfg.get("minimum_weight", 0.05))
+        maximum = float(cfg.get("maximum_weight", 20.0))
+        base_weights = {
+            name: float(value)
+            for name, value in dict(train_cfg.get("weights", {})).items()
+            if float(value) > 0.0
+        }
+        adaptive_weights = dict(base_weights)
+        parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        last_losses: dict[str, float] = {}
+        self.model.train()
+        phase_start = time.perf_counter()
+        for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+                break
+            self.optimizer.zero_grad(set_to_none=True)
+            self.compute_tracker.record_objective(batch)
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            losses = compute_global_losses(pointwise)
+            active = [name for name in adaptive_weights if name in losses]
+            if active and (local_epoch % update_every == 0):
+                norms = {name: loss_gradient_norm(losses[name], parameters) for name in active}
+                target = float(np.mean([value for value in norms.values() if np.isfinite(value)]))
+                proposed = {
+                    name: float(np.clip(target / max(norms[name], 1e-12), minimum, maximum))
+                    for name in active
+                }
+                scale = sum(base_weights.get(name, 1.0) for name in active) / max(sum(proposed.values()), 1e-12)
+                for name in active:
+                    proposal = proposed[name] * scale
+                    adaptive_weights[name] = ema * adaptive_weights[name] + (1.0 - ema) * proposal
+            total = weighted_sum(losses, adaptive_weights)
+            total.backward()
+            grad_norm = self._grad_norm()
+            self.optimizer.step()
+            self.compute_tracker.record_optimizer_step()
+            last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
+            last_losses.update({f"adaptive_weight_{name}": value for name, value in adaptive_weights.items()})
+            last_losses["total"] = float(total.detach().cpu())
+            last_losses["grad_norm"] = grad_norm
+            self.last_losses = dict(last_losses)
+            if local_epoch % log_every == 0 or local_epoch == epochs - 1:
+                self.loss_logger.log(
+                    {"cycle": cycle, "phase": log_prefix or self.mode, "epoch": self.global_step, **last_losses}
+                )
+            self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
+        return last_losses
+
     def _run_rar(self) -> dict[str, float]:
         """Residual adaptive refinement baseline without VARA controller logic."""
         train_cfg = self.config.get("training", {})
@@ -138,6 +327,8 @@ class VARATrainer(ExperimentTrainer):
 
         for cycle in range(cycles):
             self.train_epochs(batch, None, cycle=cycle, log_prefix="rar_main")
+            if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+                break
             maps, scores, names, _weak_regions, X, Y, coords = self.diagnose()
             metrics = self._validation_metrics(coords)
             self.metrics_logger.log({"cycle": cycle, "phase": "rar_after", **metrics})
@@ -206,6 +397,8 @@ class VARATrainer(ExperimentTrainer):
 
         for cycle in range(cycles):
             self.train_epochs(batch, self.controller.state, cycle=cycle, epochs_override=main_epochs, log_prefix="main")
+            if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+                break
             maps_before, scores_before, names, weak_regions, X, Y, coords = self.diagnose()
             metrics_before = self._validation_metrics(coords)
             self.metrics_logger.log({"cycle": cycle, "phase": "before_trial", **metrics_before, "J_score": self._j_score(metrics_before)})
@@ -316,6 +509,8 @@ class VARATrainer(ExperimentTrainer):
                 epochs_override=cycle_main_epochs,
                 log_prefix="local_main",
             )
+            if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+                break
             maps_before, norm_before, raw_before, names, weak_regions, X, Y, coords = self._diagnose_local(update_ema=True)
             metrics_before = self._validation_metrics(coords)
             self._log_patch_scores(cycle, names, raw_before, norm_before)
@@ -372,6 +567,8 @@ class VARATrainer(ExperimentTrainer):
 
             if constrained:
                 for candidate_id, intervention in enumerate(interventions):
+                    if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+                        break
                     (
                         _maps_candidate_before,
                         _norm_candidate_before,
@@ -559,13 +756,17 @@ class VARATrainer(ExperimentTrainer):
     def _validation_metrics(self, coords: np.ndarray) -> dict[str, float]:
         from src.evaluation.metrics import evaluate_on_grid
 
-        return evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        phase_start = time.perf_counter()
+        metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        self.compute_tracker.add_phase_time("evaluation", time.perf_counter() - phase_start)
+        return metrics
 
     def _diagnose_local(
         self,
         update_ema: bool,
         detect: bool = True,
     ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, list[str], list[Any], np.ndarray, np.ndarray, np.ndarray]:
+        phase_start = time.perf_counter()
         X, Y, coords = self.validation_grid()
         builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
         maps = builder.build(coords, mode=self.config.get("diagnostics", {}).get("mode", "full_reference"))
@@ -574,6 +775,7 @@ class VARATrainer(ExperimentTrainer):
         if raw_scores is None:
             raw_scores = norm_scores
         weak_regions = self.weak_detector.detect(norm_scores, names, self.patch_grid) if detect else []
+        self.compute_tracker.add_phase_time("diagnostics", time.perf_counter() - phase_start)
         return maps, norm_scores, raw_scores, names, weak_regions, X, Y, coords
 
     def _log_patch_scores(self, cycle: int, names: list[str], raw_scores: np.ndarray, norm_scores: np.ndarray) -> None:

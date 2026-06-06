@@ -1,0 +1,6 @@
+mode: self_adaptive_attention_pinn
+description: "Soft-attention self-adaptive PINN baseline with adversarial point weights."
+self_adaptive_attention:
+  attention_lr: 0.01
+  maximum_attention: 20.0
+  logit_limit: 8.0

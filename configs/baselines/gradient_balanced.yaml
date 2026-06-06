@@ -1,0 +1,7 @@
+mode: gradient_balanced_pinn
+description: "Gradient-statistics adaptive loss-balancing PINN baseline."
+gradient_balancing:
+  update_every: 10
+  ema: 0.9
+  minimum_weight: 0.05
+  maximum_weight: 20.0

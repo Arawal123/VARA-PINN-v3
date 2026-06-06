@@ -1,0 +1,6 @@
+re,full_field_reference_path
+100,data/references/lid_driven_cavity/full_field/re_0100_paddlescience.npz
+400,data/references/lid_driven_cavity/full_field/re_0400_paddlescience.npz
+1000,data/references/lid_driven_cavity/full_field/re_1000_paddlescience.npz
+1600,data/references/lid_driven_cavity/full_field/re_1600_paddlescience.npz
+3200,data/references/lid_driven_cavity/full_field/re_3200_paddlescience.npz

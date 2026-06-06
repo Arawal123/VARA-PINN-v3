@@ -16,6 +16,7 @@ from src.diagnostics import DiagnosticMapBuilder, PatchGrid, PatchScorer, WeakRe
 from src.evaluation.metrics import evaluate_on_grid
 from src.losses.base_losses import compute_global_losses, compute_pointwise_losses, weighted_sum
 from src.losses.local_losses import compute_local_weighted_loss
+from src.losses.modern_baselines import gradient_enhanced_pointwise_losses
 from src.losses.pressure_losses import pressure_anchor_loss
 from src.losses.vorticity_losses import vorticity_transport_residual
 from src.models import build_mlp_from_config
@@ -30,6 +31,7 @@ from src.physics.rectangular_benchmarks import (
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
 from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.checkpointing import load_checkpoint, save_checkpoint
+from src.training.compute_budget import ComputeTracker
 from src.training.lbfgs_utils import make_lbfgs_closure
 from src.utils.config import save_config
 from src.utils.device import get_device
@@ -62,6 +64,7 @@ class ExperimentTrainer:
         self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
+        self.compute_tracker = ComputeTracker(dict(config.get("compute_budget", {})))
 
         patch_cfg = config.get("patches", {})
         self.patch_grid = PatchGrid(
@@ -247,7 +250,11 @@ class ExperimentTrainer:
 
         last_losses: dict[str, float] = {}
         self.model.train()
+        self.compute_tracker.start()
+        phase_start = time.perf_counter()
         for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+                break
             self.optimizer.zero_grad(set_to_none=True)
             total, losses, local_logs = self._training_objective(
                 batch,
@@ -259,6 +266,7 @@ class ExperimentTrainer:
             total.backward()
             grad_norm = self._grad_norm()
             self.optimizer.step()
+            self.compute_tracker.record_optimizer_step()
 
             last_losses = {k: float(v.detach().cpu()) for k, v in losses.items()}
             last_losses.update(local_logs)
@@ -268,6 +276,7 @@ class ExperimentTrainer:
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log({"cycle": cycle, "phase": log_prefix or "main", "epoch": self.global_step, **last_losses})
             self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
         return last_losses
 
     def _training_objective(
@@ -279,7 +288,11 @@ class ExperimentTrainer:
         pressure_anchor_patches: dict[int, float],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
         """Build the train objective used by Adam and guarded repair stages."""
-        pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+        self.compute_tracker.record_objective(batch)
+        if self.mode == "gradient_enhanced_pinn":
+            pointwise = gradient_enhanced_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+        else:
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
         if "pressure_poisson" in active_aux_losses:
             pointwise["pressure_poisson"] = pressure_poisson_residual(
                 self.model, batch["xy_f"], self.benchmark.nu
@@ -316,6 +329,13 @@ class ExperimentTrainer:
         the result only when validation score improves.
         """
         cfg = self._final_repair_config()
+        if self.compute_tracker.enabled and self.compute_tracker.exhausted():
+            self.final_repair_status = {
+                "enabled": bool(cfg.get("enabled", False)),
+                "accepted": False,
+                "reason": "compute_budget_exhausted",
+            }
+            return self.final_repair_status
         if not bool(cfg.get("enabled", False)):
             self.final_repair_status = {"enabled": False, "accepted": False}
             return self.final_repair_status
@@ -365,9 +385,13 @@ class ExperimentTrainer:
             return total
 
         self.model.train()
+        phase_start = time.perf_counter()
         for step in range(steps):
+            if not self.compute_tracker.can_start_objective(int(repair_batch["xy_f"].shape[0])):
+                break
             closure = make_lbfgs_closure(lbfgs, loss_fn)
             loss = lbfgs.step(closure)
+            self.compute_tracker.record_optimizer_step()
             if "total" not in last_logs:
                 last_logs["total"] = float(loss.detach().cpu()) if hasattr(loss, "detach") else float(loss)
             last_logs["grad_norm"] = self._grad_norm()
@@ -384,6 +408,7 @@ class ExperimentTrainer:
                     }
                 )
             self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
 
         after_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
         _, after_score = self._repair_score(after_metrics)
@@ -496,11 +521,13 @@ class ExperimentTrainer:
         self.model.load_state_dict(device_snapshot)
 
     def diagnose(self) -> tuple[dict[str, np.ndarray], np.ndarray, list[str], list[Any], np.ndarray, np.ndarray, np.ndarray]:
+        phase_start = time.perf_counter()
         X, Y, coords = self.validation_grid()
         builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
         maps = builder.build(coords, mode=self.config.get("diagnostics", {}).get("mode", "full_reference"))
         scores, names = self.patch_scorer.compute(maps, coords, update_ema=True)
         weak_regions = self.weak_detector.detect(scores, names, self.patch_grid)
+        self.compute_tracker.add_phase_time("diagnostics", time.perf_counter() - phase_start)
         return maps, scores, names, weak_regions, X, Y, coords
 
     def resample_batch(
@@ -528,7 +555,9 @@ class ExperimentTrainer:
 
     def evaluate_and_save_final(self) -> dict[str, float]:
         X, Y, coords = self.test_grid()
+        phase_start = time.perf_counter()
         metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        self.compute_tracker.add_phase_time("evaluation", time.perf_counter() - phase_start)
         metrics["final_total_loss"] = float(self.last_losses.get("total", float("nan")))
         metrics["optimizer_stage"] = self.optimizer_stage
         for key, value in self.final_repair_status.items():
@@ -541,6 +570,7 @@ class ExperimentTrainer:
         metrics["reportable"] = metrics["run_type"] != "smoke"
         metrics["collapse_evaluated"] = bool(metrics["reportable"])
         metrics["collapsed"] = self._collapsed(metrics)
+        metrics.update(self.compute_tracker.summary())
         self.metrics_logger.log({"cycle": "final_test", **metrics})
         save_json(metrics, self.run_dir / "summary.json")
         pd.DataFrame([metrics]).to_csv(self.table_dir / "summary.csv", index=False)

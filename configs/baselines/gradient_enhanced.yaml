@@ -1,0 +1,5 @@
+mode: gradient_enhanced_pinn
+description: "Gradient-enhanced PINN baseline using spatial derivatives of PDE residuals."
+training:
+  weights:
+    pde_gradient: 0.1

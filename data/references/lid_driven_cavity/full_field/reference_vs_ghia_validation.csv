@@ -1,0 +1,4 @@
+reynolds,full_field_reference_path,ghia_reference_source,cfd_vs_ghia_u_centerline_rmse,cfd_vs_ghia_u_centerline_rel_l2,cfd_vs_ghia_v_centerline_rmse,cfd_vs_ghia_v_centerline_rel_l2
+100.0,data/references/lid_driven_cavity/full_field/re_0100_paddlescience.npz,ghia_1982,0.00230207208864209,0.005038465928377882,0.004656944960948089,0.034908452693092826
+400.0,data/references/lid_driven_cavity/full_field/re_0400_paddlescience.npz,ghia_1982,0.0008967886726009573,0.0020984609152496984,0.036340020110136886,0.15214304789125904
+1000.0,data/references/lid_driven_cavity/full_field/re_1000_paddlescience.npz,ghia_1982,0.008243654513732343,0.020157782622015966,0.005455847634389149,0.01751865466319236

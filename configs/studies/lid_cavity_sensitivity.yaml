@@ -1,0 +1,41 @@
+description: "One-factor-at-a-time sensitivity study around the published cavity configuration."
+variants:
+  reference: {}
+  patch_grid_2x2:
+    patches:
+      nx_patches: 2
+      ny_patches: 2
+  patch_grid_8x8:
+    patches:
+      nx_patches: 8
+      ny_patches: 8
+  weak_threshold_60:
+    weak_regions:
+      percentile_threshold: 60.0
+  weak_threshold_90:
+    weak_regions:
+      percentile_threshold: 90.0
+  max_active_patches_3:
+    weak_regions:
+      max_active_patches: 3
+  max_active_patches_9:
+    weak_regions:
+      max_active_patches: 9
+  intervention_strength_015:
+    local_controller:
+      initial_strength: 0.15
+  intervention_strength_060:
+    local_controller:
+      initial_strength: 0.60
+  collateral_tolerance_005:
+    local_controller:
+      collateral_tolerance: 0.05
+  collateral_tolerance_020:
+    local_controller:
+      collateral_tolerance: 0.20
+  trial_epochs_5:
+    local_controller:
+      trial_epochs: 5
+  trial_epochs_20:
+    local_controller:
+      trial_epochs: 20
