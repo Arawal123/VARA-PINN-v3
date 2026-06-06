@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.run_modern_baselines import METHODS, _quick_config
+from scripts.run_modern_baselines import DEFAULT_METHODS, METHODS, _quick_config
 from src.training.vara_trainer import VARATrainer
 from src.utils.config import deep_update, load_config, save_config
 from src.utils.io import save_json
@@ -23,7 +23,7 @@ from src.utils.io import save_json
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/lid_driven_cavity.yaml")
-    parser.add_argument("--methods", nargs="+", default=list(METHODS))
+    parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument(
         "--scenarios",

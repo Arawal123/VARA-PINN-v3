@@ -1,0 +1,6 @@
+model:
+  physics_formulation: streamfunction_pressure
+
+# This formulation is divergence-free by construction but requires
+# third-order derivatives in the momentum residual. Report its compute
+# separately and apply it to every compared method.

@@ -1,0 +1,17 @@
+protocol:
+  name: vara_controller_v2_frozen_protocol
+  development_cases:
+    - kovasznay_re40_seeds_0_1_2
+    - double_vortex_re40_seed_0
+  held_out_cases:
+    - kovasznay_re20
+    - kovasznay_re80
+    - channel_re40
+    - taylor_green_re100
+    - lid_cavity_re100_400_1000_1600_3200
+  controller_config: configs/vara_v2/controller.yaml
+  primary_compute_budget:
+    type: optimizer_steps
+    value: 400
+  no_per_benchmark_controller_tuning: true
+  full_field_reference_is_evaluation_only: true

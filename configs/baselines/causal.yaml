@@ -1,0 +1,3 @@
+causal_training:
+  chunks: 16
+  epsilon: 1.0

@@ -1,0 +1,6 @@
+model:
+  physics_formulation: cavity_hard_boundary
+  hard_boundary_corner_width: 0.02
+
+# The transform enforces a continuous, corner-regularized moving lid.
+# Apply this same overlay to every compared method.

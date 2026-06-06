@@ -28,6 +28,7 @@ from src.physics.rectangular_benchmarks import (
     LidDrivenCavityQualitative,
     PoiseuilleChannelFlow,
 )
+from src.physics.taylor_green import TaylorGreenVortex
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
 from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.checkpointing import load_checkpoint, save_checkpoint
@@ -60,7 +61,16 @@ class ExperimentTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(optim_cfg.get("lr", 1e-3)))
         self.optimizer_stage = "adam"
         self.final_repair_status: dict[str, Any] = {}
+        self.continuation_anchor_model: torch.nn.Module | None = None
+        self.continuation_replay_points: torch.Tensor | None = None
+        self.continuation_replay_targets: torch.Tensor | None = None
         self.warm_start_status = self._maybe_load_warm_start(config)
+        continuation_enabled = bool(config.get("continuation_anchor", {}).get("enabled", False))
+        replay_enabled = bool(config.get("continuation_replay", {}).get("enabled", False))
+        if self.warm_start_status.get("loaded") and (continuation_enabled or replay_enabled):
+            self.continuation_anchor_model = deepcopy(self.model).to(self.device).eval()
+            for parameter in self.continuation_anchor_model.parameters():
+                parameter.requires_grad_(False)
         self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
@@ -72,6 +82,7 @@ class ExperimentTrainer:
             nx_patches=int(patch_cfg.get("nx_patches", 4)),
             ny_patches=int(patch_cfg.get("ny_patches", 4)),
             nt_patches=int(patch_cfg.get("nt_patches", 1)),
+            t_bounds=getattr(self.benchmark, "t_bounds", None),
         )
         diag_cfg = config.get("diagnostics", {})
         self.patch_scorer = PatchScorer(
@@ -117,8 +128,9 @@ class ExperimentTrainer:
         self.action_records: list[dict[str, Any]] = []
         self.last_losses: dict[str, float] = {}
 
-        self.uniform_sampler = UniformSampler(self.benchmark.bounds, self.device, self.seed)
-        self.boundary_sampler = BoundarySampler(self.benchmark.bounds, self.device, self.seed + 1)
+        t_bounds = getattr(self.benchmark, "t_bounds", None)
+        self.uniform_sampler = UniformSampler(self.benchmark.bounds, self.device, self.seed, t_bounds=t_bounds)
+        self.boundary_sampler = BoundarySampler(self.benchmark.bounds, self.device, self.seed + 1, t_bounds=t_bounds)
         sampler_cfg = config.get("sampling", {})
         self.adaptive_sampler = MixedAdaptiveSampler(
             self.benchmark.bounds,
@@ -127,6 +139,7 @@ class ExperimentTrainer:
             self.seed + 2,
             mixture=sampler_cfg.get("mixture"),
         )
+        self._initialize_continuation_replay()
 
     def _maybe_load_warm_start(self, config: dict[str, Any]) -> dict[str, Any]:
         checkpoint = config.get("warm_start_checkpoint")
@@ -164,6 +177,14 @@ class ExperimentTrainer:
         }
         if name == "kovasznay":
             return KovasznayFlow(**common)
+        if name in {"taylor_green", "taylor-green", "tgv"}:
+            return TaylorGreenVortex(
+                **common,
+                t_min=float(cfg.get("t_min", 0.0)),
+                t_max=float(cfg.get("t_max", 1.0)),
+                evaluation_time=float(cfg.get("evaluation_time", cfg.get("t_max", 1.0))),
+                amplitude=float(cfg.get("amplitude", 1.0)),
+            )
         rectangular = {**common, "amplitude": float(cfg.get("amplitude", 1.0))}
         if name in {"channel_inflow_outflow", "channel", "poiseuille"}:
             return PoiseuilleChannelFlow(**rectangular)
@@ -194,8 +215,16 @@ class ExperimentTrainer:
         n_data = int(train_cfg.get("n_data", 256))
         xy_f = self.uniform_sampler.sample(n_f)
         xy_bc = self._sample_boundary(n_bc)
-        xy_data = self.uniform_sampler.sample(n_data)
+        xy_data = self._sample_data(n_data)
         return self.make_batch(xy_f, xy_bc, xy_data)
+
+    def _sample_data(self, n: int) -> torch.Tensor:
+        """Sample reference data; time-dependent benchmarks use initial data only."""
+        points = self.uniform_sampler.sample(n)
+        t_bounds = getattr(self.benchmark, "t_bounds", None)
+        if t_bounds is not None and n > 0 and points.shape[1] >= 3:
+            points[:, 2] = float(t_bounds[0])
+        return points
 
     def _sample_boundary_numpy(self, n: int) -> np.ndarray:
         boundary_cfg = self.config.get("sampling", {}).get("cavity_boundary", {})
@@ -318,7 +347,123 @@ class ExperimentTrainer:
                 mask = patch_ids == int(pid)
                 if torch.any(mask):
                     total = total + float(strength) * pressure_anchor_loss(pred_f[mask, 2:3], 0.0)
+        anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+        replay_loss, replay_weight = self.continuation_replay_loss()
+        gauge_loss = self.pressure_gauge_loss()
+        total = total + anchor_loss + replay_loss + gauge_loss
+        if anchor_weight > 0.0:
+            local_logs["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            local_logs["continuation_anchor_weight"] = float(anchor_weight)
+        if replay_weight > 0.0:
+            local_logs["continuation_replay"] = float(replay_loss.detach().cpu())
+            local_logs["continuation_replay_weight"] = float(replay_weight)
+        if float(gauge_loss.detach().cpu()) > 0.0:
+            local_logs["pressure_gauge"] = float(gauge_loss.detach().cpu())
         return total, losses, local_logs
+
+    def continuation_anchor_loss(self, batch: dict[str, Any]) -> tuple[torch.Tensor, float]:
+        """Shared decaying warm-start anchor used identically by every method."""
+        cfg = dict(self.config.get("continuation_anchor", {}))
+        if self.continuation_anchor_model is None or not bool(cfg.get("enabled", False)):
+            return next(self.model.parameters()).new_tensor(0.0), 0.0
+        train_cfg = self.config.get("training", {})
+        total_steps = int(
+            cfg.get(
+                "stage_steps",
+                int(train_cfg.get("adaptive_cycles", 1)) * int(train_cfg.get("epochs_per_cycle", 1)),
+            )
+        )
+        active_steps = max(1, int(round(float(cfg.get("active_fraction", 0.20)) * total_steps)))
+        if self.global_step >= active_steps:
+            return next(self.model.parameters()).new_tensor(0.0), 0.0
+        initial_weight = float(cfg.get("initial_weight", 1.0))
+        weight = initial_weight * max(0.0, 1.0 - self.global_step / active_steps)
+        coords = batch["xy_f"]
+        with torch.no_grad():
+            target = self.continuation_anchor_model(coords)
+        prediction = self.model(coords)
+        fields = str(cfg.get("fields", "velocity")).lower()
+        if fields == "all":
+            difference = prediction - target
+        else:
+            difference = prediction[:, :2] - target[:, :2]
+        return float(weight) * torch.mean(difference * difference), float(weight)
+
+    def _initialize_continuation_replay(self) -> None:
+        """Build a fixed, reference-free replay set from the previous-Re model."""
+        cfg = dict(self.config.get("continuation_replay", {}))
+        if self.continuation_anchor_model is None or not bool(cfg.get("enabled", False)):
+            return
+        n_points = max(0, int(cfg.get("n_points", 512)))
+        if n_points == 0:
+            return
+        rng = np.random.default_rng(self.seed + int(cfg.get("seed_offset", 104729)))
+        x0, x1, y0, y1 = self.benchmark.bounds
+        columns = [
+            rng.uniform(x0, x1, size=n_points),
+            rng.uniform(y0, y1, size=n_points),
+        ]
+        t_bounds = getattr(self.benchmark, "t_bounds", None)
+        if t_bounds is not None:
+            columns.append(rng.uniform(float(t_bounds[0]), float(t_bounds[1]), size=n_points))
+        points = np.column_stack(columns)
+        self.continuation_replay_points = torch.tensor(
+            points,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.no_grad():
+            targets = self.continuation_anchor_model(self.continuation_replay_points)
+        self.continuation_replay_targets = targets.detach()
+
+    def continuation_replay_loss(self) -> tuple[torch.Tensor, float]:
+        """Decaying previous-model distillation shared identically by all methods."""
+        cfg = dict(self.config.get("continuation_replay", {}))
+        zero = next(self.model.parameters()).new_tensor(0.0)
+        if (
+            self.continuation_replay_points is None
+            or self.continuation_replay_targets is None
+            or not bool(cfg.get("enabled", False))
+        ):
+            return zero, 0.0
+        total_steps = self._continuation_stage_steps(cfg)
+        active_steps = max(1, int(round(float(cfg.get("active_fraction", 0.20)) * total_steps)))
+        if self.global_step >= active_steps:
+            return zero, 0.0
+        initial_weight = float(cfg.get("initial_weight", 0.5))
+        weight = initial_weight * max(0.0, 1.0 - self.global_step / active_steps)
+        prediction = self.model(self.continuation_replay_points)
+        fields = str(cfg.get("fields", "velocity")).lower()
+        if fields == "all":
+            difference = prediction - self.continuation_replay_targets
+        else:
+            difference = prediction[:, :2] - self.continuation_replay_targets[:, :2]
+        return float(weight) * torch.mean(difference * difference), float(weight)
+
+    def _continuation_stage_steps(self, cfg: dict[str, Any]) -> int:
+        train_cfg = self.config.get("training", {})
+        controller_cfg = self.config.get("controller_v2", {})
+        default_steps = int(
+            controller_cfg.get(
+                "total_steps",
+                int(train_cfg.get("adaptive_cycles", 1)) * int(train_cfg.get("epochs_per_cycle", 1)),
+            )
+        )
+        return max(1, int(cfg.get("stage_steps", default_steps)))
+
+    def pressure_gauge_loss(self) -> torch.Tensor:
+        """Reference-free center pressure anchor shared by all compared methods."""
+        cfg = dict(self.config.get("pressure_gauge", {}))
+        weight = float(cfg.get("weight", 0.0))
+        if weight <= 0.0:
+            return next(self.model.parameters()).new_tensor(0.0)
+        x0, x1, y0, y1 = self.benchmark.bounds
+        coords = [0.5 * (x0 + x1), 0.5 * (y0 + y1)]
+        if int(self.config.get("model", {}).get("input_dim", 2)) == 3:
+            coords.append(float(cfg.get("time", self.config.get("model", {}).get("t_min", 0.0))))
+        point = torch.tensor([coords], dtype=torch.float32, device=self.device)
+        pressure = self.model(point)[:, 2:3]
+        return weight * torch.mean(pressure * pressure)
 
     def run_final_physics_repair(self, cycle: int = -1, log_prefix: str = "final_repair") -> dict[str, Any]:
         """Run a guarded global-physics LBFGS repair stage.
@@ -477,7 +622,7 @@ class ExperimentTrainer:
         self.repair_rng.shuffle(xy_f_np)
         xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)
         xy_bc = self._sample_boundary(n_bc)
-        xy_data = self.uniform_sampler.sample(n_data)
+        xy_data = self._sample_data(n_data)
         return self.make_batch(xy_f, xy_bc, xy_data)
 
     def _repair_score(self, metrics: dict[str, Any]) -> tuple[str, float]:
@@ -546,10 +691,13 @@ class ExperimentTrainer:
         if adaptive:
             priorities = control_state.sampling_priorities if control_state is not None else {}
             xy_f = self.adaptive_sampler.sample_interior(n_f, maps, coords, weak_regions, priorities)
-            xy_data = self.adaptive_sampler.sample_interior(n_data, maps, coords, weak_regions, priorities)
+            if getattr(self.benchmark, "t_bounds", None) is not None:
+                xy_data = self._sample_data(n_data)
+            else:
+                xy_data = self.adaptive_sampler.sample_interior(n_data, maps, coords, weak_regions, priorities)
         else:
             xy_f = self.uniform_sampler.sample(n_f)
-            xy_data = self.uniform_sampler.sample(n_data)
+            xy_data = self._sample_data(n_data)
         xy_bc = self._sample_boundary(n_bc)
         return self.make_batch(xy_f, xy_bc, xy_data)
 
@@ -567,6 +715,20 @@ class ExperimentTrainer:
         metrics["reference_kind"] = getattr(self.benchmark, "reference_kind", "analytical")
         metrics["has_reference"] = bool(getattr(self.benchmark, "has_reference", True))
         metrics["run_type"] = str(self.config.get("run_type", "full"))
+        model_cfg = self.config.get("model", {})
+        metrics["model_architecture"] = str(model_cfg.get("architecture", "mlp"))
+        metrics["physics_formulation"] = str(model_cfg.get("physics_formulation", "direct"))
+        metrics["hard_boundary_corner_width"] = (
+            float(model_cfg.get("hard_boundary_corner_width", 0.02))
+            if metrics["physics_formulation"] == "cavity_hard_boundary"
+            else float("nan")
+        )
+        metrics["continuation_replay_enabled"] = bool(
+            self.config.get("continuation_replay", {}).get("enabled", False)
+        )
+        metrics["continuation_replay_points"] = int(
+            0 if self.continuation_replay_points is None else self.continuation_replay_points.shape[0]
+        )
         metrics["reportable"] = metrics["run_type"] != "smoke"
         metrics["collapse_evaluated"] = bool(metrics["reportable"])
         metrics["collapsed"] = self._collapsed(metrics)

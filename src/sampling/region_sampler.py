@@ -25,10 +25,12 @@ class RegionSampler:
         pts = []
         for pid in chosen:
             patch = self.patch_grid.get_patch(int(pid))
-            x0, x1, y0, y1, _, _ = patch.bounds
-            pts.append([self.rng.uniform(x0, x1), self.rng.uniform(y0, y1)])
+            x0, x1, y0, y1, t0, t1 = patch.bounds
+            point = [self.rng.uniform(x0, x1), self.rng.uniform(y0, y1)]
+            if t0 is not None and t1 is not None:
+                point.append(self.rng.uniform(t0, t1))
+            pts.append(point)
         return np.asarray(pts, dtype=float)
 
     def sample(self, patch_ids: list[int], n: int, weights: np.ndarray | None = None) -> torch.Tensor:
         return torch.tensor(self.sample_numpy(patch_ids, n, weights), dtype=torch.float32, device=self.device)
-

@@ -1,0 +1,37 @@
+variants:
+  v2_budget_neutral_only:
+    controller_v2:
+      gradient_prefilter_enabled: false
+      trust_region_enabled: false
+      action_memory_enabled: false
+      rollback_enabled: false
+  v2_plus_gradient_prefilter:
+    controller_v2:
+      gradient_prefilter_enabled: true
+      trust_region_enabled: false
+      action_memory_enabled: false
+      rollback_enabled: false
+  v2_plus_trust_region:
+    controller_v2:
+      gradient_prefilter_enabled: true
+      trust_region_enabled: true
+      action_memory_enabled: false
+      rollback_enabled: false
+  v2_plus_action_memory:
+    controller_v2:
+      gradient_prefilter_enabled: true
+      trust_region_enabled: true
+      action_memory_enabled: true
+      rollback_enabled: false
+  v2_full:
+    controller_v2:
+      gradient_prefilter_enabled: true
+      trust_region_enabled: true
+      action_memory_enabled: true
+      rollback_enabled: true
+  v2_no_rollback:
+    controller_v2:
+      gradient_prefilter_enabled: true
+      trust_region_enabled: true
+      action_memory_enabled: true
+      rollback_enabled: false

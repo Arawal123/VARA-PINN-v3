@@ -9,10 +9,17 @@ import torch
 class BoundarySampler:
     """Uniform sampler over the rectangular boundary."""
 
-    def __init__(self, bounds: tuple[float, float, float, float], device: torch.device, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        bounds: tuple[float, float, float, float],
+        device: torch.device,
+        seed: int | None = None,
+        t_bounds: tuple[float, float] | None = None,
+    ) -> None:
         self.bounds = bounds
         self.device = device
         self.rng = np.random.default_rng(seed)
+        self.t_bounds = t_bounds
 
     def sample_numpy(self, n: int) -> np.ndarray:
         x0, x1, y0, y1 = self.bounds
@@ -31,6 +38,9 @@ class BoundarySampler:
         ]
         out = np.vstack([p for p in pts if len(p)])
         self.rng.shuffle(out)
+        if self.t_bounds is not None:
+            times = self.rng.uniform(self.t_bounds[0], self.t_bounds[1], out.shape[0])
+            out = np.column_stack([out, times])
         return out
 
     def sample(self, n: int) -> torch.Tensor:

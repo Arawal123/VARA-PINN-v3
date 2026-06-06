@@ -63,19 +63,73 @@ def _activation(name: str) -> nn.Module:
     raise ValueError(f"Unsupported activation: {name}")
 
 
-def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float]) -> MLP:
-    """Build a velocity-pressure MLP from a config dictionary."""
+def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float]) -> nn.Module:
+    """Build the configured velocity-pressure network."""
     model_cfg = config.get("model", {})
     x0, x1, y0, y1 = bounds
     in_dim = int(model_cfg.get("input_dim", 2))
     lower = [x0, y0] if in_dim == 2 else [x0, y0, model_cfg.get("t_min", 0.0)]
     upper = [x1, y1] if in_dim == 2 else [x1, y1, model_cfg.get("t_max", 1.0)]
-    return MLP(
-        in_dim=in_dim,
-        out_dim=int(model_cfg.get("output_dim", 3)),
-        hidden_layers=model_cfg.get("hidden_layers", [96, 96, 96, 96]),
-        activation=model_cfg.get("activation", "tanh"),
-        input_lower=lower,
-        input_upper=upper,
-    )
+    architecture = str(model_cfg.get("architecture", "mlp")).lower()
+    formulation = str(model_cfg.get("physics_formulation", "direct")).lower()
+    requested_out_dim = int(model_cfg.get("output_dim", 3))
+    internal_out_dim = 2 if formulation == "streamfunction_pressure" else requested_out_dim
+    if architecture == "residual_fourier_mlp":
+        from .residual_fourier_mlp import ResidualFourierMLP, parameter_matched_width
+
+        frequencies = tuple(model_cfg.get("frequencies", [1.0, 2.0, 4.0, 8.0]))
+        blocks = int(model_cfg.get("residual_blocks", 4))
+        hidden_layers = model_cfg.get("comparison_hidden_layers", model_cfg.get("hidden_layers", [96, 96, 96, 96]))
+        matched_width, enhanced_count, legacy_count = parameter_matched_width(
+            in_dim,
+            internal_out_dim,
+            hidden_layers,
+            frequencies,
+            blocks,
+        )
+        width = int(model_cfg.get("width", matched_width))
+        if "width" not in model_cfg:
+            mismatch = abs(enhanced_count - legacy_count) / max(legacy_count, 1)
+            if mismatch > 0.05:
+                raise ValueError(
+                    "Could not parameter-match residual_fourier_mlp within 5%; "
+                    f"legacy={legacy_count}, enhanced={enhanced_count}."
+                )
+        model: nn.Module = ResidualFourierMLP(
+            in_dim=in_dim,
+            out_dim=internal_out_dim,
+            width=width,
+            blocks=blocks,
+            frequencies=frequencies,
+            input_lower=lower,
+            input_upper=upper,
+        )
+    else:
+        model = MLP(
+            in_dim=in_dim,
+            out_dim=internal_out_dim,
+            hidden_layers=model_cfg.get("hidden_layers", [96, 96, 96, 96]),
+            activation=model_cfg.get("activation", "tanh"),
+            input_lower=lower,
+            input_upper=upper,
+        )
+    if formulation == "streamfunction_pressure":
+        from .physics_wrappers import StreamfunctionPressureWrapper
+
+        return StreamfunctionPressureWrapper(model)
+    if formulation == "cavity_hard_boundary":
+        if str(config.get("benchmark", "")).lower() not in {"lid_driven_cavity", "cavity"}:
+            raise ValueError("cavity_hard_boundary is only valid for the lid-driven cavity benchmark.")
+        from .physics_wrappers import CavityHardBoundaryWrapper
+
+        benchmark_cfg = config.get("benchmark_params", {})
+        return CavityHardBoundaryWrapper(
+            model,
+            bounds,
+            lid_velocity=float(benchmark_cfg.get("lid_velocity", 1.0)),
+            corner_width=float(model_cfg.get("hard_boundary_corner_width", 0.02)),
+        )
+    if formulation != "direct":
+        raise ValueError(f"Unsupported model.physics_formulation: {formulation}")
+    return model
 

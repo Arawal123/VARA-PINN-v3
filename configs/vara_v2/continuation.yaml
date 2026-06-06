@@ -1,0 +1,16 @@
+continuation_anchor:
+  enabled: true
+  active_fraction: 0.20
+  initial_weight: 0.5
+  fields: velocity
+
+continuation_replay:
+  enabled: true
+  n_points: 512
+  active_fraction: 0.20
+  initial_weight: 0.5
+  fields: velocity
+  seed_offset: 104729
+
+warm_start:
+  load_optimizer: false

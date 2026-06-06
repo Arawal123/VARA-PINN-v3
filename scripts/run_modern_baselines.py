@@ -34,14 +34,28 @@ METHODS = {
         "gradient_enhanced_pinn",
         "configs/baselines/gradient_enhanced.yaml",
     ),
+    "relobralo": (
+        "relobralo_pinn",
+        "configs/baselines/relobralo.yaml",
+    ),
+    "residual_attention": (
+        "residual_attention_pinn",
+        "configs/baselines/residual_attention.yaml",
+    ),
+    "causal": (
+        "causal_pinn",
+        "configs/baselines/causal.yaml",
+    ),
     "vara": ("local_constrained_vara", None),
 }
+
+DEFAULT_METHODS = [name for name in METHODS if name != "causal"]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/lid_driven_cavity.yaml")
-    parser.add_argument("--methods", nargs="+", default=list(METHODS))
+    parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--output_dir", default="experiments/cavity_modern_baselines")
     parser.add_argument("--device", default=None)

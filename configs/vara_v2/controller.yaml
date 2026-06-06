@@ -1,0 +1,33 @@
+controller_v2:
+  total_steps: 400
+  warmup_steps: 100
+  control_blocks: 6
+  block_steps: 50
+  probe_steps: 10
+  gradient_probe_interior: 256
+  gradient_probe_boundary: 128
+  min_uniform_mass: 0.35
+  max_patch_mass: 0.25
+  multiplier_min: 0.5
+  multiplier_max: 2.0
+  max_candidates: 4
+  prefilter_damage_ratio: 0.25
+  trust_radius_initial: 0.10
+  trust_radius_min: 0.025
+  trust_radius_max: 0.20
+  trust_expand: 1.25
+  trust_shrink: 0.5
+  effectiveness_ema: 0.8
+  noise_floor: 0.0001
+  reliable_reward_ratio: 0.75
+  gradient_prefilter_enabled: true
+  trust_region_enabled: true
+  action_memory_enabled: true
+  rollback_enabled: true
+
+pressure_gauge:
+  weight: 0.001
+
+optimizer:
+  final_repair:
+    enabled: false

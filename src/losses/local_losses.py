@@ -25,6 +25,40 @@ LOSS_COORD_SOURCE = {
 }
 
 
+def compute_budgeted_patch_losses(
+    pointwise: dict[str, torch.Tensor],
+    batch: dict[str, Any],
+    patch_grid: Any,
+    multipliers: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Reduce pointwise losses with mean-one patch multipliers.
+
+    Unlike the V1 additive local loss, this replaces the ordinary mean for an
+    affected loss component. A multiplier field with mean one therefore
+    redistributes emphasis without increasing total configured loss mass.
+    """
+    reduced: dict[str, torch.Tensor] = {}
+    for name, values in pointwise.items():
+        if name not in multipliers:
+            reduced[name] = mse(values)
+            continue
+        coord_name = LOSS_COORD_SOURCE.get(name)
+        if coord_name is None or coord_name not in batch:
+            reduced[name] = mse(values)
+            continue
+        coords = batch[coord_name]
+        patch_ids = patch_grid.assign_torch(coords).to(device=values.device)
+        patch_values = torch.as_tensor(
+            multipliers[name],
+            dtype=values.dtype,
+            device=values.device,
+        )
+        weights = patch_values[patch_ids].reshape(values.shape)
+        weights = weights / weights.mean().clamp_min(1e-12)
+        reduced[name] = torch.mean(weights * values)
+    return reduced
+
+
 def compute_local_weighted_loss(
     pointwise: dict[str, torch.Tensor],
     batch: dict[str, Any],

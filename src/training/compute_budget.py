@@ -19,6 +19,10 @@ class ComputeTracker:
     collocation_evaluations: int = 0
     boundary_evaluations: int = 0
     data_evaluations: int = 0
+    controller_gradient_evaluations: int = 0
+    controller_gradient_point_evaluations: int = 0
+    probe_optimizer_steps: int = 0
+    rollback_optimizer_steps: int = 0
     phase_seconds: dict[str, float] = field(default_factory=dict)
     stop_reason: str = ""
 
@@ -88,6 +92,16 @@ class ComputeTracker:
     def record_auxiliary_optimizer_step(self) -> None:
         self.auxiliary_optimizer_steps += 1
 
+    def record_controller_gradient_evaluation(self, points: int, count: int = 1) -> None:
+        self.controller_gradient_evaluations += int(count)
+        self.controller_gradient_point_evaluations += int(points) * int(count)
+
+    def record_probe_step(self) -> None:
+        self.probe_optimizer_steps += 1
+
+    def record_rollback_steps(self, steps: int) -> None:
+        self.rollback_optimizer_steps += max(0, int(steps))
+
     def add_phase_time(self, name: str, seconds: float) -> None:
         self.phase_seconds[name] = self.phase_seconds.get(name, 0.0) + max(0.0, float(seconds))
 
@@ -118,6 +132,10 @@ class ComputeTracker:
             "collocation_evaluations": self.collocation_evaluations,
             "boundary_evaluations": self.boundary_evaluations,
             "data_evaluations": self.data_evaluations,
+            "controller_gradient_evaluations": self.controller_gradient_evaluations,
+            "controller_gradient_point_evaluations": self.controller_gradient_point_evaluations,
+            "probe_optimizer_steps": self.probe_optimizer_steps,
+            "rollback_optimizer_steps": self.rollback_optimizer_steps,
         }
 
 

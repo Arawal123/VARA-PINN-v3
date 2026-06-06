@@ -1,0 +1,8 @@
+model:
+  architecture: residual_fourier_mlp
+  frequencies: [1.0, 2.0, 4.0, 8.0]
+  residual_blocks: 4
+  comparison_hidden_layers: [64, 64, 64]
+
+pressure_gauge:
+  weight: 0.001

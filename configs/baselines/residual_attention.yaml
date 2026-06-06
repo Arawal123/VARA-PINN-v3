@@ -1,0 +1,4 @@
+residual_attention:
+  decay: 0.999
+  eta: 0.01
+  maximum_attention: 10.0

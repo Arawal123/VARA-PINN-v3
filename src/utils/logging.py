@@ -23,6 +23,9 @@ class CSVLogger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fieldnames: list[str] | None = None
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open("r", newline="", encoding="utf-8") as f:
+                self.fieldnames = list(csv.DictReader(f).fieldnames or [])
 
     def log(self, row: dict[str, Any]) -> None:
         row = {k: _scalar(v) for k, v in row.items()}
@@ -32,13 +35,28 @@ class CSVLogger:
         else:
             extra = [k for k in row if k not in self.fieldnames]
             if extra:
-                self.fieldnames.extend(extra)
+                self._extend_schema(extra)
             write_header = False
         with self.path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
+
+    def _extend_schema(self, extra: list[str]) -> None:
+        """Rewrite prior rows when a later record introduces new columns."""
+        old_fieldnames = list(self.fieldnames or [])
+        rows: list[dict[str, Any]] = []
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open("r", newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f, fieldnames=old_fieldnames))
+            if rows and all(rows[0].get(name) == name for name in old_fieldnames):
+                rows = rows[1:]
+        self.fieldnames = [*old_fieldnames, *extra]
+        with self.path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 class JSONListLogger:
@@ -57,4 +75,3 @@ def _scalar(value: Any) -> Any:
     if hasattr(value, "item"):
         return value.item()
     return value
-

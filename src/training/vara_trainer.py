@@ -20,6 +20,9 @@ from src.controllers import (
 from src.diagnostics import DiagnosticMapBuilder
 from src.losses.base_losses import compute_global_losses, compute_pointwise_losses, weighted_sum
 from src.losses.modern_baselines import (
+    ReLoBRaLoWeights,
+    ResidualAttentionState,
+    causal_temporal_objective,
     loss_gradient_norm,
     self_adaptive_objective,
 )
@@ -84,6 +87,8 @@ class VARATrainer(ExperimentTrainer):
         self.local_figure_dir = ensure_dir(self.run_dir / "figures")
         self.local_decisions: list[dict[str, Any]] = []
         self.local_weight_records: list[dict[str, Any]] = []
+        self._relobralo_state: ReLoBRaLoWeights | None = None
+        self._residual_attention_state: ResidualAttentionState | None = None
 
     def run(self) -> dict[str, float]:
         self.compute_tracker.start()
@@ -95,6 +100,12 @@ class VARATrainer(ExperimentTrainer):
             return self._run_uniform_baseline(self._train_gradient_balanced_epochs)
         if self.mode == "gradient_enhanced_pinn":
             return self._run_uniform_baseline(self.train_epochs)
+        if self.mode == "relobralo_pinn":
+            return self._run_uniform_baseline(self._train_relobralo_epochs)
+        if self.mode == "residual_attention_pinn":
+            return self._run_uniform_baseline(self._train_residual_attention_epochs)
+        if self.mode == "causal_pinn":
+            return self._run_uniform_baseline(self._train_causal_epochs)
         if self.mode in {"local_vara", "local_constrained_vara"}:
             return self._run_local(constrained=self.mode == "local_constrained_vara")
         if self.mode == "full_vara_constrained":
@@ -228,6 +239,15 @@ class VARATrainer(ExperimentTrainer):
                 boundary_logits,
                 maximum_attention=float(cfg.get("maximum_attention", 20.0)),
             )
+            anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+            replay_loss, replay_weight = self.continuation_replay_loss()
+            gauge_loss = self.pressure_gauge_loss()
+            total = total + anchor_loss + replay_loss + gauge_loss
+            attention_logs["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            attention_logs["continuation_anchor_weight"] = float(anchor_weight)
+            attention_logs["continuation_replay"] = float(replay_loss.detach().cpu())
+            attention_logs["continuation_replay_weight"] = float(replay_weight)
+            attention_logs["pressure_gauge"] = float(gauge_loss.detach().cpu())
             total.backward()
             grad_norm = self._grad_norm()
             self.optimizer.step()
@@ -301,12 +321,21 @@ class VARATrainer(ExperimentTrainer):
                     proposal = proposed[name] * scale
                     adaptive_weights[name] = ema * adaptive_weights[name] + (1.0 - ema) * proposal
             total = weighted_sum(losses, adaptive_weights)
+            anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+            replay_loss, replay_weight = self.continuation_replay_loss()
+            gauge_loss = self.pressure_gauge_loss()
+            total = total + anchor_loss + replay_loss + gauge_loss
             total.backward()
             grad_norm = self._grad_norm()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
             last_losses.update({f"adaptive_weight_{name}": value for name, value in adaptive_weights.items()})
+            last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            last_losses["continuation_anchor_weight"] = float(anchor_weight)
+            last_losses["continuation_replay"] = float(replay_loss.detach().cpu())
+            last_losses["continuation_replay_weight"] = float(replay_weight)
+            last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
             self.last_losses = dict(last_losses)
@@ -316,6 +345,203 @@ class VARATrainer(ExperimentTrainer):
                 )
             self.global_step += 1
         self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
+        return last_losses
+
+    def _train_relobralo_epochs(
+        self,
+        batch: dict[str, Any],
+        _control_state: Any | None = None,
+        cycle: int = 0,
+        epochs_override: int | None = None,
+        log_prefix: str = "",
+    ) -> dict[str, float]:
+        """Train with published relative-loss random-lookback balancing."""
+        train_cfg = self.config.get("training", {})
+        cfg = self.config.get("relobralo", {})
+        epochs = int(epochs_override if epochs_override is not None else train_cfg.get("epochs_per_cycle", 100))
+        log_every = max(1, int(train_cfg.get("log_every", 25)))
+        active_names = [
+            name
+            for name, value in dict(train_cfg.get("weights", {})).items()
+            if float(value) > 0.0
+        ]
+        if self._relobralo_state is None:
+            self._relobralo_state = ReLoBRaLoWeights(
+                active_names,
+                temperature=float(cfg.get("temperature", 0.1)),
+                alpha=float(cfg.get("alpha", 0.999)),
+                random_lookback_probability=float(cfg.get("random_lookback_probability", 0.999)),
+                seed=self.seed + 1709,
+            )
+        last_losses: dict[str, float] = {}
+        started = time.perf_counter()
+        self.model.train()
+        for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+                break
+            self.optimizer.zero_grad(set_to_none=True)
+            self.compute_tracker.record_objective(batch)
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            losses = compute_global_losses(pointwise)
+            available = [name for name in self._relobralo_state.names if name in losses]
+            if available != self._relobralo_state.names:
+                self._relobralo_state = ReLoBRaLoWeights(
+                    available,
+                    temperature=float(cfg.get("temperature", 0.1)),
+                    alpha=float(cfg.get("alpha", 0.999)),
+                    random_lookback_probability=float(cfg.get("random_lookback_probability", 0.999)),
+                    seed=self.seed + 1709,
+                )
+            adaptive = self._relobralo_state.update(losses)
+            total = weighted_sum(losses, adaptive)
+            anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+            replay_loss, replay_weight = self.continuation_replay_loss()
+            gauge_loss = self.pressure_gauge_loss()
+            total = total + anchor_loss + replay_loss + gauge_loss
+            total.backward()
+            grad_norm = self._grad_norm()
+            self.optimizer.step()
+            self.compute_tracker.record_optimizer_step()
+            last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
+            last_losses.update({f"relobralo_weight_{name}": value for name, value in adaptive.items()})
+            last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            last_losses["continuation_anchor_weight"] = float(anchor_weight)
+            last_losses["continuation_replay"] = float(replay_loss.detach().cpu())
+            last_losses["continuation_replay_weight"] = float(replay_weight)
+            last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
+            last_losses["total"] = float(total.detach().cpu())
+            last_losses["grad_norm"] = grad_norm
+            self.last_losses = dict(last_losses)
+            if local_epoch % log_every == 0 or local_epoch == epochs - 1:
+                self.loss_logger.log(
+                    {"cycle": cycle, "phase": log_prefix or self.mode, "epoch": self.global_step, **last_losses}
+                )
+            self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - started)
+        return last_losses
+
+    def _train_residual_attention_epochs(
+        self,
+        batch: dict[str, Any],
+        _control_state: Any | None = None,
+        cycle: int = 0,
+        epochs_override: int | None = None,
+        log_prefix: str = "",
+    ) -> dict[str, float]:
+        """Train with residual-based point attention on the interior objective."""
+        train_cfg = self.config.get("training", {})
+        cfg = self.config.get("residual_attention", {})
+        epochs = int(epochs_override if epochs_override is not None else train_cfg.get("epochs_per_cycle", 100))
+        log_every = max(1, int(train_cfg.get("log_every", 25)))
+        weights = dict(train_cfg.get("weights", {}))
+        size = int(batch["xy_f"].shape[0])
+        if self._residual_attention_state is None or self._residual_attention_state.values.numel() != size:
+            self._residual_attention_state = ResidualAttentionState(
+                size,
+                decay=float(cfg.get("decay", 0.999)),
+                eta=float(cfg.get("eta", 0.01)),
+                maximum=float(cfg.get("maximum_attention", 10.0)),
+            )
+        last_losses: dict[str, float] = {}
+        started = time.perf_counter()
+        self.model.train()
+        for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(size):
+                break
+            self.optimizer.zero_grad(set_to_none=True)
+            self.compute_tracker.record_objective(batch)
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            attention = self._residual_attention_state.update(torch.sqrt(pointwise["pde"] + 1e-18))
+            losses: dict[str, torch.Tensor] = {}
+            for name, values in pointwise.items():
+                if name in {"pde", "momentum_u", "momentum_v", "continuity"}:
+                    losses[name] = torch.mean(attention.reshape(values.shape) * values)
+                else:
+                    losses[name] = torch.mean(values)
+            total = weighted_sum(losses, weights)
+            anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+            replay_loss, replay_weight = self.continuation_replay_loss()
+            gauge_loss = self.pressure_gauge_loss()
+            total = total + anchor_loss + replay_loss + gauge_loss
+            total.backward()
+            grad_norm = self._grad_norm()
+            self.optimizer.step()
+            self.compute_tracker.record_optimizer_step()
+            last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
+            last_losses["residual_attention_mean"] = float(attention.detach().mean().cpu())
+            last_losses["residual_attention_max"] = float(attention.detach().max().cpu())
+            last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            last_losses["continuation_anchor_weight"] = float(anchor_weight)
+            last_losses["continuation_replay"] = float(replay_loss.detach().cpu())
+            last_losses["continuation_replay_weight"] = float(replay_weight)
+            last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
+            last_losses["total"] = float(total.detach().cpu())
+            last_losses["grad_norm"] = grad_norm
+            self.last_losses = dict(last_losses)
+            if local_epoch % log_every == 0 or local_epoch == epochs - 1:
+                self.loss_logger.log(
+                    {"cycle": cycle, "phase": log_prefix or self.mode, "epoch": self.global_step, **last_losses}
+                )
+            self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - started)
+        return last_losses
+
+    def _train_causal_epochs(
+        self,
+        batch: dict[str, Any],
+        _control_state: Any | None = None,
+        cycle: int = 0,
+        epochs_override: int | None = None,
+        log_prefix: str = "",
+    ) -> dict[str, float]:
+        """Train a time-dependent PINN with causal temporal residual weights."""
+        if batch["xy_f"].shape[1] < 3:
+            raise ValueError("causal_pinn requires a time coordinate.")
+        train_cfg = self.config.get("training", {})
+        cfg = self.config.get("causal_training", {})
+        epochs = int(epochs_override if epochs_override is not None else train_cfg.get("epochs_per_cycle", 100))
+        log_every = max(1, int(train_cfg.get("log_every", 25)))
+        scalar_weights = dict(train_cfg.get("weights", {}))
+        last_losses: dict[str, float] = {}
+        started = time.perf_counter()
+        self.model.train()
+        for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+                break
+            self.optimizer.zero_grad(set_to_none=True)
+            self.compute_tracker.record_objective(batch)
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            total, losses, causal_logs = causal_temporal_objective(
+                pointwise,
+                batch["xy_f"][:, 2],
+                scalar_weights,
+                chunks=int(cfg.get("chunks", 16)),
+                epsilon=float(cfg.get("epsilon", 1.0)),
+            )
+            anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+            replay_loss, replay_weight = self.continuation_replay_loss()
+            gauge_loss = self.pressure_gauge_loss()
+            total = total + anchor_loss + replay_loss + gauge_loss
+            total.backward()
+            grad_norm = self._grad_norm()
+            self.optimizer.step()
+            self.compute_tracker.record_optimizer_step()
+            last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
+            last_losses.update(causal_logs)
+            last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            last_losses["continuation_anchor_weight"] = float(anchor_weight)
+            last_losses["continuation_replay"] = float(replay_loss.detach().cpu())
+            last_losses["continuation_replay_weight"] = float(replay_weight)
+            last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
+            last_losses["total"] = float(total.detach().cpu())
+            last_losses["grad_norm"] = grad_norm
+            self.last_losses = dict(last_losses)
+            if local_epoch % log_every == 0 or local_epoch == epochs - 1:
+                self.loss_logger.log(
+                    {"cycle": cycle, "phase": log_prefix or self.mode, "epoch": self.global_step, **last_losses}
+                )
+            self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - started)
         return last_losses
 
     def _run_rar(self) -> dict[str, float]:

@@ -25,6 +25,25 @@ python scripts/train_vara.py --config configs/kovasznay.yaml --mode full_vara
 
 Use `configs/kovasznay_debug.yaml` for smoke tests. The main `configs/kovasznay.yaml` is Colab-scale and intended for real Kovasznay training.
 
+## VARA Controller V2
+
+V2 is opt-in and does not change any V1 mode or config:
+
+```bash
+python scripts/run_vara_v2.py --seeds 0 --device cuda
+python scripts/run_publication_suite_v2.py --study core --seeds 0 1 2 3 4 5 6 7 8 9 --device cuda
+python scripts/run_vara_v2_continuation.py --methods vanilla vara_v1 vara_v2 --seeds 0 1 2 3 4 --device cuda
+```
+
+The frozen protocol is recorded in `configs/vara_v2/frozen_protocol.yaml`. See
+`docs/vara_v2.md` for the matched-compute, generalization, ablation, and
+continuation workflow.
+
+V2 keeps the general controller, shared physics formulations, and Reynolds
+continuation/replay as separate opt-in modules. This preserves legacy runs and
+lets controller gains be distinguished from architecture or continuation
+gains.
+
 ## Baselines and Ablations
 
 ```bash
@@ -110,7 +129,10 @@ The controller uses a validation diagnostic grid for adaptation. Final test metr
 
 ## Current Limitations
 
-Kovasznay is the first complete benchmark. Taylor-Green has an analytical reference skeleton, while lid-driven cavity and cylinder wake configs are prepared for external reference data integration. Reviewer-grade claims still require longer runs, broader baselines, multi-seed statistics, and matched point/compute budgets.
+Kovasznay, manufactured rectangular flows, transient Taylor-Green, and
+reference-backed lid-driven cavity are wired. Cylinder wake still requires an
+external reference dataset. Smoke runs validate plumbing only; reviewer-grade
+claims require the documented multi-seed matched-compute protocol.
 
 ## Citation
 
