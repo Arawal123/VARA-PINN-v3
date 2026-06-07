@@ -121,6 +121,26 @@ plots, and method montages. Failed stages remain available in
 `streamline_montage_invalid_stages.png` for diagnosis. Do not use a failed
 stage as physical evidence.
 
+The strict Re=100 gate is executable:
+
+```bash
+python scripts/check_lid_cavity_re100_sanity.py \
+  --method both \
+  --seed 0 \
+  --device cuda \
+  --output_dir experiments/vara_v2/re100_sanity_gate \
+  --overwrite
+```
+
+This gate intentionally evaluates Vanilla first. If Vanilla does not satisfy
+raw reference-free physics, topology, streamfunction, speed, vortex, boundary,
+and checkpoint-restoration checks, VARA is not evaluated. If VARA passes the
+same physical gates but fails to beat Vanilla, the report states
+`VARA not dominant`; the failure is not hidden. CFD/Ghia/full-field metrics are
+evaluation-only and are checked only when a reference is explicitly provided.
+Normalized training losses, when enabled in an appendix experiment, are logged
+separately and are never used for validity decisions.
+
 The reliable protocol uses a shared 64x3 tanh MLP by default because it is
 the stable low-Re continuation seed. Apply `--enhanced_backbone` only as a
 shared architecture experiment across every compared method, not as a hidden

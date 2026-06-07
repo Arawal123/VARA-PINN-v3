@@ -30,6 +30,7 @@ from src.physics.rectangular_benchmarks import (
 )
 from src.physics.taylor_green import TaylorGreenVortex
 from src.sampling import BoundarySampler, MixedAdaptiveSampler, UniformSampler
+from src.sampling.boundary_sampler import boundary_side_fractions
 from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.checkpointing import load_checkpoint, save_checkpoint
 from src.training.compute_budget import ComputeTracker
@@ -141,6 +142,7 @@ class ExperimentTrainer:
         self.accept_logger = JSONListLogger(self.run_dir / "acceptance_log.json")
         self.action_records: list[dict[str, Any]] = []
         self.last_losses: dict[str, float] = {}
+        self.last_boundary_sampling_summary: dict[str, float] = {}
 
         t_bounds = getattr(self.benchmark, "t_bounds", None)
         sampler_cfg = config.get("sampling", {})
@@ -280,13 +282,20 @@ class ExperimentTrainer:
     def _sample_boundary_numpy(self, n: int) -> np.ndarray:
         boundary_cfg = self.config.get("sampling", {}).get("cavity_boundary", {})
         if self._is_lid_driven_cavity() and bool(boundary_cfg.get("enabled", True)):
-            return self.boundary_sampler.sample_lid_cavity_numpy(
+            points = self.boundary_sampler.sample_lid_cavity_numpy(
                 n,
                 lid_fraction=float(boundary_cfg.get("lid_fraction", 0.45)),
                 corner_fraction=float(boundary_cfg.get("corner_fraction", 0.25)),
                 corner_width=float(boundary_cfg.get("corner_width", 0.12)),
+                mode=str(boundary_cfg.get("mode", "focused")),
             )
-        return self.boundary_sampler.sample_numpy(n)
+        else:
+            points = self.boundary_sampler.sample_numpy(n)
+        self.last_boundary_sampling_summary = boundary_side_fractions(
+            points,
+            self.benchmark.bounds,
+        )
+        return points
 
     def _sample_boundary(self, n: int) -> torch.Tensor:
         return torch.tensor(self._sample_boundary_numpy(n), dtype=torch.float32, device=self.device)
@@ -368,6 +377,7 @@ class ExperimentTrainer:
             "velocity_mag_rmse",
             "velocity_mag_mae",
             "unweighted_data_loss",
+            "unweighted_reference_evaluation_loss",
             "u_centerline_rmse",
             "v_centerline_rmse",
             "u_centerline_rel_l2",
@@ -382,9 +392,13 @@ class ExperimentTrainer:
         for name in reference_names:
             if name in metrics:
                 metrics[name] = float("nan")
-        metrics["unweighted_validation_loss"] = float(
+        metrics["unweighted_physics_validation_loss"] = float(
             metrics["unweighted_pde_loss"] + metrics["unweighted_bc_loss"]
         )
+        metrics["unweighted_reference_evaluation_loss"] = float("nan")
+        metrics["unweighted_validation_loss"] = metrics[
+            "unweighted_physics_validation_loss"
+        ]
         metrics["cavity_benchmark_score"] = float(
             metrics["pde_residual_mean"]
             + metrics["continuity_residual_mean"]
@@ -463,6 +477,7 @@ class ExperimentTrainer:
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
             last_losses["learning_rate"] = learning_rate
+            last_losses.update(self.last_boundary_sampling_summary)
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log({"cycle": cycle, "phase": log_prefix or "main", "epoch": self.global_step, **last_losses})

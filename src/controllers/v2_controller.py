@@ -31,6 +31,7 @@ ALLOWED_GUARD_METRICS = (
     "momentum_residual_mean",
     "boundary_condition_error",
     "unweighted_validation_loss",
+    "unweighted_physics_validation_loss",
 )
 
 SAFE_REFERENCE_FREE_METRICS = {

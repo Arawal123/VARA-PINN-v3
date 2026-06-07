@@ -52,10 +52,13 @@ class BoundarySampler:
         lid_fraction: float = 0.45,
         corner_fraction: float = 0.25,
         corner_width: float = 0.12,
+        mode: str = "focused",
     ) -> np.ndarray:
         """Sample cavity walls with extra mass on the moving lid and lid-corner discontinuities."""
         if n <= 0:
             return np.zeros((0, 2), dtype=float)
+        if str(mode).lower() in {"balanced", "uniform", "equal"}:
+            return self.sample_numpy(n)
         lid_fraction = float(np.clip(lid_fraction, 0.0, 1.0))
         corner_fraction = float(np.clip(corner_fraction, 0.0, 1.0))
         if lid_fraction + corner_fraction > 0.95:
@@ -81,9 +84,16 @@ class BoundarySampler:
         lid_fraction: float = 0.45,
         corner_fraction: float = 0.25,
         corner_width: float = 0.12,
+        mode: str = "focused",
     ) -> torch.Tensor:
         return torch.tensor(
-            self.sample_lid_cavity_numpy(n, lid_fraction, corner_fraction, corner_width),
+            self.sample_lid_cavity_numpy(
+                n,
+                lid_fraction,
+                corner_fraction,
+                corner_width,
+                mode,
+            ),
             dtype=torch.float32,
             device=self.device,
         )
@@ -154,3 +164,36 @@ class BoundarySampler:
             else:
                 pts[i] = [x1, self.rng.uniform(y1 - width_y, y1)]
         return pts
+
+
+def boundary_side_fractions(
+    points: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    tol: float = 1e-6,
+) -> dict[str, float]:
+    """Report rectangular boundary side fractions for diagnostics."""
+    points = np.asarray(points, dtype=float)
+    if points.size == 0:
+        return {
+            "boundary_fraction_left": 0.0,
+            "boundary_fraction_right": 0.0,
+            "boundary_fraction_bottom": 0.0,
+            "boundary_fraction_top": 0.0,
+            "boundary_fraction_corner": 0.0,
+        }
+    x0, x1, y0, y1 = bounds
+    x = points[:, 0]
+    y = points[:, 1]
+    left = np.isclose(x, x0, atol=tol, rtol=0.0)
+    right = np.isclose(x, x1, atol=tol, rtol=0.0)
+    bottom = np.isclose(y, y0, atol=tol, rtol=0.0)
+    top = np.isclose(y, y1, atol=tol, rtol=0.0)
+    corner = (left | right) & (bottom | top)
+    denom = max(points.shape[0], 1)
+    return {
+        "boundary_fraction_left": float(np.count_nonzero(left) / denom),
+        "boundary_fraction_right": float(np.count_nonzero(right) / denom),
+        "boundary_fraction_bottom": float(np.count_nonzero(bottom) / denom),
+        "boundary_fraction_top": float(np.count_nonzero(top) / denom),
+        "boundary_fraction_corner": float(np.count_nonzero(corner) / denom),
+    }

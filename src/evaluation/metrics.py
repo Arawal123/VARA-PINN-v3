@@ -167,6 +167,8 @@ def evaluate_on_grid(
         "unweighted_data_loss": float("nan"),
         "unweighted_pde_loss": _finite_mean(pde_loss),
         "unweighted_bc_loss": unweighted_bc_loss,
+        "unweighted_physics_validation_loss": float("nan"),
+        "unweighted_reference_evaluation_loss": float("nan"),
         "unweighted_validation_loss": float("nan"),
         "wall_clock_eval_sec": time.time() - start,
         "num_eval_points": int(coords_np.shape[0]),
@@ -245,13 +247,13 @@ def evaluate_on_grid(
                 continuity=_masked_values(continuity_all, residual_mask),
             )
         )
-    metrics["unweighted_validation_loss"] = _finite_sum(
-        [
-            metrics["unweighted_pde_loss"],
-            metrics["unweighted_bc_loss"],
-            0.0 if not has_reference else metrics["unweighted_data_loss"],
-        ]
+    metrics["unweighted_physics_validation_loss"] = _finite_sum(
+        [metrics["unweighted_pde_loss"], metrics["unweighted_bc_loss"]]
     )
+    metrics["unweighted_reference_evaluation_loss"] = (
+        metrics["unweighted_data_loss"] if has_reference else float("nan")
+    )
+    metrics["unweighted_validation_loss"] = metrics["unweighted_physics_validation_loss"]
     if benchmark.__class__.__name__.lower().startswith("liddrivencavity"):
         metrics["cavity_benchmark_score"] = _finite_sum(
             [

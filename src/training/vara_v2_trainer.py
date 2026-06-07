@@ -433,6 +433,7 @@ class VARAV2Trainer(ExperimentTrainer):
             logs["grad_norm"] = grad_norm
             logs["learning_rate"] = learning_rate
             logs.update(normalization_logs)
+            logs.update(self.last_boundary_sampling_summary)
             self.last_losses = logs
             if local_step % log_every == 0 or local_step == steps - 1:
                 self.loss_logger.log(

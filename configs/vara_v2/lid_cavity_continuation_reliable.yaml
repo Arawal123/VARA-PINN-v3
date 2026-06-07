@@ -8,20 +8,22 @@ model:
   # The smooth low-Re starting problem converges more reliably with the
   # standard tanh MLP. The Fourier backbone remains an opt-in shared study.
   architecture: mlp
-  output_dim: 2
+  output_dim: 3
   hidden_layers: [64, 64, 64]
-  # Topology-first cavity continuation uses the streamfunction-pressure
-  # formulation so the plotted velocity field is solenoidal by construction.
-  # CFD/Ghia references remain evaluation-only; no reference data is used in
-  # this wrapper or in the controller.
-  physics_formulation: streamfunction_pressure
+  # Reliable cavity uses direct velocity-pressure outputs with an exact
+  # regularized cavity wall transform. Plain streamfunction-pressure enforces
+  # divergence but not the no-slip/moving-lid walls, and is kept for appendix
+  # experiments rather than the primary reliable protocol.
+  physics_formulation: cavity_hard_boundary
+  hard_boundary_corner_width: 0.02
+  hard_boundary_lid_lifting: harmonic
 
 training:
   pointwise_reduction: mean
-  adaptive_cycles: 10
+  adaptive_cycles: 20
   epochs_per_cycle: 200
-  n_collocation: 1024
-  n_boundary: 768
+  n_collocation: 2048
+  n_boundary: 512
   n_data: 0
   log_every: 50
   weights:
@@ -29,8 +31,8 @@ training:
     pde: 0.0
     momentum_u: 1.0
     momentum_v: 1.0
-    continuity: 0.0
-    bc: 30.0
+    continuity: 1.0
+    bc: 1.0
     u: 0.0
     v: 0.0
     p: 0.0
@@ -38,7 +40,7 @@ training:
     pressure_gradient: 0.0
 
 loss_normalization:
-  enabled: true
+  enabled: false
   names: [momentum_u, momentum_v, continuity, bc]
   ema: 0.98
   min_scale: 1.0e-5
@@ -46,12 +48,12 @@ loss_normalization:
   warmup_steps: 0
 
 controller_v2:
-  total_steps: 2000
+  total_steps: 4000
   # Align every neutral controller boundary with Vanilla's 200-step
   # collocation refresh. When no action is accepted, both trajectories are
   # therefore exactly identical.
-  warmup_steps: 400
-  control_blocks: 8
+  warmup_steps: 800
+  control_blocks: 16
   block_steps: 200
   probe_steps: 10
   gradient_probe_interior: 256
@@ -64,7 +66,7 @@ controller_v2:
     - continuity_residual_mean
     - momentum_residual_mean
     - boundary_condition_error
-    - unweighted_validation_loss
+    - unweighted_physics_validation_loss
     - streamfunction_consistency_rmse
     - centerline_pde_residual_mean
     - centerline_continuity_residual_mean
@@ -84,11 +86,19 @@ continuation_replay:
 sampling:
   uniform:
     engine: sobol
+  cavity_boundary:
+    enabled: true
+    mode: balanced
+    lid_fraction: 0.25
+    corner_fraction: 0.0
+    corner_width: 0.08
 
 checkpoint:
-  restore_best_before_final: false
+  restore_best_before_final: true
   reference_free_metrics:
+    - pde_residual_mean
     - momentum_residual_mean
+    - boundary_condition_error
     - continuity_residual_mean
     - streamfunction_consistency_rmse
     - centerline_pde_residual_mean
@@ -124,6 +134,8 @@ evaluation:
   # separate boundary metrics, so singular lid corners must not be counted
   # twice or dominate controller decisions.
   residual_interior_only: true
+  controller_reference_metrics_enabled: false
+  checkpoint_reference_metrics_enabled: false
 
 continuation_validity:
   enabled: true
@@ -132,10 +144,14 @@ continuation_validity:
   max_momentum_residual_mean: 0.30
   max_boundary_condition_error: 0.12
   max_speed_pred: 2.0
+  min_speed_pred_mean: 0.05
   max_streamfunction_consistency_rmse: 0.03
   max_lid_cavity_primary_center_error: 0.12
   max_lid_cavity_topology_score: 0.18
   max_velocity_full_rel_l2: 0.85
   require_lid_cavity_topology_alignment: true
-  min_primary_streamfunction_abs: 0.01
+  min_primary_streamfunction_abs: 0.015
+  min_detected_vortices: 1
   min_primary_vortex_wall_distance: 0.05
+  max_final_checkpoint_physics_degradation: 0.05
+  max_vara_vs_vanilla_physics_degradation: 0.02

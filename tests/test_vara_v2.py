@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from scripts.run_vara_v2_continuation import _load_base_config
+from scripts.check_lid_cavity_re100_sanity import build_report
 from src.controllers import V2ControllerConfig, VARAV2Controller
 from src.evaluation.metrics import evaluate_on_grid
 from src.evaluation.statistical_tests import (
@@ -25,6 +26,7 @@ from src.models import (
 )
 from src.physics.navier_stokes import navier_stokes_residuals
 from src.physics.rectangular_benchmarks import LidDrivenCavityQualitative
+from src.sampling.boundary_sampler import BoundarySampler, boundary_side_fractions
 from src.physics.taylor_green import TaylorGreenVortex
 from src.training.checkpointing import save_checkpoint
 from src.training.vara_trainer import VARATrainer
@@ -270,7 +272,12 @@ def test_cavity_hard_boundary_wrapper_enforces_regularized_walls():
 def test_continuation_overlay_inherits_lid_cavity_base_config():
     config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     assert config["benchmark"] == "lid_driven_cavity"
-    assert config["model"]["physics_formulation"] == "streamfunction_pressure"
+    assert config["model"]["physics_formulation"] == "cavity_hard_boundary"
+    assert config["model"]["output_dim"] == 3
+    assert config["loss_normalization"]["enabled"] is False
+    assert config["evaluation"]["controller_reference_metrics_enabled"] is False
+    assert config["evaluation"]["checkpoint_reference_metrics_enabled"] is False
+    assert "unweighted_physics_validation_loss" in config["controller_v2"]["guard_metrics"]
 
 
 def test_cavity_hard_boundary_accepts_lid_cavity_alias():
@@ -287,6 +294,74 @@ def test_cavity_hard_boundary_accepts_lid_cavity_alias():
         build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0)),
         CavityHardBoundaryWrapper,
     )
+
+
+def test_balanced_lid_cavity_boundary_sampler_reports_side_fractions():
+    sampler = BoundarySampler((0.0, 1.0, 0.0, 1.0), torch.device("cpu"), seed=7)
+    points = sampler.sample_lid_cavity_numpy(
+        400,
+        mode="balanced",
+    )
+    fractions = boundary_side_fractions(points, (0.0, 1.0, 0.0, 1.0))
+    assert sum(
+        fractions[name]
+        for name in [
+            "boundary_fraction_left",
+            "boundary_fraction_right",
+            "boundary_fraction_bottom",
+            "boundary_fraction_top",
+        ]
+    ) == pytest.approx(1.0)
+    for name in [
+        "boundary_fraction_left",
+        "boundary_fraction_right",
+        "boundary_fraction_bottom",
+        "boundary_fraction_top",
+    ]:
+        assert 0.15 <= fractions[name] <= 0.35
+
+
+def test_re100_sanity_report_fails_broken_physical_behavior(tmp_path):
+    result_root = tmp_path / "broken_re100"
+    summary = result_root / "summary"
+    method_dir = result_root / "seed_0" / "re_0100" / "vanilla"
+    summary.mkdir(parents=True)
+    (method_dir / "logs").mkdir(parents=True)
+    (method_dir / "checkpoints").mkdir(parents=True)
+    (method_dir / "figures").mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "seed": 0,
+                "reynolds": 100.0,
+                "method": "vanilla",
+                "method_dir": str(method_dir),
+                "continuation_stage_valid": False,
+                "continuation_invalid_reasons": "known broken fixture",
+                "boundary_condition_error": 0.4,
+                "pde_residual_mean": 0.9,
+                "continuity_residual_mean": 0.3,
+                "momentum_residual_mean": 0.7,
+                "speed_pred_mean": 0.01,
+                "speed_pred_max": 0.02,
+                "primary_streamfunction_abs": 0.001,
+                "detected_vortex_count": 0,
+                "lid_cavity_topology_aligned": 0.0,
+                "lid_cavity_primary_center_error": 0.5,
+                "streamfunction_consistency_rmse": 0.5,
+                "unweighted_physics_validation_loss": 1.3,
+                "has_reference": False,
+            }
+        ]
+    ).to_csv(summary / "continuation_results_long.csv", index=False)
+    pd.DataFrame(
+        [{"momentum_u": 0.7, "momentum_v": 0.7, "continuity": 0.3, "bc": 0.4}]
+    ).to_csv(method_dir / "logs" / "losses.csv", index=False)
+    report = build_report(result_root, "vanilla", 0)
+    assert not report["passed"]
+    assert any("continuation_stage_valid=false" in item for item in report["failures"])
+    assert any("detected_vortex_count" in item for item in report["failures"])
+    assert "raw_momentum_u" in report["methods"]["vanilla"]["raw_training_losses_last"]
 
 
 def test_harmonic_cavity_lifting_reduces_couette_interior_bias():
