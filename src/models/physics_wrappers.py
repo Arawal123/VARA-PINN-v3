@@ -132,6 +132,83 @@ class StreamfunctionPressureWrapper(nn.Module):
             return torch.cat([u, v, p], dim=1)
 
 
+class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
+    """Divergence-free cavity ansatz with regularized hard velocity walls.
+
+    The base network predicts ``(raw_psi, raw_p)``. The streamfunction is
+    assembled as
+
+        psi_total = psi_lift + envelope_psi * raw_psi
+
+    where the correction envelope and its first derivatives vanish on all
+    walls. Velocity is then recovered from the streamfunction, so the interior
+    continuity residual is zero up to autograd/numerical precision while the
+    regularized moving lid remains imposed by construction.
+    """
+
+    def __init__(
+        self,
+        base: nn.Module,
+        bounds: tuple[float, float, float, float],
+        lid_velocity: float = 1.0,
+        corner_width: float = 0.02,
+        lid_vertical_power: int = 6,
+    ) -> None:
+        super().__init__()
+        self.base = base
+        self.bounds = tuple(float(value) for value in bounds)
+        self.lid_velocity = float(lid_velocity)
+        self.corner_width = max(float(corner_width), 1e-6)
+        self.lid_vertical_power = max(2, int(lid_vertical_power))
+        self.physics_formulation = "hard_boundary_streamfunction_pressure"
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        with torch.enable_grad():
+            working = coords if coords.requires_grad else coords.clone().detach().requires_grad_(True)
+            raw = self.base(working)
+            psi_total = self.streamfunction(working, raw[:, 0:1])
+            p = raw[:, 1:2]
+            gradient = torch.autograd.grad(
+                psi_total,
+                working,
+                grad_outputs=torch.ones_like(psi_total),
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+            u = gradient[:, 1:2]
+            v = -gradient[:, 0:1]
+            return torch.cat([u, v, p], dim=1)
+
+    def streamfunction(self, coords: torch.Tensor, raw_psi: torch.Tensor) -> torch.Tensor:
+        x0, x1, y0, y1 = self.bounds
+        lx = max(x1 - x0, 1e-12)
+        ly = max(y1 - y0, 1e-12)
+        xi = (coords[:, 0:1] - x0) / lx
+        eta = (coords[:, 1:2] - y0) / ly
+        horizontal = self._lid_profile(xi)
+        vertical = self._vertical_lid_shape(eta)
+        psi_lift = self.lid_velocity * ly * horizontal * vertical
+        correction_envelope = (
+            xi.pow(2)
+            * (1.0 - xi).pow(2)
+            * eta.pow(2)
+            * (1.0 - eta).pow(2)
+        )
+        # The factor keeps the correction O(1) near the cavity core while
+        # preserving zero value and zero first derivative on every wall.
+        return psi_lift + 256.0 * correction_envelope * raw_psi
+
+    def _lid_profile(self, xi: torch.Tensor) -> torch.Tensor:
+        left = _smoothstep01(xi / self.corner_width)
+        right = _smoothstep01((1.0 - xi) / self.corner_width)
+        return left * right
+
+    def _vertical_lid_shape(self, eta: torch.Tensor) -> torch.Tensor:
+        power = self.lid_vertical_power
+        return eta.pow(power) * (eta - 1.0)
+
+
 def _smoothstep01(value: torch.Tensor) -> torch.Tensor:
     clipped = torch.clamp(value, 0.0, 1.0)
     return clipped * clipped * (3.0 - 2.0 * clipped)

@@ -20,6 +20,7 @@ from src.losses.base_losses import compute_global_losses
 from src.losses.local_losses import compute_budgeted_patch_losses
 from src.models import (
     CavityHardBoundaryWrapper,
+    HardBoundaryStreamfunctionPressureWrapper,
     StreamfunctionPressureWrapper,
     build_mlp_from_config,
     parameter_matched_width,
@@ -272,8 +273,10 @@ def test_cavity_hard_boundary_wrapper_enforces_regularized_walls():
 def test_continuation_overlay_inherits_lid_cavity_base_config():
     config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     assert config["benchmark"] == "lid_driven_cavity"
-    assert config["model"]["physics_formulation"] == "cavity_hard_boundary"
-    assert config["model"]["output_dim"] == 3
+    assert config["model"]["physics_formulation"] == "hard_boundary_streamfunction_pressure"
+    assert config["model"]["output_dim"] == 2
+    assert config["training"]["adaptive_cycles"] == 60
+    assert config["controller_v2"]["total_steps"] == 12000
     assert config["loss_normalization"]["enabled"] is False
     assert config["evaluation"]["controller_reference_metrics_enabled"] is False
     assert config["evaluation"]["checkpoint_reference_metrics_enabled"] is False
@@ -293,6 +296,22 @@ def test_cavity_hard_boundary_accepts_lid_cavity_alias():
     assert isinstance(
         build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0)),
         CavityHardBoundaryWrapper,
+    )
+
+
+def test_hard_boundary_streamfunction_pressure_builds_for_lid_cavity_alias():
+    config = {
+        "benchmark": "lid_cavity",
+        "model": {
+            "physics_formulation": "hard_boundary_streamfunction_pressure",
+            "input_dim": 2,
+            "output_dim": 2,
+            "hidden_layers": [8, 8],
+        },
+    }
+    assert isinstance(
+        build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0)),
+        HardBoundaryStreamfunctionPressureWrapper,
     )
 
 
@@ -435,6 +454,67 @@ def test_divergence_free_cavity_lifting_satisfies_walls_and_continuity():
     )
     assert wall_velocity[3, 0].item() == pytest.approx(1.0)
     assert wall_velocity[3, 1].item() == pytest.approx(0.0)
+
+
+def test_hard_boundary_streamfunction_pressure_is_divergence_free_and_residual_safe():
+    class SmoothBase(torch.nn.Module):
+        def forward(self, coords):
+            x = coords[:, 0:1]
+            y = coords[:, 1:2]
+            raw_psi = torch.sin(torch.pi * x) * torch.sin(torch.pi * y)
+            raw_p = x + y
+            return torch.cat([raw_psi, raw_p], dim=1)
+
+    model = HardBoundaryStreamfunctionPressureWrapper(
+        SmoothBase(),
+        (0.0, 1.0, 0.0, 1.0),
+        lid_velocity=1.0,
+        corner_width=0.05,
+    )
+    interior = torch.tensor(
+        [[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    velocity = model(interior)[:, :2]
+    du_dx = torch.autograd.grad(
+        velocity[:, 0].sum(),
+        interior,
+        create_graph=True,
+    )[0][:, 0]
+    dv_dy = torch.autograd.grad(
+        velocity[:, 1].sum(),
+        interior,
+        create_graph=True,
+    )[0][:, 1]
+    assert torch.max(torch.abs(du_dx + dv_dy)).item() < 1e-8
+
+    walls = torch.tensor(
+        [
+            [0.0, 0.4],
+            [1.0, 0.4],
+            [0.5, 0.0],
+            [0.5, 1.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+    wall_velocity = model(walls)[:, :2]
+    assert torch.max(torch.abs(wall_velocity[:3])).item() < 1e-8
+    assert wall_velocity[3, 0].item() == pytest.approx(1.0, abs=1e-8)
+    assert wall_velocity[3, 1].item() == pytest.approx(0.0, abs=1e-8)
+    assert torch.max(torch.abs(wall_velocity[4:])).item() < 1e-8
+
+    with torch.no_grad():
+        prediction = model(interior.detach())
+    assert prediction.shape == (3, 3)
+    assert torch.isfinite(prediction).all()
+
+    residuals = navier_stokes_residuals(model, interior.detach(), nu=0.01, steady=True)
+    assert torch.max(torch.abs(residuals["f_c"])).item() < 1e-8
+    assert torch.isfinite(residuals["f_u"]).all()
+    assert torch.isfinite(residuals["f_v"]).all()
 
 
 def test_regularized_cavity_target_matches_hard_boundary_corners():

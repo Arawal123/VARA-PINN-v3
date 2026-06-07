@@ -125,8 +125,8 @@ The strict Re=100 gate is executable:
 
 ```bash
 python scripts/check_lid_cavity_re100_sanity.py \
-  --method both \
-  --seed 0 \
+  --method vanilla \
+  --seeds 0 1 2 \
   --device cuda \
   --output_dir experiments/vara_v2/re100_sanity_gate \
   --overwrite
@@ -134,17 +134,20 @@ python scripts/check_lid_cavity_re100_sanity.py \
 
 This gate intentionally evaluates Vanilla first. If Vanilla does not satisfy
 raw reference-free physics, topology, streamfunction, speed, vortex, boundary,
-and checkpoint-restoration checks, VARA is not evaluated. If VARA passes the
-same physical gates but fails to beat Vanilla, the report states
-`VARA not dominant`; the failure is not hidden. CFD/Ghia/full-field metrics are
-evaluation-only and are checked only when a reference is explicitly provided.
-Normalized training losses, when enabled in an appendix experiment, are logged
-separately and are never used for validity decisions.
+and checkpoint-restoration checks for every requested seed, VARA is not
+evaluated. After Vanilla passes seeds `0,1,2`, `--method both` may be used. If
+VARA passes the same physical gates but fails to beat Vanilla, the report
+states `VARA not dominant`; the failure is not hidden. CFD/Ghia/full-field
+metrics are evaluation-only and are checked only when a reference is explicitly
+provided. Normalized training losses, when enabled in an appendix experiment,
+are logged separately and are never used for validity decisions.
 
-The reliable protocol uses a shared 64x3 tanh MLP by default because it is
-the stable low-Re continuation seed. Apply `--enhanced_backbone` only as a
-shared architecture experiment across every compared method, not as a hidden
-VARA-only advantage.
+The reliable protocol uses a hard-boundary streamfunction-pressure ansatz by
+default because the older direct velocity hard-boundary wrapper can enforce
+wall velocity while still allowing large interior divergence. The legacy
+velocity hard-boundary and plain streamfunction-pressure formulations are kept
+as ablations only. Apply `--enhanced_backbone` only as a shared architecture
+experiment across every compared method, not as a hidden VARA-only advantage.
 
 Shared physics-module study:
 

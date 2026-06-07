@@ -34,6 +34,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=["vanilla", "vara_v2", "both"], default="vanilla")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional multi-seed gate. If omitted, --seed is used.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--config", default="configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     parser.add_argument("--output_dir", default="experiments/vara_v2/re100_sanity_gate")
@@ -46,12 +53,13 @@ def main() -> None:
         help="Optional CSV/JSON map. Full-field gates are applied only when a Re=100 reference is supplied.",
     )
     args = parser.parse_args()
+    seeds = _requested_seeds(args)
 
     output_dir = Path(args.results_dir or args.output_dir)
     if args.results_dir is None:
-        _run_required_methods(args, output_dir)
+        _run_required_methods(args, output_dir, seeds)
 
-    report = build_report(output_dir, args.method, args.seed)
+    report = build_combined_report(output_dir, args.method, seeds)
     report_path = Path(args.report_path) if args.report_path else output_dir / "summary" / "re100_sanity_report.json"
     save_json(report, report_path)
     print(f"Saved sanity report: {report_path}")
@@ -63,14 +71,20 @@ def main() -> None:
     print("PASS: Re=100 sanity gates satisfied.")
 
 
-def _run_required_methods(args: argparse.Namespace, output_dir: Path) -> None:
+def _requested_seeds(args: argparse.Namespace) -> list[int]:
+    if args.seeds:
+        return [int(seed) for seed in args.seeds]
+    return [int(args.seed)]
+
+
+def _run_required_methods(args: argparse.Namespace, output_dir: Path, seeds: list[int]) -> None:
     """Run Vanilla first; VARA is evaluated only if Vanilla passes."""
     if args.method == "vanilla":
-        _run_methods(args, output_dir, ["vanilla"], overwrite=True)
+        _run_methods(args, output_dir, ["vanilla"], seeds=seeds, overwrite=True)
         return
     vanilla_dir = output_dir / "_vanilla_gate"
-    _run_methods(args, vanilla_dir, ["vanilla"], overwrite=True)
-    vanilla_report = build_report(vanilla_dir, "vanilla", args.seed)
+    _run_methods(args, vanilla_dir, ["vanilla"], seeds=seeds, overwrite=True)
+    vanilla_report = build_combined_report(vanilla_dir, "vanilla", seeds)
     if not vanilla_report["passed"]:
         save_json(
             vanilla_report,
@@ -79,7 +93,7 @@ def _run_required_methods(args: argparse.Namespace, output_dir: Path) -> None:
         raise SystemExit(
             "Vanilla Re=100 failed sanity gates; VARA was not evaluated."
         )
-    _run_methods(args, output_dir, ["vanilla", "vara_v2"], overwrite=True)
+    _run_methods(args, output_dir, ["vanilla", "vara_v2"], seeds=seeds, overwrite=True)
 
 
 def _run_methods(
@@ -87,13 +101,14 @@ def _run_methods(
     output_dir: Path,
     methods: list[str],
     *,
+    seeds: list[int],
     overwrite: bool,
 ) -> None:
     run_args = argparse.Namespace(
         config=args.config,
         methods=methods,
         reynolds=[100.0],
-        seeds=[int(args.seed)],
+        seeds=seeds,
         full_field_reference_map=args.full_field_reference_map,
         device=args.device,
         output_dir=str(output_dir),
@@ -104,6 +119,26 @@ def _run_methods(
         overwrite=overwrite or bool(args.overwrite),
     )
     run_v2_continuation(run_args)
+
+
+def build_combined_report(results_dir: Path, method: str, seeds: list[int]) -> dict[str, Any]:
+    if len(seeds) == 1:
+        return build_report(results_dir, method, int(seeds[0]))
+    seed_reports = [build_report(results_dir, method, int(seed)) for seed in seeds]
+    failures = [
+        f"seed {seed}: {failure}"
+        for seed, report in zip(seeds, seed_reports)
+        for failure in report["failures"]
+    ]
+    return {
+        "results_dir": str(results_dir),
+        "seeds": [int(seed) for seed in seeds],
+        "reynolds": 100.0,
+        "method_requested": method,
+        "seed_reports": seed_reports,
+        "failures": failures,
+        "passed": not failures,
+    }
 
 
 def build_report(results_dir: Path, method: str, seed: int) -> dict[str, Any]:
@@ -177,6 +212,12 @@ def _method_report(
     _check_min(metrics, "speed_pred_mean", float(thresholds.get("min_speed_pred_mean", 0.05)), failures)
     _check_min(metrics, "primary_streamfunction_abs", float(thresholds.get("min_primary_streamfunction_abs", 0.015)), failures)
     _check_min(metrics, "detected_vortex_count", int(thresholds.get("min_detected_vortices", 1)), failures)
+    _check_max_value(
+        metrics,
+        "detected_vortex_count",
+        int(thresholds.get("max_detected_vortices", 10**9)),
+        failures,
+    )
     _check_exact(metrics, "lid_cavity_topology_aligned", 1.0, failures)
     _check_max(metrics, "lid_cavity_primary_center_error", thresholds, failures)
     if "velocity_full_rel_l2" in metrics and np.isfinite(metrics["velocity_full_rel_l2"]):
@@ -204,6 +245,19 @@ def _check_min(metrics: dict[str, float], metric: str, minimum: float, failures:
         failures.append(f"{metric}=nonfinite")
     elif value < minimum:
         failures.append(f"{metric}={value:.6g}<{minimum:.6g}")
+
+
+def _check_max_value(
+    metrics: dict[str, float],
+    metric: str,
+    maximum: float,
+    failures: list[str],
+) -> None:
+    value = metrics.get(metric, float("nan"))
+    if not np.isfinite(value):
+        failures.append(f"{metric}=nonfinite")
+    elif value > maximum:
+        failures.append(f"{metric}={value:.6g}>{maximum:.6g}")
 
 
 def _check_exact(metrics: dict[str, float], metric: str, expected: float, failures: list[str]) -> None:

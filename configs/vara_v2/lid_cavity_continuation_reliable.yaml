@@ -8,19 +8,39 @@ model:
   # The smooth low-Re starting problem converges more reliably with the
   # standard tanh MLP. The Fourier backbone remains an opt-in shared study.
   architecture: mlp
-  output_dim: 3
+  output_dim: 2
   hidden_layers: [64, 64, 64]
-  # Reliable cavity uses direct velocity-pressure outputs with an exact
-  # regularized cavity wall transform. Plain streamfunction-pressure enforces
-  # divergence but not the no-slip/moving-lid walls, and is kept for appendix
-  # experiments rather than the primary reliable protocol.
-  physics_formulation: cavity_hard_boundary
+  # Reliable cavity uses a hard-boundary streamfunction-pressure ansatz:
+  # psi_total = psi_lift + envelope_psi * raw_psi, u=psi_y, v=-psi_x.
+  # This keeps continuity near autograd tolerance while preserving the
+  # regularized lid and stationary walls. The older velocity hard-boundary and
+  # plain streamfunction formulations remain available only as ablations.
+  physics_formulation: hard_boundary_streamfunction_pressure
   hard_boundary_corner_width: 0.02
-  hard_boundary_lid_lifting: harmonic
+  hard_boundary_lid_vertical_power: 6
+
+optimizer:
+  scheduler:
+    enabled: true
+    total_steps: 12000
+    warmup_steps: 500
+    warmup_start_ratio: 0.2
+    min_lr_ratio: 0.05
+  final_repair:
+    # Optional guarded LBFGS repair. It is off by default; when enabled, it is
+    # accepted only if the raw reference-free physics validation score improves.
+    enabled: false
+    score_metric: unweighted_physics_validation_loss
+    epochs: 20
+    lr: 0.2
+    max_iter: 5
+    max_eval: 10
+    batch_multiplier: 2.0
+    residual_fraction: 0.25
 
 training:
   pointwise_reduction: mean
-  adaptive_cycles: 20
+  adaptive_cycles: 60
   epochs_per_cycle: 200
   n_collocation: 2048
   n_boundary: 512
@@ -48,12 +68,12 @@ loss_normalization:
   warmup_steps: 0
 
 controller_v2:
-  total_steps: 4000
+  total_steps: 12000
   # Align every neutral controller boundary with Vanilla's 200-step
   # collocation refresh. When no action is accepted, both trajectories are
   # therefore exactly identical.
-  warmup_steps: 800
-  control_blocks: 16
+  warmup_steps: 2000
+  control_blocks: 50
   block_steps: 200
   probe_steps: 10
   gradient_probe_interior: 256
@@ -108,9 +128,9 @@ checkpoint:
 convergence_early_stopping:
   enabled: true
   # These are minimums, not fixed budgets. A stage automatically continues to
-  # the full 2000-step ceiling whenever validity or stability is not achieved.
-  min_steps_initial: 1200
-  min_steps_warm_start: 600
+  # the full 12000-step ceiling whenever validity or stability is not achieved.
+  min_steps_initial: 8000
+  min_steps_warm_start: 4000
   patience: 3
   relative_tolerance: 0.03
   latest_degradation_tolerance: 0.01
@@ -152,6 +172,7 @@ continuation_validity:
   require_lid_cavity_topology_alignment: true
   min_primary_streamfunction_abs: 0.015
   min_detected_vortices: 1
+  max_detected_vortices: 4
   min_primary_vortex_wall_distance: 0.05
   max_final_checkpoint_physics_degradation: 0.05
   max_vara_vs_vanilla_physics_degradation: 0.02

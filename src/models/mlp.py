@@ -73,7 +73,11 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
     architecture = str(model_cfg.get("architecture", "mlp")).lower()
     formulation = str(model_cfg.get("physics_formulation", "direct")).lower()
     requested_out_dim = int(model_cfg.get("output_dim", 3))
-    internal_out_dim = 2 if formulation == "streamfunction_pressure" else requested_out_dim
+    streamfunction_formulations = {
+        "streamfunction_pressure",
+        "hard_boundary_streamfunction_pressure",
+    }
+    internal_out_dim = 2 if formulation in streamfunction_formulations else requested_out_dim
     if architecture == "residual_fourier_mlp":
         from .residual_fourier_mlp import ResidualFourierMLP, parameter_matched_width
 
@@ -117,7 +121,7 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
         from .physics_wrappers import StreamfunctionPressureWrapper
 
         return StreamfunctionPressureWrapper(model)
-    if formulation == "cavity_hard_boundary":
+    if formulation in {"cavity_hard_boundary", "hard_boundary_streamfunction_pressure"}:
         cavity_names = {
             "lid_driven_cavity",
             "lid-driven-cavity",
@@ -126,10 +130,25 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
             "cavity",
         }
         if str(config.get("benchmark", "")).lower() not in cavity_names:
-            raise ValueError("cavity_hard_boundary is only valid for the lid-driven cavity benchmark.")
-        from .physics_wrappers import CavityHardBoundaryWrapper
+            raise ValueError(
+                f"{formulation} is only valid for the lid-driven cavity benchmark."
+            )
+        from .physics_wrappers import (
+            CavityHardBoundaryWrapper,
+            HardBoundaryStreamfunctionPressureWrapper,
+        )
 
         benchmark_cfg = config.get("benchmark_params", {})
+        if formulation == "hard_boundary_streamfunction_pressure":
+            return HardBoundaryStreamfunctionPressureWrapper(
+                model,
+                bounds,
+                lid_velocity=float(benchmark_cfg.get("lid_velocity", 1.0)),
+                corner_width=float(model_cfg.get("hard_boundary_corner_width", 0.02)),
+                lid_vertical_power=int(
+                    model_cfg.get("hard_boundary_lid_vertical_power", 6)
+                ),
+            )
         return CavityHardBoundaryWrapper(
             model,
             bounds,

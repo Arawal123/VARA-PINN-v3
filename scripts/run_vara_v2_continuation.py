@@ -400,6 +400,9 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
     vortex_count = int(metrics.get("detected_vortex_count", 0))
     if vortex_count < minimum_vortices:
         reasons.append(f"detected_vortex_count={vortex_count}<{minimum_vortices}")
+    maximum_vortices = int(cfg.get("max_detected_vortices", 10**9))
+    if vortex_count > maximum_vortices:
+        reasons.append(f"detected_vortex_count={vortex_count}>{maximum_vortices}")
     minimum_wall_distance = float(cfg.get("min_primary_vortex_wall_distance", 0.0))
     x = float(metrics.get("primary_vortex_center_x", np.nan))
     y = float(metrics.get("primary_vortex_center_y", np.nan))
