@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 import torch
 
+from scripts.run_vara_v2_continuation import _load_base_config
 from src.controllers import V2ControllerConfig, VARAV2Controller
 from src.evaluation.metrics import evaluate_on_grid
 from src.evaluation.statistical_tests import (
@@ -225,6 +226,28 @@ def test_cavity_hard_boundary_wrapper_enforces_regularized_walls():
     assert velocity[3, 0].item() == pytest.approx(1.0)
     assert velocity[3, 1].item() == pytest.approx(0.0)
     assert torch.allclose(velocity[4:], torch.zeros_like(velocity[4:]), atol=1e-12)
+
+
+def test_continuation_overlay_inherits_lid_cavity_base_config():
+    config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    assert config["benchmark"] == "lid_driven_cavity"
+    assert config["model"]["physics_formulation"] == "cavity_hard_boundary"
+
+
+def test_cavity_hard_boundary_accepts_lid_cavity_alias():
+    config = {
+        "benchmark": "lid_cavity",
+        "model": {
+            "physics_formulation": "cavity_hard_boundary",
+            "input_dim": 2,
+            "output_dim": 3,
+            "hidden_layers": [8, 8],
+        },
+    }
+    assert isinstance(
+        build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0)),
+        CavityHardBoundaryWrapper,
+    )
 
 
 def test_harmonic_cavity_lifting_reduces_couette_interior_bias():

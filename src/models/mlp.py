@@ -118,7 +118,14 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
 
         return StreamfunctionPressureWrapper(model)
     if formulation == "cavity_hard_boundary":
-        if str(config.get("benchmark", "")).lower() not in {"lid_driven_cavity", "cavity"}:
+        cavity_names = {
+            "lid_driven_cavity",
+            "lid-driven-cavity",
+            "lid_cavity",
+            "lid-cavity",
+            "cavity",
+        }
+        if str(config.get("benchmark", "")).lower() not in cavity_names:
             raise ValueError("cavity_hard_boundary is only valid for the lid-driven cavity benchmark.")
         from .physics_wrappers import CavityHardBoundaryWrapper
 

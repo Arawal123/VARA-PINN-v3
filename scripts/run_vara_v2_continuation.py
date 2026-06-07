@@ -72,7 +72,7 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
-    base = load_config(args.config)
+    base = _load_base_config(args.config)
     base = deep_update(base, load_config("configs/vara_v2/controller.yaml"))
     base = deep_update(base, load_config("configs/vara_v2/continuation.yaml"))
     if args.reliable:
@@ -253,6 +253,21 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     _save_validity_aware_montages(output, raw, summary)
     save_config(base, summary / "resolved_base_config.yaml")
     return {"raw": raw, "comparisons": comparisons}
+
+
+def _load_base_config(config_path: str | Path) -> dict[str, Any]:
+    """Load continuation config, accepting overlay-only YAML files.
+
+    The reliable cavity protocol is intentionally an overlay so it cannot
+    disturb the base lid-cavity config. In notebooks it is easy to pass that
+    overlay through --config, so merge benchmark-free configs onto the default
+    lid-driven-cavity base instead of failing later during model construction.
+    """
+    config = load_config(config_path)
+    if "benchmark" in config:
+        return config
+    default_base = load_config("configs/vara_v2/lid_driven_cavity.yaml")
+    return deep_update(default_base, config)
 
 
 def _save_validity_aware_montages(
