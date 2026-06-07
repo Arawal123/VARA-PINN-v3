@@ -21,11 +21,13 @@ class DiagnosticMapBuilder:
         benchmark: Any,
         device: torch.device,
         steady: bool = True,
+        residual_interior_only: bool = False,
     ) -> None:
         self.model = model
         self.benchmark = benchmark
         self.device = device
         self.steady = steady
+        self.residual_interior_only = bool(residual_interior_only)
 
     def build(
         self,
@@ -60,6 +62,17 @@ class DiagnosticMapBuilder:
             "momentum_v_residual": np.abs(residuals["f_v"].detach().cpu().numpy()),
             "pde_residual": residuals["pde_residual"].detach().cpu().numpy(),
         }
+        if self.residual_interior_only and hasattr(self.benchmark, "boundary_mask_np"):
+            boundary_mask = np.asarray(self.benchmark.boundary_mask_np(coords_np), dtype=bool)
+            for name in (
+                "continuity_residual",
+                "momentum_u_residual",
+                "momentum_v_residual",
+                "pde_residual",
+            ):
+                values = maps[name].copy()
+                values[boundary_mask] = np.nan
+                maps[name] = values
 
         if not self.steady:
             vt = vorticity_transport_residual(self.model, coords, nu=self.benchmark.nu, steady=False)

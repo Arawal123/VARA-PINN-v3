@@ -32,6 +32,7 @@ optimizer:
     enabled: false
 
 training:
+  pointwise_reduction: mean
   adaptive_cycles: 1
   epochs_per_cycle: 400
   log_every: 25
@@ -39,7 +40,7 @@ training:
   n_boundary: 768
   n_data: 0
   weights:
-    pde: 1.0
+    pde: 0.0
     momentum_u: 1.0
     momentum_v: 1.0
     continuity: 1.0
@@ -60,6 +61,10 @@ validation:
 test:
   nx: 64
   ny: 64
+
+evaluation:
+  controller_reference_metrics_enabled: false
+  checkpoint_reference_metrics_enabled: false
 
 diagnostics:
   mode: residual_only
@@ -107,6 +112,8 @@ controller_v2:
   trust_shrink: 0.5
   effectiveness_ema: 0.8
   noise_floor: 0.0001
+  target_noise_ceiling: 0.25
+  guard_noise_ceiling: 0.10
   reliable_reward_ratio: 0.75
   gradient_prefilter_enabled: true
   trust_region_enabled: true

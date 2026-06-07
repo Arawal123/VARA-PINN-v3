@@ -30,18 +30,18 @@ def normalize_values(values: np.ndarray, method: str = "percentile", eps: float 
 def robust_aggregate(values: np.ndarray, mode: str = "mean", percentile: float = 90.0) -> float:
     """Aggregate point values into one patch severity."""
     values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
     if values.size == 0:
         return 0.0
     mode = mode.lower()
     if mode == "mean":
-        return float(np.nanmean(values))
+        return float(np.mean(values))
     if mode == "max":
-        return float(np.nanmax(values))
+        return float(np.max(values))
     if mode == "percentile":
-        return float(np.nanpercentile(values, percentile))
+        return float(np.percentile(values, percentile))
     if mode == "robust_mean":
-        hi = np.nanpercentile(values, 90)
+        hi = np.percentile(values, 90)
         clipped = np.clip(values, None, hi)
-        return float(np.nanmean(clipped))
+        return float(np.mean(clipped))
     raise ValueError(f"Unknown aggregation mode: {mode}")
-

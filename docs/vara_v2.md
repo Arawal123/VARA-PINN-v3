@@ -96,6 +96,36 @@ python scripts/run_vara_v2_continuation.py \
   --output_dir experiments/vara_v2/re_continuation
 ```
 
+For physically credible cavity streamline studies, use the corrected,
+hard-boundary, longer-stage protocol:
+
+```bash
+python scripts/run_vara_v2_continuation.py \
+  --reliable \
+  --methods vanilla vara_v2 \
+  --reynolds 100 150 200 300 400 600 800 1000 \
+  --seeds 0 1 2 3 4 \
+  --device cuda \
+  --output_dir experiments/vara_v2/re_continuation_reliable \
+  --overwrite
+```
+
+The reliable runner stops a method chain when reference-free PDE,
+continuity, boundary, speed, or streamfunction-consistency gates fail. It
+also saves reconstructed streamfunction contours and vortex-center metrics.
+Its residual metrics and controller maps use interior grid points only;
+separate boundary metrics cover the walls and the regularized singular lid
+corners. Valid stages alone enter the main improvement tables, summary bar
+plots, and method montages. Failed stages remain available in
+`vara_v2_vs_vanilla_by_re_all_stages.csv` and
+`streamline_montage_invalid_stages.png` for diagnosis. Do not use a failed
+stage as physical evidence.
+
+The reliable protocol uses a shared 64x3 tanh MLP by default because it is
+the stable low-Re continuation seed. Apply `--enhanced_backbone` only as a
+shared architecture experiment across every compared method, not as a hidden
+VARA-only advantage.
+
 Shared physics-module study:
 
 ```bash

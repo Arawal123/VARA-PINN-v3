@@ -10,6 +10,7 @@ import torch
 
 from src.physics.kovasznay import center_pressure
 from src.physics.navier_stokes import navier_stokes_residuals
+from src.visualization.streamlines import reconstruct_streamfunction
 
 
 def relative_l2(pred: np.ndarray, true: np.ndarray, min_reference_norm: float = 1e-8) -> float:
@@ -18,6 +19,23 @@ def relative_l2(pred: np.ndarray, true: np.ndarray, min_reference_norm: float = 
     if ref_norm < min_reference_norm:
         return float("nan")
     return float(np.linalg.norm(pred - true) / ref_norm)
+
+
+def vector_relative_l2(
+    pred_components: tuple[np.ndarray, ...],
+    true_components: tuple[np.ndarray, ...],
+    min_reference_norm: float = 1e-8,
+) -> float:
+    """Relative L2 of a vector field, preserving directional error."""
+    pred = np.concatenate(
+        [np.asarray(component).reshape(-1, 1) for component in pred_components],
+        axis=1,
+    )
+    true = np.concatenate(
+        [np.asarray(component).reshape(-1, 1) for component in true_components],
+        axis=1,
+    )
+    return relative_l2(pred, true, min_reference_norm=min_reference_norm)
 
 
 def rmse(pred: np.ndarray, true: np.ndarray) -> float:
@@ -39,6 +57,7 @@ def evaluate_on_grid(
     coords_np: np.ndarray,
     device: torch.device,
     steady: bool = True,
+    residual_interior_only: bool = False,
 ) -> dict[str, float]:
     """Compute global evaluation metrics without using them for adaptation."""
     start = time.time()
@@ -57,12 +76,21 @@ def evaluate_on_grid(
     p_c = center_pressure(p)
     speed = np.sqrt(u * u + v * v)
     pde = residuals["pde_residual"].detach().cpu().numpy()
-    pde_loss = (
+    pde_loss_all = (
         residuals["f_u"].detach().cpu().numpy() ** 2
         + residuals["f_v"].detach().cpu().numpy() ** 2
         + residuals["f_c"].detach().cpu().numpy() ** 2
     )
-    div = np.abs(residuals["f_c"].detach().cpu().numpy())
+    continuity_all = np.abs(residuals["f_c"].detach().cpu().numpy())
+    momentum_all = np.sqrt(
+        residuals["f_u"].detach().cpu().numpy() ** 2
+        + residuals["f_v"].detach().cpu().numpy() ** 2
+    )
+    residual_mask = _residual_mask(benchmark, coords_np, residual_interior_only)
+    pde_eval = _masked_values(pde, residual_mask)
+    pde_loss = _masked_values(pde_loss_all, residual_mask)
+    div = _masked_values(continuity_all, residual_mask)
+    momentum = _masked_values(momentum_all, residual_mask)
     boundary_metrics = _boundary_metrics(model, benchmark, coords_np, device)
     unweighted_bc_loss = boundary_metrics["unweighted_bc_loss"]
     metrics = {
@@ -102,18 +130,13 @@ def evaluate_on_grid(
         "omega_pred_abs_mean": float(np.mean(np.abs(omega))),
         "omega_pred_abs_max": float(np.max(np.abs(omega))),
         "pressure_gradient_error": float("nan"),
-        "divergence_norm": float(np.mean(div)),
-        "continuity_residual_mean": float(np.mean(np.abs(residuals["f_c"].detach().cpu().numpy()))),
-        "momentum_residual_mean": float(
-            np.mean(
-                np.sqrt(
-                    residuals["f_u"].detach().cpu().numpy() ** 2
-                    + residuals["f_v"].detach().cpu().numpy() ** 2
-                )
-            )
-        ),
-        "pde_residual_mean": float(np.mean(pde)),
-        "pde_residual_max": float(np.max(pde)),
+        "divergence_norm": _finite_mean(div),
+        "continuity_residual_mean": _finite_mean(div),
+        "momentum_residual_mean": _finite_mean(momentum),
+        "pde_residual_mean": _finite_mean(pde_eval),
+        "pde_residual_max": _finite_max(pde_eval),
+        "residual_interior_only": bool(residual_interior_only),
+        "num_residual_eval_points": int(np.count_nonzero(residual_mask)),
         "boundary_condition_error": _boundary_error(model, benchmark, coords_np, device),
         "u_boundary_rmse": boundary_metrics["u_boundary_rmse"],
         "v_boundary_rmse": boundary_metrics["v_boundary_rmse"],
@@ -130,12 +153,13 @@ def evaluate_on_grid(
         "cavity_benchmark_score": float("nan"),
         "cavity_profile_reference_source": "",
         "unweighted_data_loss": float("nan"),
-        "unweighted_pde_loss": float(np.mean(pde_loss)),
+        "unweighted_pde_loss": _finite_mean(pde_loss),
         "unweighted_bc_loss": unweighted_bc_loss,
         "unweighted_validation_loss": float("nan"),
         "wall_clock_eval_sec": time.time() - start,
         "num_eval_points": int(coords_np.shape[0]),
     }
+    metrics.update(_streamfunction_metrics(coords_np, u, v))
     if has_reference and ref is not None:
         has_p_ref = bool(ref.get("has_p_reference", np.isfinite(ref.get("p", np.array([]))).any()))
         has_omega_ref = bool(ref.get("has_omega_reference", np.isfinite(ref.get("omega", np.array([]))).any()))
@@ -163,7 +187,10 @@ def evaluate_on_grid(
                 "omega_rel_l2": relative_l2(omega, ref["omega"]) if has_omega_ref else float("nan"),
                 "u_full_rel_l2": relative_l2(u, ref["u"]),
                 "v_full_rel_l2": relative_l2(v, ref["v"]),
-                "velocity_full_rel_l2": relative_l2(speed, speed_ref),
+                "velocity_full_rel_l2": vector_relative_l2(
+                    (u, v),
+                    (ref["u"], ref["v"]),
+                ),
                 "p_full_rel_l2_centered": relative_l2(p_c, p_ref_c) if has_p_ref else float("nan"),
                 "omega_full_rel_l2": relative_l2(omega, ref["omega"]) if has_omega_ref else float("nan"),
                 "u_rmse": rmse(u, ref["u"]),
@@ -196,8 +223,8 @@ def evaluate_on_grid(
                 benchmark=benchmark,
                 coords_np=coords_np,
                 device=device,
-                pde=pde,
-                continuity=np.abs(residuals["f_c"].detach().cpu().numpy()),
+                pde=_masked_values(pde, residual_mask),
+                continuity=_masked_values(continuity_all, residual_mask),
             )
         )
     metrics["unweighted_validation_loss"] = _finite_sum(
@@ -218,6 +245,72 @@ def evaluate_on_grid(
             ]
         )
     return metrics
+
+
+def _residual_mask(
+    benchmark: Any,
+    coords_np: np.ndarray,
+    interior_only: bool,
+) -> np.ndarray:
+    mask = np.ones(coords_np.shape[0], dtype=bool)
+    if interior_only and hasattr(benchmark, "boundary_mask_np"):
+        mask &= ~np.asarray(benchmark.boundary_mask_np(coords_np), dtype=bool)
+    if not np.any(mask):
+        raise ValueError("Residual evaluation mask contains no points.")
+    return mask
+
+
+def _masked_values(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=float).reshape(-1, 1).copy()
+    out[~np.asarray(mask, dtype=bool).reshape(-1), :] = np.nan
+    return out
+
+
+def _finite_mean(values: np.ndarray) -> float:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    return float(np.mean(finite)) if finite.size else float("nan")
+
+
+def _finite_max(values: np.ndarray) -> float:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    return float(np.max(finite)) if finite.size else float("nan")
+
+
+def _streamfunction_metrics(
+    coords_np: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+) -> dict[str, float]:
+    x_values = np.unique(coords_np[:, 0])
+    y_values = np.unique(coords_np[:, 1])
+    if len(x_values) * len(y_values) != len(coords_np):
+        return {
+            "streamfunction_consistency_rmse": float("nan"),
+            "primary_vortex_center_x": float("nan"),
+            "primary_vortex_center_y": float("nan"),
+            "primary_streamfunction_abs": float("nan"),
+        }
+    shape = (len(y_values), len(x_values))
+    X, Y = np.meshgrid(x_values, y_values)
+    psi, consistency = reconstruct_streamfunction(
+        X,
+        Y,
+        np.asarray(u).reshape(shape),
+        np.asarray(v).reshape(shape),
+    )
+    interior = np.abs(psi).copy()
+    if min(shape) > 2:
+        interior[[0, -1], :] = -np.inf
+        interior[:, [0, -1]] = -np.inf
+    index = np.unravel_index(int(np.argmax(interior)), shape)
+    return {
+        "streamfunction_consistency_rmse": float(consistency),
+        "primary_vortex_center_x": float(X[index]),
+        "primary_vortex_center_y": float(Y[index]),
+        "primary_streamfunction_abs": float(abs(psi[index])),
+    }
 
 
 def _cavity_residual_geometry_metrics(
@@ -257,18 +350,25 @@ def _cavity_residual_geometry_metrics(
 def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
     values = np.asarray(values, dtype=float).reshape(-1, 1)
     weights = np.asarray(weights, dtype=float).reshape(-1, 1)
-    denom = float(np.sum(weights))
+    finite = np.isfinite(values) & np.isfinite(weights)
+    if not np.any(finite):
+        return float("nan")
+    weighted = np.where(finite, values * weights, 0.0)
+    effective_weights = np.where(finite, weights, 0.0)
+    denom = float(np.sum(effective_weights))
     if denom <= 1e-12:
         return float("nan")
-    return float(np.sum(values * weights) / denom)
+    return float(np.sum(weighted) / denom)
 
 
 def _masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
     flat_mask = np.asarray(mask).reshape(-1).astype(bool)
-    if not np.any(flat_mask):
-        return float("nan")
     flat_values = np.asarray(values, dtype=float).reshape(-1)
-    return float(np.mean(flat_values[flat_mask]))
+    selected = flat_values[flat_mask]
+    selected = selected[np.isfinite(selected)]
+    if selected.size == 0:
+        return float("nan")
+    return float(np.mean(selected))
 
 
 def _corner_boundary_error(

@@ -19,11 +19,20 @@ controller_v2:
   trust_shrink: 0.5
   effectiveness_ema: 0.8
   noise_floor: 0.0001
+  target_noise_ceiling: 0.25
+  guard_noise_ceiling: 0.10
   reliable_reward_ratio: 0.75
   gradient_prefilter_enabled: true
   trust_region_enabled: true
   action_memory_enabled: true
   rollback_enabled: true
+
+training:
+  # Pointwise residual entries are already squared. Average them directly.
+  pointwise_reduction: mean
+  weights:
+    # Avoid counting f_u, f_v, and f_c both here and in their components.
+    pde: 0.0
 
 pressure_gauge:
   weight: 0.001
@@ -31,3 +40,10 @@ pressure_gauge:
 optimizer:
   final_repair:
     enabled: false
+
+evaluation:
+  # Full-field CFD, analytical test fields, and Ghia profiles are reporting
+  # signals only. This also prevents legacy V1 acceptance logic from seeing
+  # references when it is compared inside a V2 publication study.
+  controller_reference_metrics_enabled: false
+  checkpoint_reference_metrics_enabled: false

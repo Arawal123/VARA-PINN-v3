@@ -9,7 +9,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.evaluation.metrics import evaluate_on_grid
+from src.evaluation.metrics import evaluate_on_grid, vector_relative_l2
 from src.physics.cavity_reference import load_full_field_reference, load_lid_cavity_profile_reference, validate_full_field_against_ghia
 from src.physics.rectangular_benchmarks import LidDrivenCavityQualitative
 
@@ -122,3 +122,14 @@ def test_full_field_reference_can_be_validated_against_ghia(tmp_path):
     assert metrics["reynolds"] == 100.0
     assert np.isfinite(metrics["cfd_vs_ghia_u_centerline_rmse"])
     assert np.isfinite(metrics["cfd_vs_ghia_v_centerline_rmse"])
+
+
+def test_vector_velocity_error_does_not_collapse_to_speed_magnitude_error():
+    u_ref = np.array([[1.0], [0.0]])
+    v_ref = np.array([[0.0], [1.0]])
+    u_pred = -u_ref
+    v_pred = -v_ref
+    assert vector_relative_l2((u_pred, v_pred), (u_ref, v_ref)) == pytest.approx(2.0)
+    speed_ref = np.sqrt(u_ref * u_ref + v_ref * v_ref)
+    speed_pred = np.sqrt(u_pred * u_pred + v_pred * v_pred)
+    assert np.linalg.norm(speed_pred - speed_ref) == pytest.approx(0.0)

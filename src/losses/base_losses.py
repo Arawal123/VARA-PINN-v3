@@ -17,6 +17,40 @@ def mse(x: torch.Tensor) -> torch.Tensor:
     return torch.mean(x * x)
 
 
+def reduce_pointwise_loss(values: torch.Tensor, reduction: str = "legacy_mse") -> torch.Tensor:
+    """Reduce pointwise loss values.
+
+    Pointwise entries produced by ``compute_pointwise_losses`` are already
+    squared errors. ``mean`` therefore gives the conventional mean-squared
+    objective. ``legacy_mse`` preserves the historical fourth-power behavior
+    for exact reproduction of earlier experiments.
+    """
+    if values.numel() == 0:
+        return values.new_tensor(0.0)
+    mode = str(reduction).lower()
+    if mode in {"mean", "mean_squared", "mse"}:
+        return torch.mean(values)
+    if mode in {"legacy_mse", "legacy_fourth_power"}:
+        return mse(values)
+    raise ValueError(f"Unsupported pointwise loss reduction: {reduction}")
+
+
+def reduce_weighted_pointwise_loss(
+    values: torch.Tensor,
+    weights: torch.Tensor,
+    reduction: str = "legacy_mse",
+) -> torch.Tensor:
+    """Apply point weights without changing the configured loss definition."""
+    if values.numel() == 0:
+        return values.new_tensor(0.0)
+    mode = str(reduction).lower()
+    if mode in {"mean", "mean_squared", "mse"}:
+        return torch.mean(weights * values)
+    if mode in {"legacy_mse", "legacy_fourth_power"}:
+        return torch.mean(weights * values * values)
+    raise ValueError(f"Unsupported pointwise loss reduction: {reduction}")
+
+
 def compute_pointwise_losses(
     model: torch.nn.Module,
     batch: dict[str, Any],
@@ -55,9 +89,15 @@ def compute_pointwise_losses(
     return pointwise
 
 
-def compute_global_losses(pointwise: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def compute_global_losses(
+    pointwise: dict[str, torch.Tensor],
+    reduction: str = "legacy_mse",
+) -> dict[str, torch.Tensor]:
     """Reduce pointwise losses."""
-    return {name: mse(values) for name, values in pointwise.items()}
+    return {
+        name: reduce_pointwise_loss(values, reduction=reduction)
+        for name, values in pointwise.items()
+    }
 
 
 def weighted_sum(losses: dict[str, torch.Tensor], weights: dict[str, float]) -> torch.Tensor:

@@ -15,8 +15,8 @@ def sample_from_score_grid(
     if n <= 0:
         return np.zeros((0, coords.shape[1]), dtype=float)
     flat_score = np.asarray(score, dtype=float).reshape(-1)
-    flat_score = np.maximum(flat_score, 0.0) + 1e-12
+    flat_score = np.where(np.isfinite(flat_score), np.maximum(flat_score, 0.0), 0.0)
+    flat_score = flat_score + 1e-12
     prob = flat_score / flat_score.sum()
     idx = rng.choice(coords.shape[0], size=n, replace=True, p=prob)
     return coords[idx]
-

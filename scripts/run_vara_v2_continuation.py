@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from pathlib import Path
+import shutil
 import sys
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +25,6 @@ from scripts.run_lid_cavity_re_continuation import (
     _save_image_grid,
     _montage_label,
     _save_summary_bar_plots,
-    _save_summary_montages,
     _wide_improvement,
 )
 from scripts.run_modern_baselines import METHODS as BASELINE_METHODS
@@ -50,7 +51,22 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--output_dir", default="experiments/vara_v2/re_continuation")
     parser.add_argument("--enhanced_backbone", action="store_true")
+    parser.add_argument(
+        "--reliable",
+        action="store_true",
+        help="Use the physically guarded, longer, hard-boundary continuation protocol.",
+    )
+    parser.add_argument(
+        "--continue_on_invalid",
+        action="store_true",
+        help="Continue a method chain after a stage fails reference-free validity checks.",
+    )
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete and recreate output_dir. Otherwise non-empty outputs are rejected.",
+    )
     args = parser.parse_args()
     run(args)
 
@@ -59,6 +75,8 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     base = load_config(args.config)
     base = deep_update(base, load_config("configs/vara_v2/controller.yaml"))
     base = deep_update(base, load_config("configs/vara_v2/continuation.yaml"))
+    if args.reliable:
+        base = deep_update(base, load_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml"))
     if args.enhanced_backbone:
         base = deep_update(base, load_config("configs/vara_v2/enhanced_backbone.yaml"))
     if args.quick:
@@ -93,16 +111,26 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         base["device"] = args.device
     reference_map = _load_full_field_reference_map(args.full_field_reference_map)
     output = Path(args.output_dir)
+    if output.exists() and any(output.iterdir()):
+        if not bool(getattr(args, "overwrite", False)):
+            raise SystemExit(
+                f"Output directory already exists and is not empty: {output}. "
+                "Use --overwrite or choose a new --output_dir."
+            )
+        shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     comparison_rows: list[dict[str, Any]] = []
 
     for seed in args.seeds:
         previous: dict[str, Path | None] = {method: None for method in args.methods}
+        failed_methods: set[str] = set()
         for reynolds in args.reynolds:
             per_method: dict[str, dict[str, Any]] = {}
             re_name = f"re_{int(round(reynolds)):04d}"
             for method in args.methods:
+                if method in failed_methods:
+                    continue
                 method_dir = output / f"seed_{seed}" / re_name / method
                 config = deepcopy(base)
                 config["seed"] = int(seed)
@@ -134,8 +162,13 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     }
                 trainer = _trainer_for(method, config)
                 metrics = trainer.run()
+                validity = _continuation_validity(metrics, config)
+                metrics.update(validity)
                 checkpoint = trainer.checkpoint_dir / "final.pt"
-                previous[method] = checkpoint
+                if validity["continuation_stage_valid"] or args.continue_on_invalid or not args.reliable:
+                    previous[method] = checkpoint
+                else:
+                    failed_methods.add(method)
                 row = {
                     **metrics,
                     "method": method,
@@ -149,11 +182,30 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                 rows.append(row)
                 per_method[method] = row
                 print(f"seed={seed} Re={reynolds:g} method={method}: {trainer.run_dir}")
+                if not validity["continuation_stage_valid"]:
+                    print(
+                        f"  INVALID continuation stage: {validity['continuation_invalid_reasons']}"
+                    )
 
             if "vanilla" in per_method and "vara_v2" in per_method:
-                comparison_rows.extend(
-                    _comparison_rows(seed, reynolds, per_method["vanilla"], per_method["vara_v2"])
+                pair_rows = _comparison_rows(
+                    seed,
+                    reynolds,
+                    per_method["vanilla"],
+                    per_method["vara_v2"],
                 )
+                vanilla_valid = bool(per_method["vanilla"]["continuation_stage_valid"])
+                vara_valid = bool(per_method["vara_v2"]["continuation_stage_valid"])
+                pair_valid = vanilla_valid and vara_valid
+                for pair_row in pair_rows:
+                    pair_row.update(
+                        {
+                            "vanilla_stage_valid": vanilla_valid,
+                            "vara_stage_valid": vara_valid,
+                            "comparison_stage_valid": pair_valid,
+                        }
+                    )
+                comparison_rows.extend(pair_rows)
                 # Reuse the established Vanilla/VARA comparison renderer.
                 comparison_dir = output / f"seed_{seed}" / re_name
                 _save_per_re_comparison(
@@ -161,28 +213,176 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     per_method["vanilla"],
                     per_method["vara_v2"],
                 )
+                save_json(
+                    {
+                        "comparison_stage_valid": pair_valid,
+                        "vanilla_stage_valid": vanilla_valid,
+                        "vara_stage_valid": vara_valid,
+                        "vanilla_invalid_reasons": per_method["vanilla"][
+                            "continuation_invalid_reasons"
+                        ],
+                        "vara_invalid_reasons": per_method["vara_v2"][
+                            "continuation_invalid_reasons"
+                        ],
+                    },
+                    comparison_dir / "comparison" / "continuation_validity.json",
+                )
 
     summary = output / "summary"
     summary.mkdir(parents=True, exist_ok=True)
     raw = pd.DataFrame(rows)
-    comparisons = pd.DataFrame(comparison_rows)
+    comparisons_all = pd.DataFrame(comparison_rows)
+    if "comparison_stage_valid" in comparisons_all:
+        comparisons = comparisons_all[
+            comparisons_all["comparison_stage_valid"].fillna(False).astype(bool)
+        ].copy()
+    else:
+        comparisons = comparisons_all.copy()
     raw.to_csv(summary / "continuation_results_long.csv", index=False)
+    comparisons_all.to_csv(
+        summary / "vara_v2_vs_vanilla_by_re_all_stages.csv",
+        index=False,
+    )
     comparisons.to_csv(summary / "vara_v2_vs_vanilla_by_re.csv", index=False)
     _wide_improvement(comparisons).to_csv(summary / "improvement_percent_by_re.csv", index=False)
     _save_summary_bar_plots(comparisons, summary)
-    _save_summary_montages(output, summary)
-    v2_items = [
-        (path, _montage_label(path, "vara_v2"))
-        for path in sorted(output.glob("seed_*/re_*/vara_v2/figures/streamlines.png"))
-    ]
-    _save_image_grid(
-        v2_items,
-        summary / "streamline_montage_vara_v2.png",
-        cols=4,
-        title="VARA V2 continuation streamlines",
-    )
+    _save_validity_aware_montages(output, raw, summary)
     save_config(base, summary / "resolved_base_config.yaml")
     return {"raw": raw, "comparisons": comparisons}
+
+
+def _save_validity_aware_montages(
+    output: Path,
+    raw: pd.DataFrame,
+    summary: Path,
+) -> None:
+    if raw.empty:
+        return
+    validity = raw.get(
+        "continuation_stage_valid",
+        pd.Series(True, index=raw.index),
+    ).fillna(False).astype(bool)
+    valid = raw[validity].copy()
+    invalid = raw[~validity].copy()
+    methods = sorted(str(value) for value in raw["method"].dropna().unique())
+    for method in methods:
+        items = []
+        subset = valid[valid["method"] == method]
+        for row in subset.to_dict("records"):
+            path = Path(row["method_dir"]) / "figures" / "streamlines.png"
+            items.append((path, _montage_label(path, method)))
+        items.sort(key=lambda item: _continuation_sort_key(item[0]))
+        _save_image_grid(
+            items,
+            summary / f"streamline_montage_{method}.png",
+            cols=4,
+            title=f"{method} valid continuation streamlines",
+        )
+
+    valid_pairs = set()
+    for (seed, reynolds), group in valid.groupby(["seed", "reynolds"]):
+        present = set(str(value) for value in group["method"])
+        if {"vanilla", "vara_v2"}.issubset(present):
+            valid_pairs.add((int(seed), float(reynolds)))
+    comparison_items = []
+    for seed, reynolds in sorted(valid_pairs):
+        re_name = f"re_{int(round(reynolds)):04d}"
+        path = output / f"seed_{seed}" / re_name / "comparison" / "streamlines_side_by_side.png"
+        comparison_items.append((path, f"seed_{seed} {re_name} comparison"))
+    _save_image_grid(
+        comparison_items,
+        summary / "streamline_montage_side_by_side.png",
+        cols=2,
+        title="Valid Vanilla vs VARA V2 streamlines",
+    )
+
+    invalid_items = []
+    for row in invalid.to_dict("records"):
+        path = Path(row["method_dir"]) / "figures" / "streamlines.png"
+        label = (
+            f"INVALID seed_{int(row['seed'])} "
+            f"Re={float(row['reynolds']):g} {row['method']}"
+        )
+        invalid_items.append((path, label))
+    invalid_items.sort(key=lambda item: _continuation_sort_key(item[0]))
+    _save_image_grid(
+        invalid_items,
+        summary / "streamline_montage_invalid_stages.png",
+        cols=4,
+        title="Invalid stages - diagnostic use only",
+    )
+
+
+def _continuation_sort_key(path: Path) -> tuple[int, float, str]:
+    seed_part = next((part for part in path.parts if part.startswith("seed_")), "seed_0")
+    re_part = next((part for part in path.parts if part.startswith("re_")), "re_0")
+    try:
+        seed = int(seed_part.split("_", 1)[1])
+    except ValueError:
+        seed = 0
+    try:
+        reynolds = float(re_part.split("_", 1)[1].replace("p", "."))
+    except ValueError:
+        reynolds = float("inf")
+    return seed, reynolds, str(path)
+
+
+def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(config.get("continuation_validity", {}))
+    if not bool(cfg.get("enabled", False)):
+        return {
+            "continuation_stage_valid": True,
+            "continuation_invalid_reasons": "",
+        }
+    checks = {
+        "pde_residual_mean": float(cfg.get("max_pde_residual_mean", np.inf)),
+        "continuity_residual_mean": float(cfg.get("max_continuity_residual_mean", np.inf)),
+        "momentum_residual_mean": float(cfg.get("max_momentum_residual_mean", np.inf)),
+        "boundary_condition_error": float(cfg.get("max_boundary_condition_error", np.inf)),
+        "speed_pred_max": float(cfg.get("max_speed_pred", np.inf)),
+        "streamfunction_consistency_rmse": float(
+            cfg.get("max_streamfunction_consistency_rmse", np.inf)
+        ),
+    }
+    reasons = []
+    for name, maximum in checks.items():
+        try:
+            value = float(metrics.get(name, np.nan))
+        except (TypeError, ValueError):
+            value = float("nan")
+        if not np.isfinite(value):
+            reasons.append(f"{name}=nonfinite")
+        elif value > maximum:
+            reasons.append(f"{name}={value:.4g}>{maximum:.4g}")
+    minimum_psi = float(cfg.get("min_primary_streamfunction_abs", 0.0))
+    psi = float(metrics.get("primary_streamfunction_abs", np.nan))
+    if not np.isfinite(psi):
+        reasons.append("primary_streamfunction_abs=nonfinite")
+    elif psi < minimum_psi:
+        reasons.append(f"primary_streamfunction_abs={psi:.4g}<{minimum_psi:.4g}")
+    minimum_wall_distance = float(cfg.get("min_primary_vortex_wall_distance", 0.0))
+    x = float(metrics.get("primary_vortex_center_x", np.nan))
+    y = float(metrics.get("primary_vortex_center_y", np.nan))
+    bounds = (
+        float(config.get("benchmark_params", {}).get("x_min", 0.0)),
+        float(config.get("benchmark_params", {}).get("x_max", 1.0)),
+        float(config.get("benchmark_params", {}).get("y_min", 0.0)),
+        float(config.get("benchmark_params", {}).get("y_max", 1.0)),
+    )
+    if not np.isfinite(x) or not np.isfinite(y):
+        reasons.append("primary_vortex_center=nonfinite")
+    else:
+        x0, x1, y0, y1 = bounds
+        scale = max(min(x1 - x0, y1 - y0), 1e-12)
+        wall_distance = min(x - x0, x1 - x, y - y0, y1 - y) / scale
+        if wall_distance < minimum_wall_distance:
+            reasons.append(
+                f"primary_vortex_wall_distance={wall_distance:.4g}<{minimum_wall_distance:.4g}"
+            )
+    return {
+        "continuation_stage_valid": not reasons,
+        "continuation_invalid_reasons": ";".join(reasons),
+    }
 
 
 def _trainer_for(method: str, config: dict[str, Any]) -> Any:

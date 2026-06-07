@@ -307,7 +307,10 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
             pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
-            losses = compute_global_losses(pointwise)
+            losses = compute_global_losses(
+                pointwise,
+                reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
+            )
             active = [name for name in adaptive_weights if name in losses]
             if active and (local_epoch % update_every == 0):
                 norms = {name: loss_gradient_norm(losses[name], parameters) for name in active}
@@ -382,7 +385,10 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
             pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
-            losses = compute_global_losses(pointwise)
+            losses = compute_global_losses(
+                pointwise,
+                reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
+            )
             available = [name for name in self._relobralo_state.names if name in losses]
             if available != self._relobralo_state.names:
                 self._relobralo_state = ReLoBRaLoWeights(
@@ -980,10 +986,8 @@ class VARATrainer(ExperimentTrainer):
         return metrics
 
     def _validation_metrics(self, coords: np.ndarray) -> dict[str, float]:
-        from src.evaluation.metrics import evaluate_on_grid
-
         phase_start = time.perf_counter()
-        metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        metrics = self.controller_metrics(coords)
         self.compute_tracker.add_phase_time("evaluation", time.perf_counter() - phase_start)
         return metrics
 
@@ -994,8 +998,8 @@ class VARATrainer(ExperimentTrainer):
     ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, list[str], list[Any], np.ndarray, np.ndarray, np.ndarray]:
         phase_start = time.perf_counter()
         X, Y, coords = self.validation_grid()
-        builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
-        maps = builder.build(coords, mode=self.config.get("diagnostics", {}).get("mode", "full_reference"))
+        builder = self.diagnostic_builder()
+        maps = builder.build(coords, mode=self.controller_diagnostic_mode())
         norm_scores, names = self.patch_scorer.compute(maps, coords, update_ema=update_ema)
         raw_scores = self.patch_scorer.last_raw_scores
         if raw_scores is None:

@@ -45,6 +45,8 @@ class V2ControllerConfig:
     trust_shrink: float = 0.5
     effectiveness_ema: float = 0.8
     noise_floor: float = 1e-4
+    target_noise_ceiling: float = 0.25
+    guard_noise_ceiling: float = 0.10
     reliable_reward_ratio: float = 0.75
     gradient_prefilter_enabled: bool = True
     trust_region_enabled: bool = True
@@ -67,6 +69,8 @@ class V2ControllerConfig:
             trust_shrink=float(data.get("trust_shrink", 0.5)),
             effectiveness_ema=float(data.get("effectiveness_ema", 0.8)),
             noise_floor=float(data.get("noise_floor", 1e-4)),
+            target_noise_ceiling=float(data.get("target_noise_ceiling", 0.25)),
+            guard_noise_ceiling=float(data.get("guard_noise_ceiling", 0.10)),
             reliable_reward_ratio=float(data.get("reliable_reward_ratio", 0.75)),
             gradient_prefilter_enabled=bool(data.get("gradient_prefilter_enabled", True)),
             trust_region_enabled=bool(data.get("trust_region_enabled", True)),
@@ -366,10 +370,22 @@ class VARAV2Controller:
         self.decisions.append({**candidate.to_record(), **decision})
 
     def target_noise(self, variable: str, patch_id: int) -> float:
-        return _robust_relative_noise(self.score_history.get((variable, int(patch_id)), []), self.config.noise_floor)
+        return min(
+            self.config.target_noise_ceiling,
+            _robust_relative_noise(
+                self.score_history.get((variable, int(patch_id)), []),
+                self.config.noise_floor,
+            ),
+        )
 
     def metric_noise(self, name: str) -> float:
-        return _robust_relative_noise(self.metric_history.get(name, []), self.config.noise_floor)
+        return min(
+            self.config.guard_noise_ceiling,
+            _robust_relative_noise(
+                self.metric_history.get(name, []),
+                self.config.noise_floor,
+            ),
+        )
 
     def validate_state(self) -> None:
         mass = self.state.sampling_mass

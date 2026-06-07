@@ -42,7 +42,7 @@ from src.utils.seed import set_seed
 from src.visualization.controller_plots import save_intervention_timeline, save_patch_score_map
 from src.visualization.fields import save_field_panel, save_prediction_reference_error_panel
 from src.visualization.heatmaps import save_heatmap
-from src.visualization.streamlines import save_streamlines
+from src.visualization.streamlines import save_streamfunction_contours, save_streamlines
 
 
 class ExperimentTrainer:
@@ -197,6 +197,9 @@ class ExperimentTrainer:
             return LidDrivenCavityQualitative(
                 **rectangular,
                 lid_velocity=float(cfg.get("lid_velocity", 1.0)),
+                lid_corner_regularization_width=float(
+                    cfg.get("lid_corner_regularization_width", 0.0)
+                ),
                 reference=str(cfg.get("reference", "none")),
                 reference_path=cfg.get("reference_path"),
                 full_field_reference_path=full_field_reference_path,
@@ -255,6 +258,92 @@ class ExperimentTrainer:
     def test_grid(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         cfg = self.config.get("test", {})
         return self.benchmark.grid(int(cfg.get("nx", 64)), int(cfg.get("ny", 64)))
+
+    def residual_interior_only(self) -> bool:
+        return bool(
+            self.config.get("evaluation", {}).get("residual_interior_only", False)
+        )
+
+    def evaluate_metrics(self, coords: np.ndarray) -> dict[str, float]:
+        return evaluate_on_grid(
+            self.model,
+            self.benchmark,
+            coords,
+            self.device,
+            self.steady,
+            residual_interior_only=self.residual_interior_only(),
+        )
+
+    def controller_metrics(self, coords: np.ndarray) -> dict[str, float]:
+        metrics = self.evaluate_metrics(coords)
+        enabled = bool(
+            self.config.get("evaluation", {}).get(
+                "controller_reference_metrics_enabled",
+                True,
+            )
+        )
+        if enabled:
+            return metrics
+        reference_names = (
+            "u_rel_l2",
+            "v_rel_l2",
+            "p_rel_l2_centered",
+            "speed_rel_l2",
+            "omega_rel_l2",
+            "u_full_rel_l2",
+            "v_full_rel_l2",
+            "velocity_full_rel_l2",
+            "p_full_rel_l2_centered",
+            "omega_full_rel_l2",
+            "u_rmse",
+            "v_rmse",
+            "p_rmse_centered",
+            "omega_rmse",
+            "velocity_mag_rmse",
+            "velocity_mag_mae",
+            "unweighted_data_loss",
+            "u_centerline_rmse",
+            "v_centerline_rmse",
+            "u_centerline_rel_l2",
+            "v_centerline_rel_l2",
+            "centerline_profile_score",
+        )
+        for name in reference_names:
+            if name in metrics:
+                metrics[name] = float("nan")
+        metrics["unweighted_validation_loss"] = float(
+            metrics["unweighted_pde_loss"] + metrics["unweighted_bc_loss"]
+        )
+        metrics["cavity_benchmark_score"] = float(
+            metrics["pde_residual_mean"]
+            + metrics["continuity_residual_mean"]
+            + metrics["momentum_residual_mean"]
+            + metrics["boundary_condition_error"]
+        )
+        metrics["controller_reference_metrics_enabled"] = False
+        return metrics
+
+    def diagnostic_builder(self) -> DiagnosticMapBuilder:
+        return DiagnosticMapBuilder(
+            self.model,
+            self.benchmark,
+            self.device,
+            self.steady,
+            residual_interior_only=self.residual_interior_only(),
+        )
+
+    def controller_diagnostic_mode(self) -> str:
+        reference_enabled = bool(
+            self.config.get("evaluation", {}).get(
+                "controller_reference_metrics_enabled",
+                True,
+            )
+        )
+        if not reference_enabled:
+            return "residual_only"
+        return str(
+            self.config.get("diagnostics", {}).get("mode", "full_reference")
+        )
 
     def train_epochs(
         self,
@@ -330,7 +419,8 @@ class ExperimentTrainer:
             pointwise["vorticity_transport"] = vorticity_transport_residual(
                 self.model, batch["xy_f"], self.benchmark.nu, steady=False
             ).pow(2)
-        losses = compute_global_losses(pointwise)
+        reduction = str(self.config.get("training", {}).get("pointwise_reduction", "legacy_mse"))
+        losses = compute_global_losses(pointwise, reduction=reduction)
         total = weighted_sum(losses, weights)
         local_loss, local_logs = compute_local_weighted_loss(
             pointwise,
@@ -338,6 +428,7 @@ class ExperimentTrainer:
             self.patch_grid,
             local_weights,
             entropy_weight=float(self.config.get("controller", {}).get("entropy_weight", 0.0)),
+            reduction=reduction,
         )
         total = total + local_loss
         if pressure_anchor_patches:
@@ -491,7 +582,7 @@ class ExperimentTrainer:
             return self.final_repair_status
 
         _, _, validation_coords = self.validation_grid()
-        before_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
+        before_metrics = self.evaluate_metrics(validation_coords)
         score_name, before_score = self._repair_score(before_metrics)
         model_snapshot = self._model_snapshot()
         optimizer_snapshot = deepcopy(self.optimizer.state_dict())
@@ -555,7 +646,7 @@ class ExperimentTrainer:
             self.global_step += 1
         self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
 
-        after_metrics = evaluate_on_grid(self.model, self.benchmark, validation_coords, self.device, self.steady)
+        after_metrics = self.evaluate_metrics(validation_coords)
         _, after_score = self._repair_score(after_metrics)
         tolerance = float(cfg.get("acceptance_tolerance", 0.0))
         accepted = bool(after_score <= before_score * (1.0 + tolerance))
@@ -611,8 +702,8 @@ class ExperimentTrainer:
         pieces = [self.uniform_sampler.sample(n_uniform).detach().cpu().numpy()]
         if n_residual > 0:
             _, _, coords = self.validation_grid()
-            builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
-            maps = builder.build(coords, mode=self.config.get("diagnostics", {}).get("mode", "full_reference"))
+            builder = self.diagnostic_builder()
+            maps = builder.build(coords, mode=self.controller_diagnostic_mode())
             score = maps.get("aggregate_pde_residual", maps.get("pde_residual"))
             if score is not None:
                 pieces.append(sample_from_score_grid(coords, score, n_residual, self.repair_rng))
@@ -668,8 +759,8 @@ class ExperimentTrainer:
     def diagnose(self) -> tuple[dict[str, np.ndarray], np.ndarray, list[str], list[Any], np.ndarray, np.ndarray, np.ndarray]:
         phase_start = time.perf_counter()
         X, Y, coords = self.validation_grid()
-        builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
-        maps = builder.build(coords, mode=self.config.get("diagnostics", {}).get("mode", "full_reference"))
+        builder = self.diagnostic_builder()
+        maps = builder.build(coords, mode=self.controller_diagnostic_mode())
         scores, names = self.patch_scorer.compute(maps, coords, update_ema=True)
         weak_regions = self.weak_detector.detect(scores, names, self.patch_grid)
         self.compute_tracker.add_phase_time("diagnostics", time.perf_counter() - phase_start)
@@ -704,7 +795,7 @@ class ExperimentTrainer:
     def evaluate_and_save_final(self) -> dict[str, float]:
         X, Y, coords = self.test_grid()
         phase_start = time.perf_counter()
-        metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        metrics = self.evaluate_metrics(coords)
         self.compute_tracker.add_phase_time("evaluation", time.perf_counter() - phase_start)
         metrics["final_total_loss"] = float(self.last_losses.get("total", float("nan")))
         metrics["optimizer_stage"] = self.optimizer_stage
@@ -725,6 +816,12 @@ class ExperimentTrainer:
         )
         metrics["continuation_replay_enabled"] = bool(
             self.config.get("continuation_replay", {}).get("enabled", False)
+        )
+        metrics["controller_reference_metrics_enabled"] = bool(
+            self.config.get("evaluation", {}).get(
+                "controller_reference_metrics_enabled",
+                True,
+            )
         )
         metrics["continuation_replay_points"] = int(
             0 if self.continuation_replay_points is None else self.continuation_replay_points.shape[0]
@@ -751,7 +848,7 @@ class ExperimentTrainer:
         return metrics
 
     def save_plots(self, X: np.ndarray, Y: np.ndarray, coords: np.ndarray) -> None:
-        builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
+        builder = self.diagnostic_builder()
         diag_mode = "full_reference" if getattr(self.benchmark, "has_reference", True) else "residual_only"
         maps = builder.build(coords, mode=diag_mode)
         shape = X.shape
@@ -845,18 +942,44 @@ class ExperimentTrainer:
             maps["v_pred"].reshape(shape),
             self.figure_dir / "streamlines.png",
         )
+        save_streamfunction_contours(
+            X,
+            Y,
+            maps["u_pred"].reshape(shape),
+            maps["v_pred"].reshape(shape),
+            self.figure_dir / "streamfunction_contours.png",
+        )
 
     def maybe_checkpoint(self, cycle: int, metrics: dict[str, float]) -> None:
-        score = (
-            metrics.get("u_rel_l2", 0.0)
-            + metrics.get("v_rel_l2", 0.0)
-            + metrics.get("p_rel_l2_centered", 0.0)
-            + metrics.get("omega_rel_l2", 0.0)
-        )
+        score = self._checkpoint_score(metrics)
         save_checkpoint(self.checkpoint_dir / "latest.pt", self.model, self.optimizer, self.config, metrics, self.global_step, cycle)
         if score < self.best_score:
             self.best_score = score
             save_checkpoint(self.checkpoint_dir / "best.pt", self.model, self.optimizer, self.config, metrics, self.global_step, cycle)
+
+    def _checkpoint_score(self, metrics: dict[str, Any]) -> float:
+        evaluation_cfg = self.config.get("evaluation", {})
+        reference_enabled = bool(
+            evaluation_cfg.get(
+                "checkpoint_reference_metrics_enabled",
+                evaluation_cfg.get("controller_reference_metrics_enabled", True),
+            )
+        )
+        if reference_enabled:
+            # Preserve the historical checkpoint selector unless an opt-in
+            # reference-free study explicitly disables it.
+            return float(
+                metrics.get("u_rel_l2", 0.0)
+                + metrics.get("v_rel_l2", 0.0)
+                + metrics.get("p_rel_l2_centered", 0.0)
+                + metrics.get("omega_rel_l2", 0.0)
+            )
+        pde = float(metrics.get("unweighted_pde_loss", float("nan")))
+        boundary = float(metrics.get("unweighted_bc_loss", float("nan")))
+        if math.isfinite(pde) and math.isfinite(boundary):
+            return pde + boundary
+        fallback = float(metrics.get("pde_residual_mean", float("inf")))
+        return fallback if math.isfinite(fallback) else math.inf
 
     def _collapsed(self, metrics: dict[str, Any]) -> bool:
         if not bool(metrics.get("collapse_evaluated", True)):

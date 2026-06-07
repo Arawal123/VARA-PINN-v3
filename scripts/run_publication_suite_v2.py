@@ -292,7 +292,9 @@ def _run_case(
 
 def _make_trainer(method: str, config: dict[str, Any]) -> tuple[Any, str]:
     if method == "vara_v2" or method.startswith("v2_"):
-        config = deep_update(config, load_config("configs/vara_v2/controller.yaml"))
+        # _case_config already installs the V2 defaults. Reapplying them here
+        # would overwrite quick schedules and, more seriously, controller
+        # ablation overlays applied by _run_case.
         return VARAV2Trainer(config), method
     if method == "vara_v1":
         return VARATrainer(config, mode="local_constrained_vara"), method
@@ -312,10 +314,13 @@ def _case_config(name: str, quick: bool) -> dict[str, Any]:
         reference_map = pd.read_csv("data/references/lid_driven_cavity/full_field/reference_map.csv")
         match = reference_map[np.isclose(reference_map["re"].astype(float), reynolds)]
         full_field = None if match.empty else str(match.iloc[0]["full_field_reference_path"])
+        profile_reference = "ghia" if any(
+            np.isclose(reynolds, available) for available in (100.0, 400.0, 1000.0)
+        ) else "none"
         config["benchmark_params"] = {
             **config.get("benchmark_params", {}),
             "reynolds": reynolds,
-            "reference": "ghia",
+            "reference": profile_reference,
             "full_field_reference_path": full_field,
             "profile_only": full_field is None,
         }
@@ -649,7 +654,7 @@ def _finite(value: Any) -> float | None:
 
 def _worst_patch_metrics(trainer: Any) -> dict[str, float]:
     _x, _y, coords = trainer.test_grid()
-    builder = DiagnosticMapBuilder(trainer.model, trainer.benchmark, trainer.device, trainer.steady)
+    builder = trainer.diagnostic_builder()
     maps = builder.build(coords, mode="residual_only")
     patch_ids = trainer.patch_grid.assign_numpy(coords)
     result = {}
@@ -659,9 +664,9 @@ def _worst_patch_metrics(trainer: Any) -> dict[str, float]:
     ):
         values = np.asarray(maps[source], dtype=float).reshape(-1)
         patch_means = [
-            float(np.mean(values[patch_ids == patch_id]))
+            float(np.nanmean(values[patch_ids == patch_id]))
             for patch_id in range(trainer.patch_grid.num_patches)
-            if np.any(patch_ids == patch_id)
+            if np.any(np.isfinite(values[patch_ids == patch_id]))
         ]
         result[target] = max(patch_means) if patch_means else float("nan")
     return result

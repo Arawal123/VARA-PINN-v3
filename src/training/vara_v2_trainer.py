@@ -84,7 +84,10 @@ class VARAV2Trainer(ExperimentTrainer):
 
             if candidate is None:
                 self._train_v2_steps(batch, block_steps, cycle=block + 1, phase="v2_no_action")
-                batch = self._resample_v2_batch(maps_before, coords)
+                maps_kept, _raw_kept, _names_kept, _weak_kept, coords_kept = (
+                    self._diagnose_reference_free(update_history=False)
+                )
+                batch = self._resample_v2_batch(maps_kept, coords_kept)
                 self._log_state(block)
                 continue
 
@@ -93,8 +96,12 @@ class VARAV2Trainer(ExperimentTrainer):
             controller_snapshot = self.v2_controller.state.snapshot()
             trust_before = self.v2_controller.trust_radius
             self.v2_controller.apply(candidate)
+            # Sampling actions must be evaluated on the allocation they
+            # propose. Probing the old batch makes sampling-only candidates
+            # observationally identical to doing nothing.
+            proposal_batch = self._resample_v2_batch(maps_before, coords)
             self._train_v2_steps(
-                batch,
+                proposal_batch,
                 probe_steps,
                 cycle=block + 1,
                 phase="v2_trust_probe",
@@ -137,8 +144,9 @@ class VARAV2Trainer(ExperimentTrainer):
             self._log_decision(block, candidate, decision)
 
             remaining = block_steps - probe_steps
+            committed_batch = proposal_batch if committed else batch
             self._train_v2_steps(
-                batch,
+                committed_batch,
                 remaining,
                 cycle=block + 1,
                 phase="v2_commit" if committed else "v2_rollback_continue",
@@ -199,6 +207,7 @@ class VARAV2Trainer(ExperimentTrainer):
                 batch,
                 self.patch_grid,
                 self.v2_controller.state.loss_multipliers,
+                reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
             )
             total = weighted_sum(losses, scalar_weights)
             anchor = self.pressure_gauge_loss()
@@ -238,7 +247,7 @@ class VARAV2Trainer(ExperimentTrainer):
     ) -> tuple[dict[str, np.ndarray], np.ndarray, list[str], list[Any], np.ndarray]:
         started = time.perf_counter()
         _x, _y, coords = self.validation_grid()
-        builder = DiagnosticMapBuilder(self.model, self.benchmark, self.device, self.steady)
+        builder = self.diagnostic_builder()
         maps = builder.build(coords, mode="residual_only")
         configured = list(self.config.get("diagnostics", {}).get("variables", []))
         names = [
@@ -264,7 +273,7 @@ class VARAV2Trainer(ExperimentTrainer):
         return maps, raw, scored_names, weak_regions, coords
 
     def _guard_metrics(self, coords: np.ndarray) -> dict[str, float]:
-        metrics = evaluate_on_grid(self.model, self.benchmark, coords, self.device, self.steady)
+        metrics = self.evaluate_metrics(coords)
         selected = {
             name: float(metrics[name])
             for name in ALLOWED_GUARD_METRICS
@@ -300,9 +309,11 @@ class VARAV2Trainer(ExperimentTrainer):
             self.steady,
         )
         parameters = self._influence_parameters()
+        # The aggregate PDE entry is the sum of the three equation entries.
+        # Do not count it a second time when estimating guard compatibility.
         guard_components = [
             pointwise[name].mean()
-            for name in ("pde", "continuity", "momentum_u", "momentum_v", "bc")
+            for name in ("continuity", "momentum_u", "momentum_v", "bc")
             if name in pointwise
         ]
         guard = sum(guard_components)

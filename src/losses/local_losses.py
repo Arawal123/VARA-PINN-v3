@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from .base_losses import mse
+from .base_losses import reduce_pointwise_loss, reduce_weighted_pointwise_loss
 
 
 LOSS_COORD_SOURCE = {
@@ -30,6 +30,7 @@ def compute_budgeted_patch_losses(
     batch: dict[str, Any],
     patch_grid: Any,
     multipliers: dict[str, Any],
+    reduction: str = "legacy_mse",
 ) -> dict[str, torch.Tensor]:
     """Reduce pointwise losses with mean-one patch multipliers.
 
@@ -40,11 +41,11 @@ def compute_budgeted_patch_losses(
     reduced: dict[str, torch.Tensor] = {}
     for name, values in pointwise.items():
         if name not in multipliers:
-            reduced[name] = mse(values)
+            reduced[name] = reduce_pointwise_loss(values, reduction)
             continue
         coord_name = LOSS_COORD_SOURCE.get(name)
         if coord_name is None or coord_name not in batch:
-            reduced[name] = mse(values)
+            reduced[name] = reduce_pointwise_loss(values, reduction)
             continue
         coords = batch[coord_name]
         patch_ids = patch_grid.assign_torch(coords).to(device=values.device)
@@ -55,7 +56,7 @@ def compute_budgeted_patch_losses(
         )
         weights = patch_values[patch_ids].reshape(values.shape)
         weights = weights / weights.mean().clamp_min(1e-12)
-        reduced[name] = torch.mean(weights * values)
+        reduced[name] = reduce_weighted_pointwise_loss(values, weights, reduction)
     return reduced
 
 
@@ -65,6 +66,7 @@ def compute_local_weighted_loss(
     patch_grid: Any,
     local_weights: dict[str, dict[int, float]],
     entropy_weight: float = 0.0,
+    reduction: str = "legacy_mse",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute sum_j,r w[j,r] L[j,r] with empty-mask protection."""
     device = next(iter(pointwise.values())).device
@@ -85,7 +87,7 @@ def compute_local_weighted_loss(
             if not torch.any(mask):
                 local_loss = values.new_tensor(0.0)
             else:
-                local_loss = mse(values[mask])
+                local_loss = reduce_pointwise_loss(values[mask], reduction)
             key = f"local/{variable}/patch_{patch_id}"
             logs[key] = float(local_loss.detach().cpu())
             total = total + float(weight) * local_loss

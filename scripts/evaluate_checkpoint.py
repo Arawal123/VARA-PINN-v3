@@ -166,7 +166,16 @@ def evaluate_single_checkpoint(
     model = build_mlp_from_config(config, benchmark.bounds).to(device)
     payload = load_checkpoint(checkpoint, model, optimizer=None)
     _, _, coords = benchmark.grid(int(config.get("test", {}).get("nx", 64)), int(config.get("test", {}).get("ny", 64)))
-    metrics = evaluate_on_grid(model, benchmark, coords, device, steady=bool(config.get("pde", {}).get("steady", True)))
+    metrics = evaluate_on_grid(
+        model,
+        benchmark,
+        coords,
+        device,
+        steady=bool(config.get("pde", {}).get("steady", True)),
+        residual_interior_only=bool(
+            config.get("evaluation", {}).get("residual_interior_only", False)
+        ),
+    )
     prior_metrics = payload.get("metrics", {}) if isinstance(payload, dict) else {}
     metrics.update(
         {
@@ -202,6 +211,9 @@ def _build_benchmark(config: dict[str, Any]) -> Any:
             y_max=float(cfg.get("y_max", 1.0)),
             amplitude=float(cfg.get("amplitude", 1.0)),
             lid_velocity=float(cfg.get("lid_velocity", 1.0)),
+            lid_corner_regularization_width=float(
+                cfg.get("lid_corner_regularization_width", 0.0)
+            ),
             reference=str(cfg.get("reference", "none")),
             reference_path=cfg.get("reference_path"),
             full_field_reference_path=full_field_reference_path,
@@ -216,7 +228,15 @@ def _save_cfd_plots(model: torch.nn.Module, benchmark: Any, config: dict[str, An
     fig_dir.mkdir(parents=True, exist_ok=True)
     _, _, coords = benchmark.grid(int(config.get("test", {}).get("nx", 64)), int(config.get("test", {}).get("ny", 64)))
     X, Y, _ = benchmark.grid(int(config.get("test", {}).get("nx", 64)), int(config.get("test", {}).get("ny", 64)))
-    builder = DiagnosticMapBuilder(model, benchmark, device, steady=bool(config.get("pde", {}).get("steady", True)))
+    builder = DiagnosticMapBuilder(
+        model,
+        benchmark,
+        device,
+        steady=bool(config.get("pde", {}).get("steady", True)),
+        residual_interior_only=bool(
+            config.get("evaluation", {}).get("residual_interior_only", False)
+        ),
+    )
     maps = builder.build(coords, mode="full_reference")
     ref = benchmark.exact_np(coords)
     shape = X.shape

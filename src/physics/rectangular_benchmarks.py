@@ -148,6 +148,7 @@ class LidDrivenCavityQualitative(RectangularBenchmarkBase):
     """Boundary/residual-only lid-driven cavity benchmark without fake interior truth."""
 
     lid_velocity: float = 1.0
+    lid_corner_regularization_width: float = 0.0
     reference: str = "none"
     reference_path: str | None = None
     full_field_reference_path: str | None = None
@@ -184,10 +185,22 @@ class LidDrivenCavityQualitative(RectangularBenchmarkBase):
         u = torch.zeros_like(x)
         v = torch.zeros_like(x)
         top = torch.isclose(y, torch.full_like(y, self.y_max), atol=tol, rtol=0.0)
-        u = torch.where(top, torch.full_like(u, self.lid_velocity), u)
+        lid = torch.full_like(u, self.lid_velocity)
+        if self.lid_corner_regularization_width > 0.0:
+            xi = (x - self.x_min) / max(self.width, 1e-12)
+            width = max(float(self.lid_corner_regularization_width), 1e-8)
+            left = _smoothstep01(xi / width)
+            right = _smoothstep01((1.0 - xi) / width)
+            lid = lid * left * right
+        u = torch.where(top, lid, u)
         p = torch.zeros_like(x)
         omega = torch.zeros_like(x)
         px = torch.zeros_like(x)
         py = torch.zeros_like(x)
         speed = torch.sqrt(u * u + v * v)
         return {"u": u, "v": v, "p": p, "omega": omega, "p_x": px, "p_y": py, "speed": speed}
+
+
+def _smoothstep01(value: torch.Tensor) -> torch.Tensor:
+    clipped = torch.clamp(value, 0.0, 1.0)
+    return clipped * clipped * (3.0 - 2.0 * clipped)

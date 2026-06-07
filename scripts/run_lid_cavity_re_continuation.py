@@ -39,6 +39,7 @@ METRICS = [
     "continuity_residual_mean",
     "momentum_residual_mean",
     "boundary_condition_error",
+    "streamfunction_consistency_rmse",
     "unweighted_validation_loss",
     "final_total_loss",
 ]
@@ -458,6 +459,21 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
     )
     _save_image_grid(
         [
+            (
+                Path(vanilla["method_dir"]) / "figures" / "streamfunction_contours.png",
+                "Vanilla reconstructed streamfunction",
+            ),
+            (
+                Path(vara["method_dir"]) / "figures" / "streamfunction_contours.png",
+                "VARA reconstructed streamfunction",
+            ),
+        ],
+        comparison_dir / "streamfunction_side_by_side.png",
+        cols=2,
+        title=f"Re={float(vanilla['reynolds']):g} reconstructed streamfunction",
+    )
+    _save_image_grid(
+        [
             (Path(vanilla["method_dir"]) / "figures" / "pde_residual.png", "Vanilla PDE"),
             (Path(vara["method_dir"]) / "figures" / "pde_residual.png", "VARA PDE"),
             (Path(vanilla["method_dir"]) / "figures" / "continuity_residual.png", "Vanilla continuity"),
@@ -492,12 +508,18 @@ def _save_summary_montages(out: Path, summary_dir: Path) -> None:
     for method in ["vanilla", "vara"]:
         items = [
             (path, _montage_label(path, method))
-            for path in sorted(out.glob(f"seed_*/re_*/{method}/figures/streamlines.png"))
+            for path in sorted(
+                out.glob(f"seed_*/re_*/{method}/figures/streamlines.png"),
+                key=_continuation_image_sort_key,
+            )
         ]
         _save_image_grid(items, summary_dir / f"streamline_montage_{method}.png", cols=4, title=f"{method.upper()} continuation streamlines")
     side_by_side = [
         (path, _montage_label(path, "comparison"))
-        for path in sorted(out.glob("seed_*/re_*/comparison/streamlines_side_by_side.png"))
+        for path in sorted(
+            out.glob("seed_*/re_*/comparison/streamlines_side_by_side.png"),
+            key=_continuation_image_sort_key,
+        )
     ]
     _save_image_grid(side_by_side, summary_dir / "streamline_montage_side_by_side.png", cols=2, title="Vanilla vs VARA streamlines")
 
@@ -624,6 +646,21 @@ def _montage_label(path: Path, method: str) -> str:
     seed = next((part for part in parts if part.startswith("seed_")), "")
     re = next((part for part in parts if part.startswith("re_")), "")
     return f"{seed} {re} {method}".strip()
+
+
+def _continuation_image_sort_key(path: Path) -> tuple[int, float, str]:
+    seed_part = next((part for part in path.parts if part.startswith("seed_")), "seed_0")
+    re_part = next((part for part in path.parts if part.startswith("re_")), "re_0")
+    try:
+        seed = int(seed_part.split("_", 1)[1])
+    except ValueError:
+        seed = 0
+    raw_re = re_part.split("_", 1)[1].replace("p", ".")
+    try:
+        reynolds = float(raw_re)
+    except ValueError:
+        reynolds = float("inf")
+    return seed, reynolds, str(path)
 
 
 def _re_dir(out: Path, seed: int, reynolds: float) -> Path:

@@ -1,3 +1,6 @@
+benchmark_params:
+  lid_corner_regularization_width: 0.02
+
 model:
   physics_formulation: cavity_hard_boundary
   hard_boundary_corner_width: 0.02

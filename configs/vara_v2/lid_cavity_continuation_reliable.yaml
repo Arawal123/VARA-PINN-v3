@@ -1,0 +1,79 @@
+# Opt-in physically guarded continuation protocol. Legacy configs are unchanged.
+benchmark_params:
+  # The mathematical cavity has singular top corners. Use the same explicit
+  # regularization in the target and hard-boundary output transform.
+  lid_corner_regularization_width: 0.10
+
+model:
+  # The smooth low-Re starting problem converges more reliably with the
+  # standard tanh MLP. The Fourier backbone remains an opt-in shared study.
+  architecture: mlp
+  hidden_layers: [64, 64, 64]
+  physics_formulation: cavity_hard_boundary
+  hard_boundary_corner_width: 0.10
+
+training:
+  pointwise_reduction: mean
+  adaptive_cycles: 10
+  epochs_per_cycle: 200
+  n_collocation: 1024
+  n_boundary: 256
+  n_data: 0
+  log_every: 50
+  weights:
+    # The component residuals already comprise the PDE objective.
+    pde: 0.0
+    momentum_u: 1.0
+    momentum_v: 1.0
+    continuity: 2.0
+    bc: 1.0
+    u: 0.0
+    v: 0.0
+    p: 0.0
+    omega: 0.0
+    pressure_gradient: 0.0
+
+controller_v2:
+  total_steps: 2000
+  warmup_steps: 500
+  control_blocks: 10
+  block_steps: 150
+  probe_steps: 20
+  gradient_probe_interior: 256
+  gradient_probe_boundary: 64
+
+continuation_anchor:
+  enabled: false
+
+continuation_replay:
+  enabled: true
+  n_points: 1024
+  active_fraction: 0.10
+  initial_weight: 0.10
+  fields: velocity
+  seed_offset: 104729
+
+validation:
+  nx: 64
+  ny: 64
+
+test:
+  nx: 96
+  ny: 96
+
+evaluation:
+  # PDE residuals are interior equations. Wall accuracy is reported by the
+  # separate boundary metrics, so singular lid corners must not be counted
+  # twice or dominate controller decisions.
+  residual_interior_only: true
+
+continuation_validity:
+  enabled: true
+  max_pde_residual_mean: 0.30
+  max_continuity_residual_mean: 0.10
+  max_momentum_residual_mean: 0.25
+  max_boundary_condition_error: 0.01
+  max_speed_pred: 2.0
+  max_streamfunction_consistency_rmse: 0.02
+  min_primary_streamfunction_abs: 0.01
+  min_primary_vortex_wall_distance: 0.05
