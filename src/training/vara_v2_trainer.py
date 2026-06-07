@@ -135,12 +135,14 @@ class VARAV2Trainer(ExperimentTrainer):
 
             model_snapshot = self._model_snapshot()
             optimizer_snapshot = deepcopy(self.optimizer.state_dict())
+            loss_normalization_snapshot = deepcopy(self.loss_normalization_state)
             controller_snapshot = self.v2_controller.state.snapshot()
             trust_before = self.v2_controller.trust_radius
             block_start_step = self.global_step
             counterfactual = self.v2_config.counterfactual_probe_enabled
             neutral_model_snapshot: dict[str, torch.Tensor] | None = None
             neutral_optimizer_snapshot: dict[str, Any] | None = None
+            neutral_loss_normalization_snapshot: dict[str, float] | None = None
             if counterfactual:
                 # A candidate must outperform the training trajectory that
                 # would have occurred without intervention. Comparing only
@@ -156,6 +158,9 @@ class VARAV2Trainer(ExperimentTrainer):
                 )
                 neutral_model_snapshot = self._model_snapshot()
                 neutral_optimizer_snapshot = deepcopy(self.optimizer.state_dict())
+                neutral_loss_normalization_snapshot = deepcopy(
+                    self.loss_normalization_state
+                )
                 (
                     _neutral_maps,
                     neutral_raw,
@@ -166,6 +171,7 @@ class VARAV2Trainer(ExperimentTrainer):
                 neutral_metrics = self._guard_metrics(neutral_coords)
                 self._restore_model_snapshot(model_snapshot)
                 self.optimizer.load_state_dict(optimizer_snapshot)
+                self.loss_normalization_state = deepcopy(loss_normalization_snapshot)
                 self.v2_controller.state.restore(controller_snapshot)
                 self.restore_sampling_state(sampling_snapshot)
                 self.global_step = block_start_step
@@ -184,6 +190,7 @@ class VARAV2Trainer(ExperimentTrainer):
             for candidate in candidates_to_probe:
                 self._restore_model_snapshot(model_snapshot)
                 self.optimizer.load_state_dict(optimizer_snapshot)
+                self.loss_normalization_state = deepcopy(loss_normalization_snapshot)
                 self.v2_controller.state.restore(controller_snapshot)
                 self.restore_sampling_state(sampling_snapshot)
                 self.global_step = block_start_step
@@ -256,6 +263,7 @@ class VARAV2Trainer(ExperimentTrainer):
                         "decision": decision,
                         "model": self._model_snapshot(),
                         "optimizer": deepcopy(self.optimizer.state_dict()),
+                        "loss_normalization": deepcopy(self.loss_normalization_state),
                         "controller": self.v2_controller.state.snapshot(),
                         "sampling": proposal_sampling_snapshot,
                         "batch": proposal_batch,
@@ -277,6 +285,7 @@ class VARAV2Trainer(ExperimentTrainer):
                 decision["committed"] = True
                 self._restore_model_snapshot(selected["model"])
                 self.optimizer.load_state_dict(selected["optimizer"])
+                self.loss_normalization_state = deepcopy(selected["loss_normalization"])
                 self.v2_controller.state.restore(selected["controller"])
                 self.restore_sampling_state(selected["sampling"])
                 committed_batch = selected["batch"]
@@ -291,11 +300,16 @@ class VARAV2Trainer(ExperimentTrainer):
                 if counterfactual:
                     assert neutral_model_snapshot is not None
                     assert neutral_optimizer_snapshot is not None
+                    assert neutral_loss_normalization_snapshot is not None
                     self._restore_model_snapshot(neutral_model_snapshot)
                     self.optimizer.load_state_dict(neutral_optimizer_snapshot)
+                    self.loss_normalization_state = deepcopy(
+                        neutral_loss_normalization_snapshot
+                    )
                 else:
                     self._restore_model_snapshot(model_snapshot)
                     self.optimizer.load_state_dict(optimizer_snapshot)
+                    self.loss_normalization_state = deepcopy(loss_normalization_snapshot)
                 self.v2_controller.state.restore(controller_snapshot)
                 self.restore_sampling_state(neutral_sampling_snapshot)
                 committed_batch = neutral_batch
@@ -396,6 +410,7 @@ class VARAV2Trainer(ExperimentTrainer):
                 self.v2_controller.state.loss_multipliers,
                 reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
             )
+            losses, normalization_logs = self.normalize_training_losses(losses)
             total = weighted_sum(losses, scalar_weights)
             anchor = self.pressure_gauge_loss()
             continuation_anchor, continuation_weight = self.continuation_anchor_loss(batch)
@@ -417,6 +432,7 @@ class VARAV2Trainer(ExperimentTrainer):
             logs["total"] = float(total.detach().cpu())
             logs["grad_norm"] = grad_norm
             logs["learning_rate"] = learning_rate
+            logs.update(normalization_logs)
             self.last_losses = logs
             if local_step % log_every == 0 or local_step == steps - 1:
                 self.loss_logger.log(

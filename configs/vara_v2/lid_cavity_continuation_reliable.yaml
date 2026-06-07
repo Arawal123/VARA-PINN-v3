@@ -8,23 +8,20 @@ model:
   # The smooth low-Re starting problem converges more reliably with the
   # standard tanh MLP. The Fourier backbone remains an opt-in shared study.
   architecture: mlp
+  output_dim: 2
   hidden_layers: [64, 64, 64]
-  physics_formulation: cavity_hard_boundary
-  hard_boundary_corner_width: 0.02
-  # The harmonic lift is the best quantitative option in the controlled
-  # pilots. The divergence-free geometric lift remains available explicitly
-  # for architecture ablations, but is not silently enabled here.
-  hard_boundary_lid_lifting: harmonic
+  # Topology-first cavity continuation uses the streamfunction-pressure
+  # formulation so the plotted velocity field is solenoidal by construction.
+  # CFD/Ghia references remain evaluation-only; no reference data is used in
+  # this wrapper or in the controller.
+  physics_formulation: streamfunction_pressure
 
 training:
   pointwise_reduction: mean
   adaptive_cycles: 10
   epochs_per_cycle: 200
   n_collocation: 1024
-  # Velocity walls are exact under the hard-boundary wrapper. A small boundary
-  # probe remains for verification without spending a quarter of every batch
-  # on identically zero boundary losses.
-  n_boundary: 64
+  n_boundary: 768
   n_data: 0
   log_every: 50
   weights:
@@ -32,13 +29,21 @@ training:
     pde: 0.0
     momentum_u: 1.0
     momentum_v: 1.0
-    continuity: 2.0
-    bc: 1.0
+    continuity: 0.0
+    bc: 30.0
     u: 0.0
     v: 0.0
     p: 0.0
     omega: 0.0
     pressure_gradient: 0.0
+
+loss_normalization:
+  enabled: true
+  names: [momentum_u, momentum_v, continuity, bc]
+  ema: 0.98
+  min_scale: 1.0e-5
+  max_scale: 1.0e4
+  warmup_steps: 0
 
 controller_v2:
   total_steps: 2000
@@ -81,7 +86,7 @@ sampling:
     engine: sobol
 
 checkpoint:
-  restore_best_before_final: true
+  restore_best_before_final: false
   reference_free_metrics:
     - momentum_residual_mean
     - continuity_residual_mean
@@ -123,10 +128,14 @@ evaluation:
 continuation_validity:
   enabled: true
   max_pde_residual_mean: 0.30
-  max_continuity_residual_mean: 0.10
-  max_momentum_residual_mean: 0.25
-  max_boundary_condition_error: 0.01
+  max_continuity_residual_mean: 0.001
+  max_momentum_residual_mean: 0.30
+  max_boundary_condition_error: 0.12
   max_speed_pred: 2.0
-  max_streamfunction_consistency_rmse: 0.02
+  max_streamfunction_consistency_rmse: 0.03
+  max_lid_cavity_primary_center_error: 0.12
+  max_lid_cavity_topology_score: 0.18
+  max_velocity_full_rel_l2: 0.85
+  require_lid_cavity_topology_alignment: true
   min_primary_streamfunction_abs: 0.01
   min_primary_vortex_wall_distance: 0.05

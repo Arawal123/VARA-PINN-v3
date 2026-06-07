@@ -42,7 +42,10 @@ from src.utils.seed import set_seed
 from src.visualization.controller_plots import save_intervention_timeline, save_patch_score_map
 from src.visualization.fields import save_field_panel, save_prediction_reference_error_panel
 from src.visualization.heatmaps import save_heatmap
-from src.visualization.streamlines import save_streamfunction_contours, save_streamlines
+from src.visualization.streamlines import (
+    save_streamfunction_contours,
+    save_streamlines,
+)
 
 
 class ExperimentTrainer:
@@ -84,6 +87,8 @@ class ExperimentTrainer:
         self.early_stopped = False
         self.early_stop_step: int | None = None
         self.compute_tracker = ComputeTracker(dict(config.get("compute_budget", {})))
+        self.loss_normalization_cfg = dict(config.get("loss_normalization", {}))
+        self.loss_normalization_state: dict[str, float] = {}
 
         patch_cfg = config.get("patches", {})
         self.patch_grid = PatchGrid(
@@ -235,7 +240,7 @@ class ExperimentTrainer:
             return DoubleVortexBoxFlow(**rectangular)
         if name in {"boundary_condition_stress_test", "bc_stress"}:
             return BoundaryStressBoxFlow(**rectangular)
-        if name in {"lid_driven_cavity", "cavity"}:
+        if name in {"lid_driven_cavity", "lid_cavity", "lid-driven-cavity", "lid-cavity", "cavity"}:
             full_field_reference_path = cfg.get("full_field_reference_path")
             return LidDrivenCavityQualitative(
                 **rectangular,
@@ -287,7 +292,13 @@ class ExperimentTrainer:
         return torch.tensor(self._sample_boundary_numpy(n), dtype=torch.float32, device=self.device)
 
     def _is_lid_driven_cavity(self) -> bool:
-        return str(self.config.get("benchmark", "")).lower() in {"lid_driven_cavity", "cavity"}
+        return str(self.config.get("benchmark", "")).lower() in {
+            "lid_driven_cavity",
+            "lid_cavity",
+            "lid-driven-cavity",
+            "lid-cavity",
+            "cavity",
+        }
 
     def make_batch(self, xy_f: torch.Tensor, xy_bc: torch.Tensor, xy_data: torch.Tensor) -> dict[str, Any]:
         with torch.no_grad():
@@ -362,6 +373,11 @@ class ExperimentTrainer:
             "u_centerline_rel_l2",
             "v_centerline_rel_l2",
             "centerline_profile_score",
+            "lid_cavity_expected_primary_x",
+            "lid_cavity_expected_primary_y",
+            "lid_cavity_primary_center_error",
+            "lid_cavity_topology_score",
+            "lid_cavity_topology_aligned",
         )
         for name in reference_names:
             if name in metrics:
@@ -478,6 +494,7 @@ class ExperimentTrainer:
             ).pow(2)
         reduction = str(self.config.get("training", {}).get("pointwise_reduction", "legacy_mse"))
         losses = compute_global_losses(pointwise, reduction=reduction)
+        losses, normalization_logs = self.normalize_training_losses(losses)
         total = weighted_sum(losses, weights)
         local_loss, local_logs = compute_local_weighted_loss(
             pointwise,
@@ -507,7 +524,43 @@ class ExperimentTrainer:
             local_logs["continuation_replay_weight"] = float(replay_weight)
         if float(gauge_loss.detach().cpu()) > 0.0:
             local_logs["pressure_gauge"] = float(gauge_loss.detach().cpu())
+        local_logs.update(normalization_logs)
         return total, losses, local_logs
+
+    def normalize_training_losses(
+        self,
+        losses: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        """Optionally equalize objective scale with reference-free EMA factors."""
+        cfg = self.loss_normalization_cfg
+        if not bool(cfg.get("enabled", False)):
+            return losses, {}
+        names = cfg.get("names", ["momentum_u", "momentum_v", "continuity", "bc"])
+        names = [str(name) for name in names]
+        ema = float(cfg.get("ema", 0.98))
+        min_scale = float(cfg.get("min_scale", 1e-6))
+        max_scale = float(cfg.get("max_scale", 1e6))
+        warmup_steps = max(0, int(cfg.get("warmup_steps", 0)))
+        normalized = dict(losses)
+        logs: dict[str, float] = {}
+        for name in names:
+            if name not in losses:
+                continue
+            raw_value = float(losses[name].detach().cpu())
+            if not math.isfinite(raw_value):
+                continue
+            previous = self.loss_normalization_state.get(name)
+            if previous is None:
+                scale = raw_value
+            else:
+                scale = ema * previous + (1.0 - ema) * raw_value
+            scale = min(max(scale, min_scale), max_scale)
+            self.loss_normalization_state[name] = scale
+            logs[f"raw_{name}"] = raw_value
+            logs[f"loss_scale_{name}"] = scale
+            if self.global_step >= warmup_steps:
+                normalized[name] = losses[name] / scale
+        return normalized, logs
 
     def continuation_anchor_loss(self, batch: dict[str, Any]) -> tuple[torch.Tensor, float]:
         """Shared decaying warm-start anchor used identically by every method."""
@@ -978,6 +1031,15 @@ class ExperimentTrainer:
                 self.figure_dir / "reference_fields.png",
             )
             save_field_panel(X, Y, reference_fields, self.figure_dir / "cfd_reference_fields.png")
+            save_streamlines(
+                X,
+                Y,
+                maps["u_ref"].reshape(shape),
+                maps["v_ref"].reshape(shape),
+                self.figure_dir / "reference_streamlines.png",
+                closed_boundary=self._is_lid_driven_cavity(),
+                title="CFD reference velocity streamlines",
+            )
             error_fields = {
                 "u error": maps["u_error"].reshape(shape),
                 "v error": maps["v_error"].reshape(shape),

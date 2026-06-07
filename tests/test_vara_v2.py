@@ -31,7 +31,11 @@ from src.training.vara_trainer import VARATrainer
 from src.training.vara_v2_trainer import VARAV2Trainer
 from src.utils.config import deep_update, load_config
 from src.utils.logging import CSVLogger
-from src.visualization.streamlines import detect_vortices, reconstruct_streamfunction
+from src.visualization.streamlines import (
+    detect_vortices,
+    lid_cavity_topology_metrics,
+    reconstruct_streamfunction,
+)
 
 
 def test_v2_allocation_conserves_sampling_and_loss_mass():
@@ -61,6 +65,35 @@ def test_mean_pointwise_reduction_does_not_square_squared_losses_again():
     legacy = compute_global_losses(pointwise, reduction="legacy_mse")
     assert corrected["pde"].item() == pytest.approx(2.5)
     assert legacy["pde"].item() == pytest.approx(8.5)
+
+
+def test_loss_normalization_equalizes_selected_terms(tmp_path):
+    config = load_config("configs/vara_v2/lid_driven_cavity.yaml")
+    config = deep_update(
+        config,
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path)},
+            "loss_normalization": {
+                "enabled": True,
+                "names": ["momentum_u", "continuity"],
+                "ema": 0.5,
+                "min_scale": 1.0e-6,
+            },
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    losses = {
+        "momentum_u": torch.tensor(100.0),
+        "continuity": torch.tensor(0.25),
+        "bc": torch.tensor(1.0),
+    }
+    normalized, logs = trainer.normalize_training_losses(losses)
+    assert normalized["momentum_u"].item() == pytest.approx(1.0)
+    assert normalized["continuity"].item() == pytest.approx(1.0)
+    assert normalized["bc"].item() == pytest.approx(1.0)
+    assert logs["loss_scale_momentum_u"] == pytest.approx(100.0)
 
 
 def test_v2_budgeted_reduction_has_same_definition_before_and_after_action():
@@ -108,7 +141,13 @@ def test_v2_budgeted_reduction_has_same_definition_before_and_after_action():
 
 def test_v2_rejects_reference_or_test_signal_names():
     controller = VARAV2Controller(V2ControllerConfig(num_patches=4))
-    for name in ["velocity_full_rel_l2", "ghia_profile_score", "cfd_reference_error", "test_rmse"]:
+    for name in [
+        "velocity_full_rel_l2",
+        "ghia_profile_score",
+        "cfd_reference_error",
+        "test_rmse",
+        "lid_cavity_topology_score",
+    ]:
         with pytest.raises(ValueError):
             controller.assert_reference_free([name])
 
@@ -231,7 +270,7 @@ def test_cavity_hard_boundary_wrapper_enforces_regularized_walls():
 def test_continuation_overlay_inherits_lid_cavity_base_config():
     config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     assert config["benchmark"] == "lid_driven_cavity"
-    assert config["model"]["physics_formulation"] == "cavity_hard_boundary"
+    assert config["model"]["physics_formulation"] == "streamfunction_pressure"
 
 
 def test_cavity_hard_boundary_accepts_lid_cavity_alias():
@@ -391,6 +430,24 @@ def test_closed_cavity_reconstruction_detects_physical_vortex():
     assert vortices
     assert vortices[0]["x"] == pytest.approx(0.5, abs=0.02)
     assert vortices[0]["y"] == pytest.approx(0.5, abs=0.02)
+
+
+def test_lid_cavity_topology_metric_accepts_expected_primary_vortex():
+    x = np.linspace(0.0, 1.0, 80)
+    y = np.linspace(0.0, 1.0, 80)
+    X, Y = np.meshgrid(x, y)
+    cx, cy = 0.6172, 0.7344
+    sigma = 0.22
+    envelope = X * (1.0 - X) * Y * (1.0 - Y)
+    gaussian = np.exp(-((X - cx) ** 2 + (Y - cy) ** 2) / sigma**2)
+    exact = -envelope * gaussian
+    dy = y[1] - y[0]
+    dx = x[1] - x[0]
+    u = np.gradient(exact, dy, axis=0)
+    v = -np.gradient(exact, dx, axis=1)
+    metrics = lid_cavity_topology_metrics(X, Y, u, v, reynolds=100.0)
+    assert metrics["lid_cavity_topology_aligned"] == 1.0
+    assert metrics["lid_cavity_primary_center_error"] < 0.05
 
 
 def test_cavity_residual_metrics_can_exclude_singular_boundary_points():

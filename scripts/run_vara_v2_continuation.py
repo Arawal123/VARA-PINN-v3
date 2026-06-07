@@ -362,6 +362,13 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
         "streamfunction_consistency_rmse": float(
             cfg.get("max_streamfunction_consistency_rmse", np.inf)
         ),
+        "lid_cavity_primary_center_error": float(
+            cfg.get("max_lid_cavity_primary_center_error", np.inf)
+        ),
+        "lid_cavity_topology_score": float(
+            cfg.get("max_lid_cavity_topology_score", np.inf)
+        ),
+        "velocity_full_rel_l2": float(cfg.get("max_velocity_full_rel_l2", np.inf)),
     }
     reasons = []
     for name, maximum in checks.items():
@@ -373,6 +380,10 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             reasons.append(f"{name}=nonfinite")
         elif value > maximum:
             reasons.append(f"{name}={value:.4g}>{maximum:.4g}")
+    if bool(cfg.get("require_lid_cavity_topology_alignment", False)):
+        aligned = float(metrics.get("lid_cavity_topology_aligned", 0.0))
+        if not np.isfinite(aligned) or aligned < 0.5:
+            reasons.append("lid_cavity_topology_aligned=false")
     minimum_psi = float(cfg.get("min_primary_streamfunction_abs", 0.0))
     psi = float(metrics.get("primary_streamfunction_abs", np.nan))
     if not np.isfinite(psi):

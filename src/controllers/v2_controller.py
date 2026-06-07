@@ -20,6 +20,9 @@ FORBIDDEN_CONTROLLER_TOKENS = {
     "full_field",
     "profile_score",
     "benchmark_score",
+    "topology",
+    "expected_primary",
+    "primary_center_error",
 }
 
 ALLOWED_GUARD_METRICS = (

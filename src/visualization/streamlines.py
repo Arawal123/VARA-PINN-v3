@@ -11,6 +11,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+LID_CAVITY_PRIMARY_CENTERS = {
+    100.0: (0.6172, 0.7344),
+    400.0: (0.5547, 0.6055),
+    1000.0: (0.5313, 0.5625),
+    1600.0: (0.5156, 0.5469),
+    3200.0: (0.5156, 0.5469),
+}
+
+
 def save_streamlines(
     X: np.ndarray,
     Y: np.ndarray,
@@ -20,6 +29,7 @@ def save_streamlines(
     *,
     closed_boundary: bool = False,
     annotate_vortices: bool = False,
+    title: str = "Predicted velocity streamlines",
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,11 +76,97 @@ def save_streamlines(
     ax.set_ylabel("y")
     topology = f", detected vortices={len(vortices)}" if closed_boundary else ""
     ax.set_title(
-        "Predicted velocity streamlines\n"
+        f"{title}\n"
         f"closed-path consistency RMSE={consistency:.3e}{topology}"
     )
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def expected_lid_cavity_primary_center(reynolds: float) -> tuple[float, float]:
+    """Return a literature-scale primary vortex center estimate.
+
+    Values are used only for reporting/validation of lid-cavity figures, never
+    for controller decisions or training losses. Intermediate Reynolds numbers
+    are interpolated in log(Re), matching the usual continuation scale.
+    """
+    re = max(float(reynolds), 1e-12)
+    points = sorted(LID_CAVITY_PRIMARY_CENTERS.items())
+    if re <= points[0][0]:
+        return points[0][1]
+    if re >= points[-1][0]:
+        return points[-1][1]
+    log_re = np.log(re)
+    for (left_re, left_xy), (right_re, right_xy) in zip(points[:-1], points[1:]):
+        if left_re <= re <= right_re:
+            t = (log_re - np.log(left_re)) / max(
+                np.log(right_re) - np.log(left_re),
+                1e-12,
+            )
+            x = (1.0 - t) * left_xy[0] + t * right_xy[0]
+            y = (1.0 - t) * left_xy[1] + t * right_xy[1]
+            return float(x), float(y)
+    return points[-1][1]
+
+
+def lid_cavity_topology_metrics(
+    X: np.ndarray,
+    Y: np.ndarray,
+    U: np.ndarray,
+    V: np.ndarray,
+    reynolds: float,
+) -> dict[str, float]:
+    """Quantify whether a predicted lid-cavity streamline field is plausible."""
+    psi, consistency = reconstruct_streamfunction(
+        X,
+        Y,
+        U,
+        V,
+        closed_boundary=True,
+    )
+    vortices = detect_vortices(X, Y, psi)
+    expected_x, expected_y = expected_lid_cavity_primary_center(reynolds)
+    clockwise = [vortex for vortex in vortices if float(vortex.get("psi", 0.0)) < 0.0]
+    candidates = clockwise if clockwise else vortices
+    if candidates:
+        primary = min(
+            candidates,
+            key=lambda vortex: (
+                (float(vortex["x"]) - expected_x) ** 2
+                + (float(vortex["y"]) - expected_y) ** 2
+            ),
+        )
+    else:
+        primary = {
+            "x": float("nan"),
+            "y": float("nan"),
+            "strength": float("nan"),
+            "psi": float("nan"),
+        }
+    x = float(primary.get("x", float("nan")))
+    y = float(primary.get("y", float("nan")))
+    strength = float(primary.get("strength", abs(float(primary.get("psi", float("nan"))))))
+    if np.isfinite(x) and np.isfinite(y):
+        center_error = float(np.hypot(x - expected_x, y - expected_y))
+    else:
+        center_error = float("nan")
+    topology_score = center_error
+    if not np.isfinite(strength) or strength < 0.01:
+        topology_score += 0.25
+    if not np.isfinite(consistency) or consistency > 0.03:
+        topology_score += 0.25
+    return {
+        "lid_cavity_expected_primary_x": float(expected_x),
+        "lid_cavity_expected_primary_y": float(expected_y),
+        "lid_cavity_primary_center_error": center_error,
+        "lid_cavity_topology_score": float(topology_score),
+        "lid_cavity_topology_aligned": float(
+            np.isfinite(topology_score)
+            and center_error <= 0.12
+            and strength >= 0.01
+            and consistency <= 0.03
+        ),
+    }
 
 
 def reconstruct_streamfunction(

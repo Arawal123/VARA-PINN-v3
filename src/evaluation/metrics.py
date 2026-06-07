@@ -10,7 +10,11 @@ import torch
 
 from src.physics.kovasznay import center_pressure
 from src.physics.navier_stokes import navier_stokes_residuals
-from src.visualization.streamlines import detect_vortices, reconstruct_streamfunction
+from src.visualization.streamlines import (
+    detect_vortices,
+    lid_cavity_topology_metrics,
+    reconstruct_streamfunction,
+)
 
 
 def relative_l2(pred: np.ndarray, true: np.ndarray, min_reference_norm: float = 1e-8) -> float:
@@ -155,6 +159,11 @@ def evaluate_on_grid(
         "centerline_profile_score": float("nan"),
         "cavity_benchmark_score": float("nan"),
         "cavity_profile_reference_source": "",
+        "lid_cavity_expected_primary_x": float("nan"),
+        "lid_cavity_expected_primary_y": float("nan"),
+        "lid_cavity_primary_center_error": float("nan"),
+        "lid_cavity_topology_score": float("nan"),
+        "lid_cavity_topology_aligned": float("nan"),
         "unweighted_data_loss": float("nan"),
         "unweighted_pde_loss": _finite_mean(pde_loss),
         "unweighted_bc_loss": unweighted_bc_loss,
@@ -163,6 +172,11 @@ def evaluate_on_grid(
         "num_eval_points": int(coords_np.shape[0]),
     }
     metrics.update(_streamfunction_metrics(benchmark, coords_np, u, v))
+    if (
+        include_reference_metrics
+        and benchmark.__class__.__name__.lower().startswith("liddrivencavity")
+    ):
+        metrics.update(_lid_cavity_topology_metrics(benchmark, coords_np, u, v))
     if has_reference and ref is not None:
         has_p_ref = bool(ref.get("has_p_reference", np.isfinite(ref.get("p", np.array([]))).any()))
         has_omega_ref = bool(ref.get("has_omega_reference", np.isfinite(ref.get("omega", np.array([]))).any()))
@@ -331,6 +345,27 @@ def _streamfunction_metrics(
         "detected_vortex_count": int(len(vortices)),
         "secondary_vortex_count": int(max(0, len(vortices) - 1)),
     }
+
+
+def _lid_cavity_topology_metrics(
+    benchmark: Any,
+    coords_np: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+) -> dict[str, float]:
+    x_values = np.unique(coords_np[:, 0])
+    y_values = np.unique(coords_np[:, 1])
+    if len(x_values) * len(y_values) != len(coords_np):
+        return {}
+    shape = (len(y_values), len(x_values))
+    X, Y = np.meshgrid(x_values, y_values)
+    return lid_cavity_topology_metrics(
+        X,
+        Y,
+        np.asarray(u).reshape(shape),
+        np.asarray(v).reshape(shape),
+        reynolds=float(getattr(benchmark, "reynolds", 100.0)),
+    )
 
 
 def _cavity_residual_geometry_metrics(

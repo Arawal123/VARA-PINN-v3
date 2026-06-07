@@ -40,6 +40,8 @@ METRICS = [
     "momentum_residual_mean",
     "boundary_condition_error",
     "streamfunction_consistency_rmse",
+    "lid_cavity_primary_center_error",
+    "lid_cavity_topology_score",
     "unweighted_validation_loss",
     "final_total_loss",
 ]
@@ -448,13 +450,17 @@ def _save_per_re_comparison(re_dir: Path, vanilla: dict[str, Any], vara: dict[st
             comparison_dir / "cfd_metric_comparison_bar.png",
             f"Re={float(vanilla['reynolds']):g} CFD reference metrics (lower is better)",
         )
+    streamline_items = [
+        (Path(vanilla["method_dir"]) / "figures" / "streamlines.png", "Vanilla streamlines"),
+        (Path(vara["method_dir"]) / "figures" / "streamlines.png", "VARA streamlines"),
+    ]
+    reference_streamlines = Path(vanilla["method_dir"]) / "figures" / "reference_streamlines.png"
+    if reference_streamlines.exists():
+        streamline_items.insert(0, (reference_streamlines, "CFD reference streamlines"))
     _save_image_grid(
-        [
-            (Path(vanilla["method_dir"]) / "figures" / "streamlines.png", "Vanilla streamlines"),
-            (Path(vara["method_dir"]) / "figures" / "streamlines.png", "VARA streamlines"),
-        ],
+        streamline_items,
         comparison_dir / "streamlines_side_by_side.png",
-        cols=2,
+        cols=len(streamline_items),
         title=f"Re={float(vanilla['reynolds']):g} streamlines",
     )
     _save_image_grid(
