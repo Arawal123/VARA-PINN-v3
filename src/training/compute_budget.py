@@ -14,6 +14,7 @@ class ComputeTracker:
     config: dict[str, Any]
     started_at: float | None = None
     optimizer_steps: int = 0
+    applied_optimizer_steps: int = 0
     auxiliary_optimizer_steps: int = 0
     objective_evaluations: int = 0
     collocation_evaluations: int = 0
@@ -37,6 +38,8 @@ class ComputeTracker:
             "epochs": "optimizer_steps",
             "gradient_steps": "optimizer_steps",
             "steps": "optimizer_steps",
+            "effective_steps": "applied_optimizer_steps",
+            "path_steps": "applied_optimizer_steps",
             "wall_clock": "wall_clock_sec",
             "time": "wall_clock_sec",
             "points": "collocation_evaluations",
@@ -64,6 +67,8 @@ class ComputeTracker:
         value = self.budget_value
         if kind == "optimizer_steps":
             allowed = self.optimizer_steps < int(value)
+        elif kind == "applied_optimizer_steps":
+            allowed = self.applied_optimizer_steps < int(value)
         elif kind == "objective_evaluations":
             allowed = self.objective_evaluations < int(value)
         elif kind == "collocation_evaluations":
@@ -73,7 +78,7 @@ class ComputeTracker:
         else:
             raise ValueError(
                 "Unknown compute budget type "
-                f"'{kind}'. Use optimizer_steps, objective_evaluations, "
+                f"'{kind}'. Use optimizer_steps, applied_optimizer_steps, objective_evaluations, "
                 "collocation_evaluations, or wall_clock_sec."
             )
         if not allowed and not self.stop_reason:
@@ -86,8 +91,13 @@ class ComputeTracker:
         self.boundary_evaluations += _batch_size(batch.get("xy_bc"))
         self.data_evaluations += _batch_size(batch.get("xy_data"))
 
-    def record_optimizer_step(self) -> None:
+    def record_optimizer_step(self, *, applied: bool = True) -> None:
         self.optimizer_steps += 1
+        if applied:
+            self.applied_optimizer_steps += 1
+
+    def record_applied_optimizer_steps(self, count: int) -> None:
+        self.applied_optimizer_steps += max(0, int(count))
 
     def record_auxiliary_optimizer_step(self) -> None:
         self.auxiliary_optimizer_steps += 1
@@ -127,6 +137,7 @@ class ComputeTracker:
             "controller_and_io_overhead_sec": overhead,
             "controller_and_io_overhead_percent": 100.0 * overhead / max(total, 1e-12),
             "optimizer_steps": self.optimizer_steps,
+            "applied_optimizer_steps": self.applied_optimizer_steps,
             "auxiliary_optimizer_steps": self.auxiliary_optimizer_steps,
             "objective_evaluations": self.objective_evaluations,
             "collocation_evaluations": self.collocation_evaluations,

@@ -16,6 +16,8 @@ FORBIDDEN_CONTROLLER_TOKENS = {
     "rel_l2",
     "rmse",
     "mae",
+    "error",
+    "full_field",
     "profile_score",
     "benchmark_score",
 }
@@ -27,6 +29,15 @@ ALLOWED_GUARD_METRICS = (
     "boundary_condition_error",
     "unweighted_validation_loss",
 )
+
+SAFE_REFERENCE_FREE_METRICS = {
+    *ALLOWED_GUARD_METRICS,
+    "streamfunction_consistency_rmse",
+    "centerline_pde_residual_mean",
+    "centerline_continuity_residual_mean",
+    "corner_pde_residual_mean",
+    "corner_boundary_error",
+}
 
 
 @dataclass
@@ -48,9 +59,13 @@ class V2ControllerConfig:
     target_noise_ceiling: float = 0.25
     guard_noise_ceiling: float = 0.10
     reliable_reward_ratio: float = 0.75
+    counterfactual_probe_enabled: bool = True
+    counterfactual_target_margin: float = 0.005
+    counterfactual_guard_margin: float = 0.02
     gradient_prefilter_enabled: bool = True
     trust_region_enabled: bool = True
     action_memory_enabled: bool = True
+    guard_metrics: tuple[str, ...] = ALLOWED_GUARD_METRICS
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], num_patches: int) -> "V2ControllerConfig":
@@ -72,9 +87,19 @@ class V2ControllerConfig:
             target_noise_ceiling=float(data.get("target_noise_ceiling", 0.25)),
             guard_noise_ceiling=float(data.get("guard_noise_ceiling", 0.10)),
             reliable_reward_ratio=float(data.get("reliable_reward_ratio", 0.75)),
+            counterfactual_probe_enabled=bool(
+                data.get("counterfactual_probe_enabled", True)
+            ),
+            counterfactual_target_margin=float(
+                data.get("counterfactual_target_margin", 0.005)
+            ),
+            counterfactual_guard_margin=float(
+                data.get("counterfactual_guard_margin", 0.02)
+            ),
             gradient_prefilter_enabled=bool(data.get("gradient_prefilter_enabled", True)),
             trust_region_enabled=bool(data.get("trust_region_enabled", True)),
             action_memory_enabled=bool(data.get("action_memory_enabled", True)),
+            guard_metrics=tuple(data.get("guard_metrics", ALLOWED_GUARD_METRICS)),
         )
 
 
@@ -147,13 +172,17 @@ class VARAV2Controller:
         self.trust_radius = float(config.trust_radius_initial)
         self.effectiveness: dict[str, float] = {}
         self.score_history: dict[tuple[str, int], list[float]] = {}
-        self.metric_history: dict[str, list[float]] = {name: [] for name in ALLOWED_GUARD_METRICS}
+        self.metric_history: dict[str, list[float]] = {
+            name: [] for name in self.config.guard_metrics
+        }
         self.decisions: list[dict[str, Any]] = []
+        self.assert_reference_free(self.config.guard_metrics)
 
     @staticmethod
     def assert_reference_free(names: list[str] | tuple[str, ...] | set[str]) -> None:
         bad = sorted(
             name for name in names
+            if str(name) not in SAFE_REFERENCE_FREE_METRICS
             if any(token in str(name).lower() for token in FORBIDDEN_CONTROLLER_TOKENS)
         )
         if bad:
@@ -163,7 +192,7 @@ class VARAV2Controller:
         self.assert_reference_free(set(metrics))
         return {
             name: float(metrics[name])
-            for name in ALLOWED_GUARD_METRICS
+            for name in self.config.guard_metrics
             if name in metrics and np.isfinite(float(metrics[name]))
         }
 
@@ -179,9 +208,9 @@ class VARAV2Controller:
                 history = self.score_history.setdefault((name, int(patch_id)), [])
                 history.append(float(value))
                 del history[:-8]
-        for name in ALLOWED_GUARD_METRICS:
+        for name in self.config.guard_metrics:
             if name in metrics and np.isfinite(float(metrics[name])):
-                history = self.metric_history[name]
+                history = self.metric_history.setdefault(name, [])
                 history.append(float(metrics[name]))
                 del history[:-8]
 
@@ -284,20 +313,33 @@ class VARAV2Controller:
         after_target: float,
         before_metrics: dict[str, float],
         after_metrics: dict[str, float],
+        *,
+        target_threshold: float | None = None,
+        guard_threshold: float | None = None,
+        comparison_mode: str = "temporal",
+        update_state: bool = True,
     ) -> tuple[bool, dict[str, Any]]:
         self.assert_reference_free(set(before_metrics) | set(after_metrics))
         eps = 1e-12
         observed = (float(before_target) - float(after_target)) / (abs(float(before_target)) + eps)
-        noise = self.target_noise(candidate.variable, candidate.patch_id)
+        noise = (
+            self.target_noise(candidate.variable, candidate.patch_id)
+            if target_threshold is None
+            else max(self.config.noise_floor, float(target_threshold))
+        )
         guard_changes: dict[str, float] = {}
         guard_noise: dict[str, float] = {}
-        for name in ALLOWED_GUARD_METRICS:
+        for name in self.config.guard_metrics:
             if name not in before_metrics or name not in after_metrics:
                 continue
             before = float(before_metrics[name])
             after = float(after_metrics[name])
             guard_changes[name] = (after - before) / (abs(before) + eps)
-            guard_noise[name] = self.metric_noise(name)
+            guard_noise[name] = (
+                self.metric_noise(name)
+                if guard_threshold is None
+                else max(self.config.noise_floor, float(guard_threshold))
+            )
         guard_ok = all(
             change <= max(self.config.noise_floor, guard_noise[name])
             for name, change in guard_changes.items()
@@ -312,6 +354,7 @@ class VARAV2Controller:
             "predicted_target_improvement": float(candidate.predicted_target_improvement),
             "predicted_guard_damage": float(candidate.predicted_guard_damage),
             "reward_ratio": float(reward_ratio),
+            "comparison_mode": str(comparison_mode),
             "guard_changes": guard_changes,
             "guard_noise": guard_noise,
             "trust_radius_before": float(self.trust_radius),
@@ -320,8 +363,30 @@ class VARAV2Controller:
                 else "pareto_guard_violation"
             ),
         }
-        self._update_after_decision(candidate, accepted, reward_ratio, decision)
+        if update_state:
+            self._update_after_decision(candidate, accepted, reward_ratio, decision)
+        else:
+            decision["trust_radius_after"] = float(self.trust_radius)
+            decision["effectiveness_after"] = float(
+                self.effectiveness.get(candidate.key(), 1.0)
+            )
         return accepted, decision
+
+    def commit_evaluation(
+        self,
+        candidate: V2Candidate,
+        accepted: bool,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply trust/action-memory updates for one selected probe result."""
+        committed = dict(decision)
+        self._update_after_decision(
+            candidate,
+            bool(accepted),
+            float(committed.get("reward_ratio", 0.0)),
+            committed,
+        )
+        return committed
 
     def record_prefilter(self, candidate: V2Candidate, update_trust: bool = True) -> dict[str, Any]:
         if self.config.trust_region_enabled and update_trust:

@@ -128,6 +128,10 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
             bounds,
             lid_velocity=float(benchmark_cfg.get("lid_velocity", 1.0)),
             corner_width=float(model_cfg.get("hard_boundary_corner_width", 0.02)),
+            lid_lifting=str(model_cfg.get("hard_boundary_lid_lifting", "linear")),
+            lid_vertical_power=int(
+                model_cfg.get("hard_boundary_lid_vertical_power", 6)
+            ),
         )
     if formulation != "direct":
         raise ValueError(f"Unsupported model.physics_formulation: {formulation}")

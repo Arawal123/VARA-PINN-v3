@@ -10,7 +10,7 @@ import torch
 
 from src.physics.kovasznay import center_pressure
 from src.physics.navier_stokes import navier_stokes_residuals
-from src.visualization.streamlines import reconstruct_streamfunction
+from src.visualization.streamlines import detect_vortices, reconstruct_streamfunction
 
 
 def relative_l2(pred: np.ndarray, true: np.ndarray, min_reference_norm: float = 1e-8) -> float:
@@ -58,6 +58,7 @@ def evaluate_on_grid(
     device: torch.device,
     steady: bool = True,
     residual_interior_only: bool = False,
+    include_reference_metrics: bool = True,
 ) -> dict[str, float]:
     """Compute global evaluation metrics without using them for adaptation."""
     start = time.time()
@@ -66,7 +67,9 @@ def evaluate_on_grid(
     with torch.no_grad():
         pred = model(coords)
     residuals = navier_stokes_residuals(model, coords, nu=benchmark.nu, steady=steady)
-    has_reference = bool(getattr(benchmark, "has_reference", True))
+    has_reference = bool(include_reference_metrics) and bool(
+        getattr(benchmark, "has_reference", True)
+    )
     ref = benchmark.exact_np(coords_np) if has_reference else None
 
     u = pred[:, 0:1].detach().cpu().numpy()
@@ -159,7 +162,7 @@ def evaluate_on_grid(
         "wall_clock_eval_sec": time.time() - start,
         "num_eval_points": int(coords_np.shape[0]),
     }
-    metrics.update(_streamfunction_metrics(coords_np, u, v))
+    metrics.update(_streamfunction_metrics(benchmark, coords_np, u, v))
     if has_reference and ref is not None:
         has_p_ref = bool(ref.get("has_p_reference", np.isfinite(ref.get("p", np.array([]))).any()))
         has_omega_ref = bool(ref.get("has_omega_reference", np.isfinite(ref.get("omega", np.array([]))).any()))
@@ -215,7 +218,8 @@ def evaluate_on_grid(
                 "unweighted_data_loss": data_loss,
             }
         )
-    metrics.update(_cavity_profile_metrics(model, benchmark, device))
+    if include_reference_metrics:
+        metrics.update(_cavity_profile_metrics(model, benchmark, device))
     if benchmark.__class__.__name__.lower().startswith("liddrivencavity"):
         metrics.update(
             _cavity_residual_geometry_metrics(
@@ -279,6 +283,7 @@ def _finite_max(values: np.ndarray) -> float:
 
 
 def _streamfunction_metrics(
+    benchmark: Any,
     coords_np: np.ndarray,
     u: np.ndarray,
     v: np.ndarray,
@@ -291,6 +296,8 @@ def _streamfunction_metrics(
             "primary_vortex_center_x": float("nan"),
             "primary_vortex_center_y": float("nan"),
             "primary_streamfunction_abs": float("nan"),
+            "detected_vortex_count": 0,
+            "secondary_vortex_count": 0,
         }
     shape = (len(y_values), len(x_values))
     X, Y = np.meshgrid(x_values, y_values)
@@ -299,17 +306,30 @@ def _streamfunction_metrics(
         Y,
         np.asarray(u).reshape(shape),
         np.asarray(v).reshape(shape),
+        closed_boundary=benchmark.__class__.__name__.lower()
+        == "liddrivencavityqualitative",
     )
-    interior = np.abs(psi).copy()
-    if min(shape) > 2:
-        interior[[0, -1], :] = -np.inf
-        interior[:, [0, -1]] = -np.inf
-    index = np.unravel_index(int(np.argmax(interior)), shape)
+    vortices = detect_vortices(X, Y, psi)
+    if vortices:
+        primary = vortices[0]
+    else:
+        interior = np.abs(psi).copy()
+        if min(shape) > 2:
+            interior[[0, -1], :] = -np.inf
+            interior[:, [0, -1]] = -np.inf
+        index = np.unravel_index(int(np.argmax(interior)), shape)
+        primary = {
+            "x": float(X[index]),
+            "y": float(Y[index]),
+            "strength": float(abs(psi[index])),
+        }
     return {
         "streamfunction_consistency_rmse": float(consistency),
-        "primary_vortex_center_x": float(X[index]),
-        "primary_vortex_center_y": float(Y[index]),
-        "primary_streamfunction_abs": float(abs(psi[index])),
+        "primary_vortex_center_x": float(primary["x"]),
+        "primary_vortex_center_y": float(primary["y"]),
+        "primary_streamfunction_abs": float(primary["strength"]),
+        "detected_vortex_count": int(len(vortices)),
+        "secondary_vortex_count": int(max(0, len(vortices) - 1)),
     }
 
 

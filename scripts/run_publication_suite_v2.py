@@ -246,7 +246,7 @@ def _run_case(
     output: Path,
     device: str | None,
     ablations: dict[str, Any] | None = None,
-    budget_type: str = "optimizer_steps",
+    budget_type: str = "applied_optimizer_steps",
     budget_value: float | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
@@ -367,7 +367,11 @@ def _case_config(name: str, quick: bool) -> dict[str, Any]:
                     "gradient_probe_interior": 12,
                     "gradient_probe_boundary": 8,
                 },
-                "compute_budget": {"enabled": True, "type": "optimizer_steps", "value": 4},
+                "compute_budget": {
+                    "enabled": True,
+                    "type": "applied_optimizer_steps",
+                    "value": 4,
+                },
             },
         )
     return config
@@ -391,7 +395,13 @@ def _primary_metric(metrics: dict[str, Any]) -> tuple[str, float]:
 def _mean_std(raw: pd.DataFrame) -> pd.DataFrame:
     rows = []
     keys = ["study", "benchmark_case", "backbone", "method"]
-    metrics = ["primary_metric_value", *REPORT_METRICS, "training_wall_clock_sec", "optimizer_steps"]
+    metrics = [
+        "primary_metric_value",
+        *REPORT_METRICS,
+        "training_wall_clock_sec",
+        "optimizer_steps",
+        "applied_optimizer_steps",
+    ]
     for group_key, group in raw.groupby(keys, dropna=False):
         identity = dict(zip(keys, group_key))
         for metric in metrics:

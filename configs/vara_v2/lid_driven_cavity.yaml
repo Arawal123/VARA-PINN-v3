@@ -33,8 +33,8 @@ optimizer:
 
 training:
   pointwise_reduction: mean
-  adaptive_cycles: 1
-  epochs_per_cycle: 400
+  adaptive_cycles: 8
+  epochs_per_cycle: 50
   log_every: 25
   n_collocation: 2048
   n_boundary: 768
@@ -115,6 +115,9 @@ controller_v2:
   target_noise_ceiling: 0.25
   guard_noise_ceiling: 0.10
   reliable_reward_ratio: 0.75
+  counterfactual_probe_enabled: true
+  counterfactual_target_margin: 0.005
+  counterfactual_guard_margin: 0.02
   gradient_prefilter_enabled: true
   trust_region_enabled: true
   action_memory_enabled: true

@@ -58,7 +58,13 @@ class ExperimentTrainer:
         self.steady = bool(config.get("pde", {}).get("steady", True))
         self.model = build_mlp_from_config(config, self.benchmark.bounds).to(self.device)
         optim_cfg = config.get("optimizer", {})
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(optim_cfg.get("lr", 1e-3)))
+        self.base_learning_rate = float(optim_cfg.get("lr", 1e-3))
+        self.max_gradient_norm = float(optim_cfg.get("max_grad_norm", 0.0))
+        self.learning_rate_schedule = dict(optim_cfg.get("scheduler", {}))
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.base_learning_rate,
+        )
         self.optimizer_stage = "adam"
         self.final_repair_status: dict[str, Any] = {}
         self.continuation_anchor_model: torch.nn.Module | None = None
@@ -74,6 +80,9 @@ class ExperimentTrainer:
         self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
+        self.early_stop_history: list[float] = []
+        self.early_stopped = False
+        self.early_stop_step: int | None = None
         self.compute_tracker = ComputeTracker(dict(config.get("compute_budget", {})))
 
         patch_cfg = config.get("patches", {})
@@ -129,17 +138,51 @@ class ExperimentTrainer:
         self.last_losses: dict[str, float] = {}
 
         t_bounds = getattr(self.benchmark, "t_bounds", None)
-        self.uniform_sampler = UniformSampler(self.benchmark.bounds, self.device, self.seed, t_bounds=t_bounds)
-        self.boundary_sampler = BoundarySampler(self.benchmark.bounds, self.device, self.seed + 1, t_bounds=t_bounds)
         sampler_cfg = config.get("sampling", {})
+        uniform_engine = str(
+            sampler_cfg.get("uniform", {}).get("engine", "random")
+        )
+        self.uniform_sampler = UniformSampler(
+            self.benchmark.bounds,
+            self.device,
+            self.seed,
+            t_bounds=t_bounds,
+            engine=uniform_engine,
+        )
+        self.boundary_sampler = BoundarySampler(self.benchmark.bounds, self.device, self.seed + 1, t_bounds=t_bounds)
         self.adaptive_sampler = MixedAdaptiveSampler(
             self.benchmark.bounds,
             self.patch_grid,
             self.device,
             self.seed + 2,
             mixture=sampler_cfg.get("mixture"),
+            uniform_engine=uniform_engine,
         )
         self._initialize_continuation_replay()
+
+    def sampling_state_snapshot(self) -> dict[str, Any]:
+        return {
+            "uniform": self.uniform_sampler.snapshot(),
+            "boundary_rng": deepcopy(self.boundary_sampler.rng.bit_generator.state),
+            "adaptive_rng": deepcopy(self.adaptive_sampler.rng.bit_generator.state),
+            "adaptive_uniform": self.adaptive_sampler.uniform.snapshot(),
+            "region_rng": deepcopy(
+                self.adaptive_sampler.region_sampler.rng.bit_generator.state
+            ),
+        }
+
+    def restore_sampling_state(self, snapshot: dict[str, Any]) -> None:
+        self.uniform_sampler.restore(snapshot["uniform"])
+        self.boundary_sampler.rng.bit_generator.state = deepcopy(
+            snapshot["boundary_rng"]
+        )
+        self.adaptive_sampler.rng.bit_generator.state = deepcopy(
+            snapshot["adaptive_rng"]
+        )
+        self.adaptive_sampler.uniform.restore(snapshot["adaptive_uniform"])
+        self.adaptive_sampler.region_sampler.rng.bit_generator.state = deepcopy(
+            snapshot["region_rng"]
+        )
 
     def _maybe_load_warm_start(self, config: dict[str, Any]) -> dict[str, Any]:
         checkpoint = config.get("warm_start_checkpoint")
@@ -275,11 +318,23 @@ class ExperimentTrainer:
         )
 
     def controller_metrics(self, coords: np.ndarray) -> dict[str, float]:
-        metrics = self.evaluate_metrics(coords)
         enabled = bool(
             self.config.get("evaluation", {}).get(
                 "controller_reference_metrics_enabled",
                 True,
+            )
+        )
+        metrics = (
+            self.evaluate_metrics(coords)
+            if enabled
+            else evaluate_on_grid(
+                self.model,
+                self.benchmark,
+                coords,
+                self.device,
+                self.steady,
+                residual_interior_only=self.residual_interior_only(),
+                include_reference_metrics=False,
             )
         )
         if enabled:
@@ -383,6 +438,7 @@ class ExperimentTrainer:
             )
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
 
@@ -390,6 +446,7 @@ class ExperimentTrainer:
             last_losses.update(local_logs)
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log({"cycle": cycle, "phase": log_prefix or "main", "epoch": self.global_step, **last_losses})
@@ -749,6 +806,47 @@ class ExperimentTrainer:
                 total += float(torch.sum(p.grad.detach() ** 2).cpu())
         return float(math.sqrt(total))
 
+    def prepare_optimizer_step(self) -> float:
+        """Apply shared clipping and a deterministic applied-step LR schedule."""
+        if self.max_gradient_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.max_gradient_norm,
+            )
+        learning_rate = self.base_learning_rate
+        cfg = self.learning_rate_schedule
+        if bool(cfg.get("enabled", False)):
+            total_steps = int(
+                cfg.get(
+                    "total_steps",
+                    self.config.get("controller_v2", {}).get(
+                        "total_steps",
+                        int(self.config.get("training", {}).get("adaptive_cycles", 1))
+                        * int(self.config.get("training", {}).get("epochs_per_cycle", 1)),
+                    ),
+                )
+            )
+            warmup_steps = max(0, int(cfg.get("warmup_steps", 0)))
+            minimum_ratio = float(cfg.get("min_lr_ratio", 0.1))
+            step = max(0, int(self.global_step))
+            if warmup_steps > 0 and step < warmup_steps:
+                start_ratio = float(cfg.get("warmup_start_ratio", 0.2))
+                fraction = step / max(warmup_steps, 1)
+                ratio = start_ratio + (1.0 - start_ratio) * fraction
+            else:
+                progress = (step - warmup_steps) / max(
+                    total_steps - warmup_steps - 1,
+                    1,
+                )
+                progress = min(max(progress, 0.0), 1.0)
+                ratio = minimum_ratio + 0.5 * (1.0 - minimum_ratio) * (
+                    1.0 + math.cos(math.pi * progress)
+                )
+            learning_rate = self.base_learning_rate * ratio
+        for group in self.optimizer.param_groups:
+            group["lr"] = learning_rate
+        return float(learning_rate)
+
     def _model_snapshot(self) -> dict[str, torch.Tensor]:
         return {name: value.detach().cpu().clone() for name, value in self.model.state_dict().items()}
 
@@ -793,6 +891,7 @@ class ExperimentTrainer:
         return self.make_batch(xy_f, xy_bc, xy_data)
 
     def evaluate_and_save_final(self) -> dict[str, float]:
+        self._restore_best_checkpoint_if_enabled()
         X, Y, coords = self.test_grid()
         phase_start = time.perf_counter()
         metrics = self.evaluate_metrics(coords)
@@ -827,6 +926,8 @@ class ExperimentTrainer:
             0 if self.continuation_replay_points is None else self.continuation_replay_points.shape[0]
         )
         metrics["reportable"] = metrics["run_type"] != "smoke"
+        metrics["early_stopped"] = bool(self.early_stopped)
+        metrics["early_stop_step"] = self.early_stop_step
         metrics["collapse_evaluated"] = bool(metrics["reportable"])
         metrics["collapsed"] = self._collapsed(metrics)
         metrics.update(self.compute_tracker.summary())
@@ -935,19 +1036,55 @@ class ExperimentTrainer:
         if "momentum_u_residual" in maps and "momentum_v_residual" in maps:
             momentum = np.sqrt(maps["momentum_u_residual"] ** 2 + maps["momentum_v_residual"] ** 2)
             save_heatmap(momentum.reshape(shape), X, Y, self.figure_dir / "momentum_residual.png", "momentum_residual")
+        streamline_x = X
+        streamline_y = Y
+        streamline_u = maps["u_pred"].reshape(shape)
+        streamline_v = maps["v_pred"].reshape(shape)
+        visualization_cfg = dict(self.config.get("visualization", {}))
+        visualization_nx = int(visualization_cfg.get("nx", shape[1]))
+        visualization_ny = int(visualization_cfg.get("ny", shape[0]))
+        if visualization_nx != shape[1] or visualization_ny != shape[0]:
+            streamline_x, streamline_y, streamline_coords_np = self.benchmark.grid(
+                visualization_nx,
+                visualization_ny,
+            )
+            streamline_coords = torch.tensor(
+                streamline_coords_np,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.model.eval()
+            with torch.no_grad():
+                streamline_prediction = self.model(streamline_coords)
+            streamline_u = (
+                streamline_prediction[:, 0:1]
+                .detach()
+                .cpu()
+                .numpy()
+                .reshape(streamline_x.shape)
+            )
+            streamline_v = (
+                streamline_prediction[:, 1:2]
+                .detach()
+                .cpu()
+                .numpy()
+                .reshape(streamline_x.shape)
+            )
         save_streamlines(
-            X,
-            Y,
-            maps["u_pred"].reshape(shape),
-            maps["v_pred"].reshape(shape),
+            streamline_x,
+            streamline_y,
+            streamline_u,
+            streamline_v,
             self.figure_dir / "streamlines.png",
+            closed_boundary=self._is_lid_driven_cavity(),
         )
         save_streamfunction_contours(
-            X,
-            Y,
-            maps["u_pred"].reshape(shape),
-            maps["v_pred"].reshape(shape),
+            streamline_x,
+            streamline_y,
+            streamline_u,
+            streamline_v,
             self.figure_dir / "streamfunction_contours.png",
+            closed_boundary=self._is_lid_driven_cavity(),
         )
 
     def maybe_checkpoint(self, cycle: int, metrics: dict[str, float]) -> None:
@@ -974,12 +1111,103 @@ class ExperimentTrainer:
                 + metrics.get("p_rel_l2_centered", 0.0)
                 + metrics.get("omega_rel_l2", 0.0)
             )
+        checkpoint_cfg = dict(self.config.get("checkpoint", {}))
+        metric_names = list(
+            checkpoint_cfg.get(
+                "reference_free_metrics",
+                [
+                    "momentum_residual_mean",
+                    "continuity_residual_mean",
+                    "boundary_condition_error",
+                    "streamfunction_consistency_rmse",
+                ],
+            )
+        )
+        floor = float(checkpoint_cfg.get("metric_floor", 1e-8))
+        values = [
+            max(float(metrics[name]), floor)
+            for name in metric_names
+            if name in metrics and math.isfinite(float(metrics[name]))
+        ]
+        if values:
+            return float(math.exp(sum(math.log(value) for value in values) / len(values)))
         pde = float(metrics.get("unweighted_pde_loss", float("nan")))
         boundary = float(metrics.get("unweighted_bc_loss", float("nan")))
         if math.isfinite(pde) and math.isfinite(boundary):
             return pde + boundary
         fallback = float(metrics.get("pde_residual_mean", float("inf")))
         return fallback if math.isfinite(fallback) else math.inf
+
+    def should_stop_early(self, metrics: dict[str, Any]) -> bool:
+        """Stop only after a valid, stable reference-free convergence window."""
+        cfg = dict(self.config.get("convergence_early_stopping", {}))
+        if not bool(cfg.get("enabled", False)):
+            return False
+        minimum = int(
+            cfg.get(
+                "min_steps_warm_start"
+                if self.warm_start_status.get("loaded")
+                else "min_steps_initial",
+                0,
+            )
+        )
+        score = self._checkpoint_score(metrics)
+        if math.isfinite(score):
+            self.early_stop_history.append(score)
+        if self.global_step < minimum or not self._passes_reference_free_validity(metrics):
+            return False
+        patience = max(2, int(cfg.get("patience", 3)))
+        if len(self.early_stop_history) < patience:
+            return False
+        window = self.early_stop_history[-patience:]
+        scale = max(min(window), float(cfg.get("score_floor", 1e-12)))
+        relative_spread = (max(window) - min(window)) / scale
+        latest_is_stable = window[-1] <= min(window) * (
+            1.0 + float(cfg.get("latest_degradation_tolerance", 0.01))
+        )
+        if relative_spread <= float(cfg.get("relative_tolerance", 0.03)) and latest_is_stable:
+            self.early_stopped = True
+            self.early_stop_step = int(self.global_step)
+            self.compute_tracker.stop_reason = "reference_free_convergence"
+            return True
+        return False
+
+    def _passes_reference_free_validity(self, metrics: dict[str, Any]) -> bool:
+        cfg = dict(self.config.get("continuation_validity", {}))
+        if not bool(cfg.get("enabled", False)):
+            return True
+        maximums = {
+            "pde_residual_mean": cfg.get("max_pde_residual_mean", math.inf),
+            "continuity_residual_mean": cfg.get(
+                "max_continuity_residual_mean", math.inf
+            ),
+            "momentum_residual_mean": cfg.get(
+                "max_momentum_residual_mean", math.inf
+            ),
+            "boundary_condition_error": cfg.get(
+                "max_boundary_condition_error", math.inf
+            ),
+            "speed_pred_max": cfg.get("max_speed_pred", math.inf),
+            "streamfunction_consistency_rmse": cfg.get(
+                "max_streamfunction_consistency_rmse", math.inf
+            ),
+        }
+        for name, maximum in maximums.items():
+            value = float(metrics.get(name, float("nan")))
+            if not math.isfinite(value) or value > float(maximum):
+                return False
+        psi = float(metrics.get("primary_streamfunction_abs", float("nan")))
+        return math.isfinite(psi) and psi >= float(
+            cfg.get("min_primary_streamfunction_abs", 0.0)
+        )
+
+    def _restore_best_checkpoint_if_enabled(self) -> None:
+        cfg = dict(self.config.get("checkpoint", {}))
+        path = self.checkpoint_dir / "best.pt"
+        if bool(cfg.get("restore_best_before_final", False)) and path.exists():
+            payload = load_checkpoint(path, self.model, optimizer=None)
+            self.final_repair_status["restored_best_checkpoint"] = True
+            self.final_repair_status["best_checkpoint_epoch"] = payload.get("epoch")
 
     def _collapsed(self, metrics: dict[str, Any]) -> bool:
         if not bool(metrics.get("collapse_evaluated", True)):

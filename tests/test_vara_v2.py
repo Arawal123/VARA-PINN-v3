@@ -26,10 +26,11 @@ from src.physics.navier_stokes import navier_stokes_residuals
 from src.physics.rectangular_benchmarks import LidDrivenCavityQualitative
 from src.physics.taylor_green import TaylorGreenVortex
 from src.training.checkpointing import save_checkpoint
+from src.training.vara_trainer import VARATrainer
 from src.training.vara_v2_trainer import VARAV2Trainer
 from src.utils.config import deep_update, load_config
 from src.utils.logging import CSVLogger
-from src.visualization.streamlines import reconstruct_streamfunction
+from src.visualization.streamlines import detect_vortices, reconstruct_streamfunction
 
 
 def test_v2_allocation_conserves_sampling_and_loss_mass():
@@ -111,7 +112,10 @@ def test_v2_rejects_reference_or_test_signal_names():
             controller.assert_reference_free([name])
 
 
-def test_v2_publication_config_hides_reference_metrics_from_legacy_controller(tmp_path):
+def test_v2_publication_config_hides_reference_metrics_from_legacy_controller(
+    tmp_path,
+    monkeypatch,
+):
     config = load_config("configs/vara_v2/lid_driven_cavity.yaml")
     config = deep_update(config, load_config("configs/vara_v2/controller.yaml"))
     config = deep_update(
@@ -130,6 +134,13 @@ def test_v2_publication_config_hides_reference_metrics_from_legacy_controller(tm
     trainer = VARAV2Trainer(config)
     _, _, coords = trainer.validation_grid()
     reporting = trainer.evaluate_metrics(coords)
+    monkeypatch.setattr(
+        type(trainer.benchmark),
+        "exact_np",
+        lambda _self, _coords: (_ for _ in ()).throw(
+            AssertionError("controller path loaded evaluation reference")
+        ),
+    )
     controller = trainer.controller_metrics(coords)
     assert np.isfinite(reporting["centerline_profile_score"])
     assert np.isnan(controller["centerline_profile_score"])
@@ -216,6 +227,79 @@ def test_cavity_hard_boundary_wrapper_enforces_regularized_walls():
     assert torch.allclose(velocity[4:], torch.zeros_like(velocity[4:]), atol=1e-12)
 
 
+def test_harmonic_cavity_lifting_reduces_couette_interior_bias():
+    class ZeroBase(torch.nn.Module):
+        def forward(self, coords):
+            return torch.zeros((coords.shape[0], 3), dtype=coords.dtype, device=coords.device)
+
+    linear = CavityHardBoundaryWrapper(
+        ZeroBase(),
+        (0.0, 1.0, 0.0, 1.0),
+        lid_velocity=1.0,
+        corner_width=0.02,
+        lid_lifting="linear",
+    )
+    harmonic = CavityHardBoundaryWrapper(
+        ZeroBase(),
+        (0.0, 1.0, 0.0, 1.0),
+        lid_velocity=1.0,
+        corner_width=0.02,
+        lid_lifting="harmonic",
+    )
+    center = torch.tensor([[0.5, 0.5]], dtype=torch.float64)
+    lid = torch.tensor([[0.5, 1.0]], dtype=torch.float64)
+    assert harmonic(center)[0, 0].item() < linear(center)[0, 0].item()
+    assert harmonic(lid)[0, 0].item() == pytest.approx(1.0)
+
+
+def test_divergence_free_cavity_lifting_satisfies_walls_and_continuity():
+    class ZeroBase(torch.nn.Module):
+        def forward(self, coords):
+            return torch.zeros(
+                (coords.shape[0], 3),
+                dtype=coords.dtype,
+                device=coords.device,
+            )
+
+    model = CavityHardBoundaryWrapper(
+        ZeroBase(),
+        (0.0, 1.0, 0.0, 1.0),
+        lid_velocity=1.0,
+        corner_width=0.05,
+        lid_lifting="divergence_free",
+    )
+    interior = torch.tensor(
+        [[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    velocity = model(interior)[:, :2]
+    du_dx = torch.autograd.grad(
+        velocity[:, 0].sum(),
+        interior,
+        create_graph=True,
+    )[0][:, 0]
+    dv_dy = torch.autograd.grad(
+        velocity[:, 1].sum(),
+        interior,
+        create_graph=True,
+    )[0][:, 1]
+    assert torch.max(torch.abs(du_dx + dv_dy)).item() < 1e-10
+
+    walls = torch.tensor(
+        [[0.0, 0.4], [1.0, 0.4], [0.5, 0.0], [0.5, 1.0]],
+        dtype=torch.float64,
+    )
+    wall_velocity = model(walls)[:, :2]
+    assert torch.allclose(
+        wall_velocity[:3],
+        torch.zeros_like(wall_velocity[:3]),
+        atol=1e-12,
+    )
+    assert wall_velocity[3, 0].item() == pytest.approx(1.0)
+    assert wall_velocity[3, 1].item() == pytest.approx(0.0)
+
+
 def test_regularized_cavity_target_matches_hard_boundary_corners():
     benchmark = LidDrivenCavityQualitative(lid_corner_regularization_width=0.1)
     points = torch.tensor(
@@ -262,6 +346,28 @@ def test_streamfunction_reconstruction_is_consistent_for_divergence_free_field()
     exact -= exact[0, 0]
     assert consistency < 1e-4
     assert np.sqrt(np.mean((psi - exact) ** 2)) < 1e-4
+
+
+def test_closed_cavity_reconstruction_detects_physical_vortex():
+    x = np.linspace(0.0, 1.0, 101)
+    y = np.linspace(0.0, 1.0, 101)
+    X, Y = np.meshgrid(x, y)
+    exact = -X * (1.0 - X) * Y * (1.0 - Y)
+    U = -X * (1.0 - X) * (1.0 - 2.0 * Y)
+    V = (1.0 - 2.0 * X) * Y * (1.0 - Y)
+    psi, consistency = reconstruct_streamfunction(
+        X,
+        Y,
+        U,
+        V,
+        closed_boundary=True,
+    )
+    vortices = detect_vortices(X, Y, psi)
+    assert consistency < 1e-4
+    assert np.sqrt(np.mean((psi - exact) ** 2)) < 1e-4
+    assert vortices
+    assert vortices[0]["x"] == pytest.approx(0.5, abs=0.02)
+    assert vortices[0]["y"] == pytest.approx(0.5, abs=0.02)
 
 
 def test_cavity_residual_metrics_can_exclude_singular_boundary_points():
@@ -338,10 +444,63 @@ def test_v2_smoke_has_exact_step_budget_and_controller_accounting(tmp_path):
         },
     )
     metrics = VARAV2Trainer(config).run()
-    assert metrics["optimizer_steps"] == 4
-    assert metrics["probe_optimizer_steps"] == 1
+    assert metrics["applied_optimizer_steps"] == 4
+    assert metrics["optimizer_steps"] == 8
+    assert metrics["probe_optimizer_steps"] == 5
     assert metrics["controller_gradient_evaluations"] > 0
     assert metrics["controller_gradient_point_evaluations"] > 0
+
+
+def test_v2_neutral_path_matches_vanilla_exactly(tmp_path):
+    config = load_config("configs/vara_v2/lid_driven_cavity.yaml")
+    config = deep_update(
+        config,
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "adaptive_cycles": 2,
+                "epochs_per_cycle": 2,
+                "n_collocation": 24,
+                "n_boundary": 8,
+                "n_data": 0,
+                "log_every": 8,
+            },
+            "validation": {"nx": 6, "ny": 6},
+            "test": {"nx": 6, "ny": 6},
+            "patches": {"nx_patches": 2, "ny_patches": 2},
+            "controller_v2": {
+                "total_steps": 4,
+                "warmup_steps": 2,
+                "control_blocks": 1,
+                "block_steps": 2,
+                "probe_steps": 1,
+                "max_candidates": 0,
+                "gradient_probe_interior": 8,
+                "gradient_probe_boundary": 4,
+            },
+            "checkpoint": {"restore_best_before_final": False},
+        },
+    )
+    vanilla_config = deepcopy(config)
+    vanilla_config["experiments"] = {
+        "root": str(tmp_path / "vanilla"),
+        "flat_layout": True,
+    }
+    v2_config = deepcopy(config)
+    v2_config["experiments"] = {
+        "root": str(tmp_path / "vara_v2"),
+        "flat_layout": True,
+    }
+    vanilla = VARATrainer(vanilla_config, mode="vanilla_pinn")
+    vara_v2 = VARAV2Trainer(v2_config)
+    vanilla.run()
+    vara_v2.run()
+    for vanilla_parameter, v2_parameter in zip(
+        vanilla.model.parameters(),
+        vara_v2.model.parameters(),
+    ):
+        assert torch.equal(vanilla_parameter, v2_parameter)
 
 
 def test_publication_runner_preserves_v2_schedule_and_ablation_overrides(tmp_path):

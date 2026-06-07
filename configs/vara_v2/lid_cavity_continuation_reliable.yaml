@@ -2,7 +2,7 @@
 benchmark_params:
   # The mathematical cavity has singular top corners. Use the same explicit
   # regularization in the target and hard-boundary output transform.
-  lid_corner_regularization_width: 0.10
+  lid_corner_regularization_width: 0.02
 
 model:
   # The smooth low-Re starting problem converges more reliably with the
@@ -10,14 +10,21 @@ model:
   architecture: mlp
   hidden_layers: [64, 64, 64]
   physics_formulation: cavity_hard_boundary
-  hard_boundary_corner_width: 0.10
+  hard_boundary_corner_width: 0.02
+  # The harmonic lift is the best quantitative option in the controlled
+  # pilots. The divergence-free geometric lift remains available explicitly
+  # for architecture ablations, but is not silently enabled here.
+  hard_boundary_lid_lifting: harmonic
 
 training:
   pointwise_reduction: mean
   adaptive_cycles: 10
   epochs_per_cycle: 200
   n_collocation: 1024
-  n_boundary: 256
+  # Velocity walls are exact under the hard-boundary wrapper. A small boundary
+  # probe remains for verification without spending a quarter of every batch
+  # on identically zero boundary losses.
+  n_boundary: 64
   n_data: 0
   log_every: 50
   weights:
@@ -35,12 +42,28 @@ training:
 
 controller_v2:
   total_steps: 2000
-  warmup_steps: 500
-  control_blocks: 10
-  block_steps: 150
-  probe_steps: 20
+  # Align every neutral controller boundary with Vanilla's 200-step
+  # collocation refresh. When no action is accepted, both trajectories are
+  # therefore exactly identical.
+  warmup_steps: 400
+  control_blocks: 8
+  block_steps: 200
+  probe_steps: 10
   gradient_probe_interior: 256
   gradient_probe_boundary: 64
+  counterfactual_probe_enabled: true
+  counterfactual_target_margin: 0.005
+  counterfactual_guard_margin: 0.02
+  guard_metrics:
+    - pde_residual_mean
+    - continuity_residual_mean
+    - momentum_residual_mean
+    - boundary_condition_error
+    - unweighted_validation_loss
+    - streamfunction_consistency_rmse
+    - centerline_pde_residual_mean
+    - centerline_continuity_residual_mean
+    - corner_pde_residual_mean
 
 continuation_anchor:
   enabled: false
@@ -53,6 +76,30 @@ continuation_replay:
   fields: velocity
   seed_offset: 104729
 
+sampling:
+  uniform:
+    engine: sobol
+
+checkpoint:
+  restore_best_before_final: true
+  reference_free_metrics:
+    - momentum_residual_mean
+    - continuity_residual_mean
+    - streamfunction_consistency_rmse
+    - centerline_pde_residual_mean
+    - centerline_continuity_residual_mean
+  metric_floor: 1.0e-8
+
+convergence_early_stopping:
+  enabled: true
+  # These are minimums, not fixed budgets. A stage automatically continues to
+  # the full 2000-step ceiling whenever validity or stability is not achieved.
+  min_steps_initial: 1200
+  min_steps_warm_start: 600
+  patience: 3
+  relative_tolerance: 0.03
+  latest_degradation_tolerance: 0.01
+
 validation:
   nx: 64
   ny: 64
@@ -60,6 +107,12 @@ validation:
 test:
   nx: 96
   ny: 96
+
+visualization:
+  # Plotting uses only a forward pass, so a denser grid reveals genuine small
+  # corner recirculations without changing training or evaluation metrics.
+  nx: 192
+  ny: 192
 
 evaluation:
   # PDE residuals are interior equations. Wall accuracy is reported by the

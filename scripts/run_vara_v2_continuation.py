@@ -104,7 +104,11 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     "gradient_probe_interior": 12,
                     "gradient_probe_boundary": 8,
                 },
-                "compute_budget": {"enabled": True, "type": "optimizer_steps", "value": 4},
+                "compute_budget": {
+                    "enabled": True,
+                    "type": "applied_optimizer_steps",
+                    "value": 4,
+                },
             },
         )
     if args.device:

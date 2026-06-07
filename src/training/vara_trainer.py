@@ -139,6 +139,8 @@ class VARATrainer(ExperimentTrainer):
             self.actions_logger.log(record)
             self.action_records.append(record)
             self.maybe_checkpoint(cycle, metrics)
+            if self.should_stop_early(metrics):
+                break
             batch = self.resample_batch(
                 batch,
                 maps,
@@ -174,6 +176,8 @@ class VARATrainer(ExperimentTrainer):
             self.actions_logger.log(record)
             self.action_records.append(record)
             self.maybe_checkpoint(cycle, metrics)
+            if self.should_stop_early(metrics):
+                break
             batch = self.resample_batch(batch, maps, coords, [], None, adaptive=False)
 
         self.run_final_physics_repair(cycle=cycles, log_prefix="final_physics_repair")
@@ -250,6 +254,7 @@ class VARATrainer(ExperimentTrainer):
             attention_logs["pressure_gauge"] = float(gauge_loss.detach().cpu())
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             for logits in (interior_logits, boundary_logits):
                 if logits.grad is not None:
@@ -265,6 +270,7 @@ class VARATrainer(ExperimentTrainer):
             last_losses.update(attention_logs)
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log(
@@ -330,6 +336,7 @@ class VARATrainer(ExperimentTrainer):
             total = total + anchor_loss + replay_loss + gauge_loss
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -341,6 +348,7 @@ class VARATrainer(ExperimentTrainer):
             last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log(
@@ -406,6 +414,7 @@ class VARATrainer(ExperimentTrainer):
             total = total + anchor_loss + replay_loss + gauge_loss
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -417,6 +426,7 @@ class VARATrainer(ExperimentTrainer):
             last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log(
@@ -471,6 +481,7 @@ class VARATrainer(ExperimentTrainer):
             total = total + anchor_loss + replay_loss + gauge_loss
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -483,6 +494,7 @@ class VARATrainer(ExperimentTrainer):
             last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log(
@@ -530,6 +542,7 @@ class VARATrainer(ExperimentTrainer):
             total = total + anchor_loss + replay_loss + gauge_loss
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -541,6 +554,7 @@ class VARATrainer(ExperimentTrainer):
             last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log(

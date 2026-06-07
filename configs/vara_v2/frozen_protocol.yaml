@@ -11,7 +11,7 @@ protocol:
     - lid_cavity_re100_400_1000_1600_3200
   controller_config: configs/vara_v2/controller.yaml
   primary_compute_budget:
-    type: optimizer_steps
+    type: applied_optimizer_steps
     value: 400
   no_per_benchmark_controller_tuning: true
   full_field_reference_is_evaluation_only: true

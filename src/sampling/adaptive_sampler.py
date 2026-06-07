@@ -20,12 +20,13 @@ class MixedAdaptiveSampler:
         device: torch.device,
         seed: int | None = None,
         mixture: dict[str, float] | None = None,
+        uniform_engine: str = "random",
     ) -> None:
         self.bounds = bounds
         self.patch_grid = patch_grid
         self.device = device
         self.rng = np.random.default_rng(seed)
-        self.uniform = UniformSampler(bounds, device, seed)
+        self.uniform = UniformSampler(bounds, device, seed, engine=uniform_engine)
         self.region_sampler = RegionSampler(patch_grid, device, seed)
         self.mixture = mixture or {
             "uniform": 0.50,

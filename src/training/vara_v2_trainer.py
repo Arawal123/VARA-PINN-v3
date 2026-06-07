@@ -12,7 +12,6 @@ import pandas as pd
 import torch
 
 from src.controllers import (
-    ALLOWED_GUARD_METRICS,
     V2Candidate,
     V2ControllerConfig,
     VARAV2Controller,
@@ -48,7 +47,12 @@ class VARAV2Trainer(ExperimentTrainer):
         self.rejected_interventions = 0
         self.prefiltered_interventions = 0
         self.rollback_enabled = bool(cfg.get("rollback_enabled", True))
+        sampling_snapshot = self.sampling_state_snapshot()
         self._probe_batch = self._make_probe_batch()
+        # The fixed controller probe must not advance the optimization
+        # samplers. Otherwise a neutral V2 run starts from different points
+        # than Vanilla even when both use the same seed.
+        self.restore_sampling_state(sampling_snapshot)
 
     def run(self) -> dict[str, float]:
         self.compute_tracker.start()
@@ -63,7 +67,30 @@ class VARAV2Trainer(ExperimentTrainer):
             raise ValueError("controller_v2.probe_steps must be between zero and block_steps.")
 
         batch = self.initial_batch()
-        self._train_v2_steps(batch, warmup_steps, cycle=0, phase="v2_warmup")
+        # Use the same neutral resampling cadence as the comparison trainer.
+        # A long V2 warm-up on one fixed batch is not equivalent to Vanilla
+        # split into several ordinary cycles, even at equal optimizer steps.
+        neutral_cycle_steps = max(
+            1,
+            int(self.config.get("training", {}).get("epochs_per_cycle", warmup_steps)),
+        )
+        warmup_remaining = warmup_steps
+        warmup_cycle = 0
+        while warmup_remaining > 0:
+            chunk = min(neutral_cycle_steps, warmup_remaining)
+            self._train_v2_steps(
+                batch,
+                chunk,
+                cycle=warmup_cycle,
+                phase="v2_warmup",
+            )
+            warmup_remaining -= chunk
+            _, _, warmup_coords = self.validation_grid()
+            warmup_metrics = self.controller_metrics(warmup_coords)
+            self.maybe_checkpoint(warmup_cycle, warmup_metrics)
+            warmup_cycle += 1
+            if warmup_remaining > 0:
+                batch = self._resample_v2_batch({}, warmup_coords)
 
         for block in range(control_blocks):
             maps_before, raw_before, names, weak_regions, coords = self._diagnose_reference_free()
@@ -72,90 +99,249 @@ class VARAV2Trainer(ExperimentTrainer):
             candidates = self.v2_controller.candidates(weak_regions)
             influence = self._candidate_influence(candidates)
             ranked = self.v2_controller.rank(candidates, influence)
-            candidate = next((item for item in ranked if not item.prefiltered), None)
+            active_candidates = [item for item in ranked if not item.prefiltered]
+            # Match the baseline cycle order exactly: diagnose the completed
+            # cycle, draw the next cycle's batch, and then optimize it. Keep
+            # the pre-draw sampler state so neutral and proposed allocations
+            # are counterfactual draws from the same sequence position.
+            sampling_snapshot = self.sampling_state_snapshot()
+            neutral_batch = self._resample_v2_batch(maps_before, coords)
+            neutral_sampling_snapshot = self.sampling_state_snapshot()
             prefiltered = [item for item in ranked if item.prefiltered]
             self.prefiltered_interventions += len(prefiltered)
             for index, rejected in enumerate(prefiltered):
                 decision = self.v2_controller.record_prefilter(
                     rejected,
-                    update_trust=candidate is None and index == 0,
+                    update_trust=not active_candidates and index == 0,
                 )
                 self._log_decision(block, rejected, decision)
 
-            if candidate is None:
-                self._train_v2_steps(batch, block_steps, cycle=block + 1, phase="v2_no_action")
+            if not active_candidates:
+                self._train_v2_steps(
+                    neutral_batch,
+                    block_steps,
+                    cycle=warmup_cycle + block,
+                    phase="v2_no_action",
+                )
                 maps_kept, _raw_kept, _names_kept, _weak_kept, coords_kept = (
                     self._diagnose_reference_free(update_history=False)
                 )
-                batch = self._resample_v2_batch(maps_kept, coords_kept)
                 self._log_state(block)
+                block_metrics = self.controller_metrics(coords_kept)
+                self.maybe_checkpoint(warmup_cycle + block, block_metrics)
+                if self.should_stop_early(block_metrics):
+                    break
                 continue
 
             model_snapshot = self._model_snapshot()
             optimizer_snapshot = deepcopy(self.optimizer.state_dict())
             controller_snapshot = self.v2_controller.state.snapshot()
             trust_before = self.v2_controller.trust_radius
-            self.v2_controller.apply(candidate)
-            # Sampling actions must be evaluated on the allocation they
-            # propose. Probing the old batch makes sampling-only candidates
-            # observationally identical to doing nothing.
-            proposal_batch = self._resample_v2_batch(maps_before, coords)
-            self._train_v2_steps(
-                proposal_batch,
-                probe_steps,
-                cycle=block + 1,
-                phase="v2_trust_probe",
-                probe=True,
-            )
-            _maps_after, raw_after, names_after, _weak_after, coords_after = self._diagnose_reference_free(
-                update_history=False
-            )
-            metrics_after = self._guard_metrics(coords_after)
-            before_target = self._candidate_score(candidate, raw_before, names)
-            after_target = self._candidate_score(candidate, raw_after, names_after)
-            accepted, decision = self.v2_controller.evaluate(
-                candidate,
-                before_target,
-                after_target,
-                metrics_before,
-                metrics_after,
-            )
-            decision.update(
-                {
-                    "block": block,
-                    "prefiltered": False,
-                    "gradient_compatibility": candidate.gradient_compatibility,
-                    "rank_score": candidate.rank_score,
-                    "trust_radius_before": trust_before,
-                }
-            )
-            committed = bool(accepted or not self.rollback_enabled)
-            decision["committed"] = committed
-            if accepted:
-                self.accepted_interventions += 1
-            elif self.rollback_enabled:
-                self.rejected_interventions += 1
+            block_start_step = self.global_step
+            counterfactual = self.v2_config.counterfactual_probe_enabled
+            neutral_model_snapshot: dict[str, torch.Tensor] | None = None
+            neutral_optimizer_snapshot: dict[str, Any] | None = None
+            if counterfactual:
+                # A candidate must outperform the training trajectory that
+                # would have occurred without intervention. Comparing only
+                # against the pre-probe state confounds ordinary Adam progress
+                # with controller benefit and can accept a harmful action.
+                self._train_v2_steps(
+                    neutral_batch,
+                    probe_steps,
+                    cycle=warmup_cycle + block,
+                    phase="v2_neutral_probe",
+                    probe=True,
+                    applied=False,
+                )
+                neutral_model_snapshot = self._model_snapshot()
+                neutral_optimizer_snapshot = deepcopy(self.optimizer.state_dict())
+                (
+                    _neutral_maps,
+                    neutral_raw,
+                    neutral_names,
+                    _neutral_weak,
+                    neutral_coords,
+                ) = self._diagnose_reference_free(update_history=False)
+                neutral_metrics = self._guard_metrics(neutral_coords)
                 self._restore_model_snapshot(model_snapshot)
                 self.optimizer.load_state_dict(optimizer_snapshot)
                 self.v2_controller.state.restore(controller_snapshot)
-                self.compute_tracker.record_rollback_steps(probe_steps)
+                self.restore_sampling_state(sampling_snapshot)
+                self.global_step = block_start_step
             else:
-                self.rejected_interventions += 1
-            self._log_decision(block, candidate, decision)
+                neutral_raw = raw_before
+                neutral_names = names
+                neutral_metrics = metrics_before
 
-            remaining = block_steps - probe_steps
-            committed_batch = proposal_batch if committed else batch
+            rejected_trials: list[tuple[V2Candidate, dict[str, Any]]] = []
+            selected: dict[str, Any] | None = None
+            candidates_to_probe = (
+                active_candidates
+                if counterfactual and self.rollback_enabled
+                else active_candidates[:1]
+            )
+            for candidate in candidates_to_probe:
+                self._restore_model_snapshot(model_snapshot)
+                self.optimizer.load_state_dict(optimizer_snapshot)
+                self.v2_controller.state.restore(controller_snapshot)
+                self.restore_sampling_state(sampling_snapshot)
+                self.global_step = block_start_step
+                self.v2_controller.apply(candidate)
+                # Sampling actions must be evaluated on the allocation they
+                # propose. Every alternative starts from the same sampler
+                # state and model checkpoint.
+                proposal_batch = self._resample_v2_batch(maps_before, coords)
+                proposal_sampling_snapshot = self.sampling_state_snapshot()
+                self._train_v2_steps(
+                    proposal_batch,
+                    probe_steps,
+                    cycle=warmup_cycle + block,
+                    phase=(
+                        "v2_counterfactual_probe"
+                        if counterfactual
+                        else "v2_trust_probe"
+                    ),
+                    probe=True,
+                    applied=False,
+                )
+                _maps_after, raw_after, names_after, _weak_after, coords_after = (
+                    self._diagnose_reference_free(update_history=False)
+                )
+                metrics_after = self._guard_metrics(coords_after)
+                before_target = self._candidate_score(
+                    candidate,
+                    neutral_raw,
+                    neutral_names,
+                )
+                after_target = self._candidate_score(
+                    candidate,
+                    raw_after,
+                    names_after,
+                )
+                accepted, decision = self.v2_controller.evaluate(
+                    candidate,
+                    before_target,
+                    after_target,
+                    neutral_metrics,
+                    metrics_after,
+                    target_threshold=(
+                        self.v2_config.counterfactual_target_margin
+                        if counterfactual
+                        else None
+                    ),
+                    guard_threshold=(
+                        self.v2_config.counterfactual_guard_margin
+                        if counterfactual
+                        else None
+                    ),
+                    comparison_mode=(
+                        "counterfactual" if counterfactual else "temporal"
+                    ),
+                    update_state=False,
+                )
+                decision.update(
+                    {
+                        "block": block,
+                        "prefiltered": False,
+                        "gradient_compatibility": candidate.gradient_compatibility,
+                        "rank_score": candidate.rank_score,
+                        "trust_radius_before": trust_before,
+                    }
+                )
+                if accepted or not self.rollback_enabled:
+                    selected = {
+                        "candidate": candidate,
+                        "accepted": accepted,
+                        "decision": decision,
+                        "model": self._model_snapshot(),
+                        "optimizer": deepcopy(self.optimizer.state_dict()),
+                        "controller": self.v2_controller.state.snapshot(),
+                        "sampling": proposal_sampling_snapshot,
+                        "batch": proposal_batch,
+                    }
+                    break
+                decision["committed"] = False
+                rejected_trials.append((candidate, decision))
+                self.compute_tracker.record_rollback_steps(probe_steps)
+
+            committed = selected is not None
+            self.rejected_interventions += len(rejected_trials)
+            if committed:
+                candidate = selected["candidate"]
+                decision = self.v2_controller.commit_evaluation(
+                    candidate,
+                    bool(selected["accepted"]),
+                    selected["decision"],
+                )
+                decision["committed"] = True
+                self._restore_model_snapshot(selected["model"])
+                self.optimizer.load_state_dict(selected["optimizer"])
+                self.v2_controller.state.restore(selected["controller"])
+                self.restore_sampling_state(selected["sampling"])
+                committed_batch = selected["batch"]
+                if bool(selected["accepted"]):
+                    self.accepted_interventions += 1
+                else:
+                    self.rejected_interventions += 1
+                self._log_decision(block, candidate, decision)
+                if counterfactual:
+                    self.compute_tracker.record_rollback_steps(probe_steps)
+            else:
+                if counterfactual:
+                    assert neutral_model_snapshot is not None
+                    assert neutral_optimizer_snapshot is not None
+                    self._restore_model_snapshot(neutral_model_snapshot)
+                    self.optimizer.load_state_dict(neutral_optimizer_snapshot)
+                else:
+                    self._restore_model_snapshot(model_snapshot)
+                    self.optimizer.load_state_dict(optimizer_snapshot)
+                self.v2_controller.state.restore(controller_snapshot)
+                self.restore_sampling_state(neutral_sampling_snapshot)
+                committed_batch = neutral_batch
+                if rejected_trials:
+                    first_candidate, first_decision = rejected_trials[0]
+                    rejected_trials[0] = (
+                        first_candidate,
+                        self.v2_controller.commit_evaluation(
+                            first_candidate,
+                            False,
+                            first_decision,
+                        ),
+                    )
+
+            for rejected_candidate, rejected_decision in rejected_trials:
+                self._log_decision(block, rejected_candidate, rejected_decision)
+            if counterfactual:
+                # Only one probe branch belongs to the committed trajectory;
+                # all alternatives remain in actual-compute accounting.
+                self.global_step = block_start_step + probe_steps
+                self.compute_tracker.record_applied_optimizer_steps(probe_steps)
+            elif committed:
+                self.compute_tracker.record_applied_optimizer_steps(probe_steps)
+
+            if not counterfactual and not committed:
+                # A rejected probe must not silently remove effective training
+                # steps from VARA. Restart the full neutral block from the
+                # restored pre-probe state.
+                self.global_step = block_start_step
+                remaining = block_steps
+            else:
+                remaining = block_steps - probe_steps
             self._train_v2_steps(
                 committed_batch,
                 remaining,
-                cycle=block + 1,
+                cycle=warmup_cycle + block,
                 phase="v2_commit" if committed else "v2_rollback_continue",
             )
             maps_kept, _raw_kept, _names_kept, _weak_kept, coords_kept = self._diagnose_reference_free(
                 update_history=False
             )
-            batch = self._resample_v2_batch(maps_kept, coords_kept)
             self._log_state(block)
+            block_metrics = self.controller_metrics(coords_kept)
+            self.maybe_checkpoint(warmup_cycle + block, block_metrics)
+            if self.should_stop_early(block_metrics):
+                break
 
         metrics = self.evaluate_and_save_final()
         metrics.update(
@@ -190,6 +376,7 @@ class VARAV2Trainer(ExperimentTrainer):
         cycle: int,
         phase: str,
         probe: bool = False,
+        applied: bool = True,
     ) -> None:
         train_cfg = self.config.get("training", {})
         scalar_weights = dict(train_cfg.get("weights", {}))
@@ -216,8 +403,9 @@ class VARAV2Trainer(ExperimentTrainer):
             total = total + anchor + continuation_anchor + continuation_replay
             total.backward()
             grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
-            self.compute_tracker.record_optimizer_step()
+            self.compute_tracker.record_optimizer_step(applied=applied)
             if probe:
                 self.compute_tracker.record_probe_step()
             logs = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -228,6 +416,7 @@ class VARAV2Trainer(ExperimentTrainer):
             logs["continuation_replay_weight"] = float(replay_weight)
             logs["total"] = float(total.detach().cpu())
             logs["grad_norm"] = grad_norm
+            logs["learning_rate"] = learning_rate
             self.last_losses = logs
             if local_step % log_every == 0 or local_step == steps - 1:
                 self.loss_logger.log(
@@ -273,10 +462,18 @@ class VARAV2Trainer(ExperimentTrainer):
         return maps, raw, scored_names, weak_regions, coords
 
     def _guard_metrics(self, coords: np.ndarray) -> dict[str, float]:
-        metrics = self.evaluate_metrics(coords)
+        metrics = evaluate_on_grid(
+            self.model,
+            self.benchmark,
+            coords,
+            self.device,
+            self.steady,
+            residual_interior_only=self.residual_interior_only(),
+            include_reference_metrics=False,
+        )
         selected = {
             name: float(metrics[name])
-            for name in ALLOWED_GUARD_METRICS
+            for name in self.v2_config.guard_metrics
             if name != "unweighted_validation_loss"
             and name in metrics
             and math.isfinite(float(metrics[name]))
@@ -388,21 +585,37 @@ class VARAV2Trainer(ExperimentTrainer):
         n_f = int(train_cfg.get("n_collocation", 2048))
         n_bc = int(train_cfg.get("n_boundary", 768))
         n_data = int(train_cfg.get("n_data", 0))
-        uniform_mass = float(self.v2_config.min_uniform_mass)
-        n_uniform = int(round(n_f * uniform_mass))
-        n_adaptive = n_f - n_uniform
-        pieces = [self.uniform_sampler.sample_numpy(n_uniform)]
-        if n_adaptive > 0:
-            patch_ids = list(range(self.patch_grid.num_patches))
-            pieces.append(
-                self.adaptive_sampler.region_sampler.sample_numpy(
-                    patch_ids,
-                    n_adaptive,
-                    self.v2_controller.state.sampling_mass,
+        neutral_mass = np.full(
+            self.patch_grid.num_patches,
+            1.0 / self.patch_grid.num_patches,
+            dtype=float,
+        )
+        sampling_is_neutral = np.allclose(
+            self.v2_controller.state.sampling_mass,
+            neutral_mass,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        if sampling_is_neutral:
+            # Exact baseline equivalence before a sampling action is
+            # committed: same sampler, same seed, and same point count.
+            xy_f_np = self.uniform_sampler.sample_numpy(n_f)
+        else:
+            uniform_mass = float(self.v2_config.min_uniform_mass)
+            n_uniform = int(round(n_f * uniform_mass))
+            n_adaptive = n_f - n_uniform
+            pieces = [self.uniform_sampler.sample_numpy(n_uniform)]
+            if n_adaptive > 0:
+                patch_ids = list(range(self.patch_grid.num_patches))
+                pieces.append(
+                    self.adaptive_sampler.region_sampler.sample_numpy(
+                        patch_ids,
+                        n_adaptive,
+                        self.v2_controller.state.sampling_mass,
+                    )
                 )
-            )
-        xy_f_np = np.vstack(pieces)
-        self.adaptive_sampler.rng.shuffle(xy_f_np)
+            xy_f_np = np.vstack(pieces)
+            self.adaptive_sampler.rng.shuffle(xy_f_np)
         xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)
         xy_bc = self._sample_boundary(n_bc)
         xy_data = self._sample_data(n_data)
