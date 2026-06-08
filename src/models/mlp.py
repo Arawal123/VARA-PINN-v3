@@ -148,6 +148,9 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
                 lid_vertical_power=int(
                     model_cfg.get("hard_boundary_lid_vertical_power", 6)
                 ),
+                correction_scale=float(
+                    model_cfg.get("hard_boundary_correction_scale", 64.0)
+                ),
             )
         return CavityHardBoundaryWrapper(
             model,

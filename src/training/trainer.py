@@ -71,6 +71,7 @@ class ExperimentTrainer:
         )
         self.optimizer_stage = "adam"
         self.final_repair_status: dict[str, Any] = {}
+        self.current_cavity_curriculum: dict[str, float] = {}
         self.continuation_anchor_model: torch.nn.Module | None = None
         self.continuation_replay_points: torch.Tensor | None = None
         self.continuation_replay_targets: torch.Tensor | None = None
@@ -458,6 +459,7 @@ class ExperimentTrainer:
         for local_epoch in range(epochs):
             if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
                 break
+            self._apply_cavity_curriculum()
             self.optimizer.zero_grad(set_to_none=True)
             total, losses, local_logs = self._training_objective(
                 batch,
@@ -477,6 +479,7 @@ class ExperimentTrainer:
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
             last_losses["learning_rate"] = learning_rate
+            last_losses.update(self.current_cavity_curriculum)
             last_losses.update(self.last_boundary_sampling_summary)
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
@@ -498,7 +501,16 @@ class ExperimentTrainer:
         if self.mode == "gradient_enhanced_pinn":
             pointwise = gradient_enhanced_pointwise_losses(self.model, batch, self.benchmark, self.steady)
         else:
-            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            residual_mode, residual_delta = self._residual_loss_settings()
+            pointwise = compute_pointwise_losses(
+                self.model,
+                batch,
+                self.benchmark,
+                self.steady,
+                residual_loss_mode=residual_mode,
+                pseudo_huber_delta=residual_delta,
+                regularization_config=self.config.get("losses", {}),
+            )
         if "pressure_poisson" in active_aux_losses:
             pointwise["pressure_poisson"] = pressure_poisson_residual(
                 self.model, batch["xy_f"], self.benchmark.nu
@@ -539,8 +551,71 @@ class ExperimentTrainer:
             local_logs["continuation_replay_weight"] = float(replay_weight)
         if float(gauge_loss.detach().cpu()) > 0.0:
             local_logs["pressure_gauge"] = float(gauge_loss.detach().cpu())
+        if self.mode != "gradient_enhanced_pinn":
+            local_logs["residual_loss_mode"] = residual_mode
+            local_logs["pseudo_huber_delta"] = float(residual_delta)
+        local_logs.update(self._model_auxiliary_logs())
         local_logs.update(normalization_logs)
         return total, losses, local_logs
+
+    def _apply_cavity_curriculum(self) -> None:
+        cfg = dict(self.config.get("cavity_curriculum", {}))
+        if not bool(cfg.get("enabled", False)):
+            return
+        stages = list(cfg.get("stages", []))
+        if not stages:
+            return
+        selected = stages[-1]
+        for stage in stages:
+            until = int(stage.get("until_step", stage.get("steps", 0)))
+            if self.global_step < until:
+                selected = stage
+                break
+        model = self.model
+        if hasattr(model, "corner_width") and "corner_width" in selected:
+            model.corner_width = max(float(selected["corner_width"]), 1e-6)
+        if hasattr(model, "lid_vertical_power") and "lid_vertical_power" in selected:
+            model.lid_vertical_power = max(2, int(selected["lid_vertical_power"]))
+        if hasattr(model, "correction_scale") and "correction_scale" in selected:
+            model.correction_scale = float(selected["correction_scale"])
+        if hasattr(self.benchmark, "lid_corner_regularization_width") and "corner_width" in selected:
+            self.benchmark.lid_corner_regularization_width = float(selected["corner_width"])
+        self.current_cavity_curriculum = {
+            "cavity_curriculum_corner_width": float(
+                getattr(model, "corner_width", float("nan"))
+            ),
+            "cavity_curriculum_lid_vertical_power": float(
+                getattr(model, "lid_vertical_power", float("nan"))
+            ),
+            "cavity_curriculum_correction_scale": float(
+                getattr(model, "correction_scale", float("nan"))
+            ),
+        }
+
+    def _residual_loss_settings(self) -> tuple[str, float]:
+        cfg = self.config.get("training", {}).get("residual_loss_mode", "mse")
+        delta = float(self.config.get("training", {}).get("pseudo_huber_delta", 1.0))
+        if isinstance(cfg, dict):
+            switch_step = int(cfg.get("switch_step", 0))
+            mode = str(
+                cfg.get("initial", "mse")
+                if self.global_step < switch_step
+                else cfg.get("final", "mse")
+            )
+            delta = float(cfg.get("pseudo_huber_delta", delta))
+            return mode, delta
+        return str(cfg), delta
+
+    def _model_auxiliary_logs(self) -> dict[str, float]:
+        logs: dict[str, float] = {}
+        diagnostics = getattr(self.model, "latest_streamfunction_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            for key, value in diagnostics.items():
+                try:
+                    logs[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        return logs
 
     def normalize_training_losses(
         self,
@@ -977,8 +1052,38 @@ class ExperimentTrainer:
         metrics["model_architecture"] = str(model_cfg.get("architecture", "mlp"))
         metrics["physics_formulation"] = str(model_cfg.get("physics_formulation", "direct"))
         metrics["hard_boundary_corner_width"] = (
-            float(model_cfg.get("hard_boundary_corner_width", 0.02))
-            if metrics["physics_formulation"] == "cavity_hard_boundary"
+            float(
+                getattr(
+                    self.model,
+                    "corner_width",
+                    model_cfg.get("hard_boundary_corner_width", 0.02),
+                )
+            )
+            if metrics["physics_formulation"]
+            in {"cavity_hard_boundary", "hard_boundary_streamfunction_pressure"}
+            else float("nan")
+        )
+        metrics["hard_boundary_lid_vertical_power"] = (
+            float(
+                getattr(
+                    self.model,
+                    "lid_vertical_power",
+                    model_cfg.get("hard_boundary_lid_vertical_power", float("nan")),
+                )
+            )
+            if metrics["physics_formulation"]
+            in {"cavity_hard_boundary", "hard_boundary_streamfunction_pressure"}
+            else float("nan")
+        )
+        metrics["hard_boundary_correction_scale"] = (
+            float(
+                getattr(
+                    self.model,
+                    "correction_scale",
+                    model_cfg.get("hard_boundary_correction_scale", float("nan")),
+                )
+            )
+            if metrics["physics_formulation"] == "hard_boundary_streamfunction_pressure"
             else float("nan")
         )
         metrics["continuation_replay_enabled"] = bool(
@@ -1207,6 +1312,11 @@ class ExperimentTrainer:
             if name in metrics and math.isfinite(float(metrics[name]))
         ]
         if values:
+            if str(checkpoint_cfg.get("score_mode", "geometric_mean")).lower() in {
+                "sum",
+                "additive",
+            }:
+                return float(sum(values))
             return float(math.exp(sum(math.log(value) for value in values) / len(values)))
         pde = float(metrics.get("unweighted_pde_loss", float("nan")))
         boundary = float(metrics.get("unweighted_bc_loss", float("nan")))

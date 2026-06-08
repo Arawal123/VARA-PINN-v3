@@ -88,6 +88,12 @@ def evaluate_on_grid(
         + residuals["f_v"].detach().cpu().numpy() ** 2
         + residuals["f_c"].detach().cpu().numpy() ** 2
     )
+    momentum_u_abs = np.abs(residuals["f_u"].detach().cpu().numpy())
+    momentum_v_abs = np.abs(residuals["f_v"].detach().cpu().numpy())
+    p_grad_abs = np.sqrt(
+        residuals["p_x"].detach().cpu().numpy() ** 2
+        + residuals["p_y"].detach().cpu().numpy() ** 2
+    )
     continuity_all = np.abs(residuals["f_c"].detach().cpu().numpy())
     momentum_all = np.sqrt(
         residuals["f_u"].detach().cpu().numpy() ** 2
@@ -135,7 +141,20 @@ def evaluate_on_grid(
         "speed_pred_mean": float(np.mean(speed)),
         "speed_pred_max": float(np.max(speed)),
         "omega_pred_abs_mean": float(np.mean(np.abs(omega))),
+        "omega_pred_abs_95p": _finite_percentile(np.abs(omega), 95.0),
         "omega_pred_abs_max": float(np.max(np.abs(omega))),
+        "omega_abs_mean": float(np.mean(np.abs(omega))),
+        "omega_abs_95p": _finite_percentile(np.abs(omega), 95.0),
+        "omega_abs_max": float(np.max(np.abs(omega))),
+        "momentum_u_mean": _finite_mean(_masked_values(momentum_u_abs, residual_mask)),
+        "momentum_v_mean": _finite_mean(_masked_values(momentum_v_abs, residual_mask)),
+        "momentum_u_max": _finite_max(_masked_values(momentum_u_abs, residual_mask)),
+        "momentum_v_max": _finite_max(_masked_values(momentum_v_abs, residual_mask)),
+        "p_grad_mean": _finite_mean(_masked_values(p_grad_abs, residual_mask)),
+        "p_grad_max": _finite_max(_masked_values(p_grad_abs, residual_mask)),
+        "psi_min": float("nan"),
+        "psi_max": float("nan"),
+        "psi_abs_max": float("nan"),
         "pressure_gradient_error": float("nan"),
         "divergence_norm": _finite_mean(div),
         "continuity_residual_mean": _finite_mean(div),
@@ -174,6 +193,7 @@ def evaluate_on_grid(
         "num_eval_points": int(coords_np.shape[0]),
     }
     metrics.update(_streamfunction_metrics(benchmark, coords_np, u, v))
+    metrics.update(_direct_streamfunction_diagnostics(model, coords_np, device))
     if (
         include_reference_metrics
         and benchmark.__class__.__name__.lower().startswith("liddrivencavity")
@@ -245,6 +265,9 @@ def evaluate_on_grid(
                 device=device,
                 pde=_masked_values(pde, residual_mask),
                 continuity=_masked_values(continuity_all, residual_mask),
+                momentum_u=_masked_values(momentum_u_abs, residual_mask),
+                momentum_v=_masked_values(momentum_v_abs, residual_mask),
+                p_grad=_masked_values(p_grad_abs, residual_mask),
             )
         )
     metrics["unweighted_physics_validation_loss"] = _finite_sum(
@@ -296,6 +319,42 @@ def _finite_max(values: np.ndarray) -> float:
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
     return float(np.max(finite)) if finite.size else float("nan")
+
+
+def _finite_percentile(values: np.ndarray, percentile: float) -> float:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    return float(np.percentile(finite, percentile)) if finite.size else float("nan")
+
+
+def _direct_streamfunction_diagnostics(
+    model: torch.nn.Module,
+    coords_np: np.ndarray,
+    device: torch.device,
+) -> dict[str, float]:
+    if not hasattr(model, "streamfunction_auxiliary"):
+        return {}
+    coords = torch.tensor(coords_np, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        auxiliary = model.streamfunction_auxiliary(coords)
+    out: dict[str, float] = {}
+    mapping = {
+        "raw_psi": "raw_psi",
+        "scaled_correction": "scaled_correction",
+        "psi_total": "psi",
+    }
+    for source, prefix in mapping.items():
+        if source not in auxiliary:
+            continue
+        values = auxiliary[source].detach().cpu().numpy()
+        out[f"{prefix}_mean"] = float(np.mean(values))
+        out[f"{prefix}_std"] = float(np.std(values))
+        out[f"{prefix}_abs_max"] = float(np.max(np.abs(values)))
+        if prefix == "psi":
+            out["psi_min"] = float(np.min(values))
+            out["psi_max"] = float(np.max(values))
+            out["psi_abs_max"] = float(np.max(np.abs(values)))
+    return out
 
 
 def _streamfunction_metrics(
@@ -377,6 +436,9 @@ def _cavity_residual_geometry_metrics(
     device: torch.device,
     pde: np.ndarray,
     continuity: np.ndarray,
+    momentum_u: np.ndarray,
+    momentum_v: np.ndarray,
+    p_grad: np.ndarray,
 ) -> dict[str, float]:
     x0, x1, y0, y1 = benchmark.bounds
     width = max(float(x1 - x0), 1e-12)
@@ -394,12 +456,27 @@ def _cavity_residual_geometry_metrics(
     bottom = coords_np[:, 1:2] <= y0 + corner_width
     top = coords_np[:, 1:2] >= y1 - corner_width
     corner_mask = (left | right) & (bottom | top)
+    wall_margin = 0.08 * min(width, height)
+    core_mask = (
+        (coords_np[:, 0:1] >= x0 + wall_margin)
+        & (coords_np[:, 0:1] <= x1 - wall_margin)
+        & (coords_np[:, 1:2] >= y0 + wall_margin)
+        & (coords_np[:, 1:2] <= y1 - wall_margin)
+    )
+    near_wall_mask = ~core_mask
     boundary_mask = benchmark.boundary_mask_np(coords_np)[:, None] if hasattr(benchmark, "boundary_mask_np") else np.zeros_like(corner_mask)
     corner_boundary_mask = corner_mask & boundary_mask
     return {
         "centerline_pde_residual_mean": _weighted_mean(pde, centerline_weight),
         "centerline_continuity_residual_mean": _weighted_mean(continuity, centerline_weight),
+        "core_pde_residual_mean": _masked_mean(pde, core_mask),
+        "near_wall_pde_residual_mean": _masked_mean(pde, near_wall_mask),
         "corner_pde_residual_mean": _masked_mean(pde, corner_mask),
+        "core_momentum_u_mean": _masked_mean(momentum_u, core_mask),
+        "core_momentum_v_mean": _masked_mean(momentum_v, core_mask),
+        "near_wall_momentum_u_mean": _masked_mean(momentum_u, near_wall_mask),
+        "near_wall_momentum_v_mean": _masked_mean(momentum_v, near_wall_mask),
+        "corner_p_grad_mean": _masked_mean(p_grad, corner_mask),
         "corner_boundary_error": _corner_boundary_error(model, benchmark, coords_np, corner_boundary_mask[:, 0], device),
     }
 

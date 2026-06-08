@@ -376,6 +376,12 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             value = float(metrics.get(name, np.nan))
         except (TypeError, ValueError):
             value = float("nan")
+        if (
+            name == "velocity_full_rel_l2"
+            and not bool(metrics.get("has_reference", False))
+            and not np.isfinite(value)
+        ):
+            continue
         if not np.isfinite(value):
             reasons.append(f"{name}=nonfinite")
         elif value > maximum:

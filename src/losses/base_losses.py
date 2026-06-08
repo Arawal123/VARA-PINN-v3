@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from src.physics.kovasznay import center_pressure
-from src.physics.navier_stokes import navier_stokes_residuals
+from src.physics.navier_stokes import gradients, navier_stokes_residuals
 
 
 def mse(x: torch.Tensor) -> torch.Tensor:
@@ -35,6 +35,15 @@ def reduce_pointwise_loss(values: torch.Tensor, reduction: str = "legacy_mse") -
     raise ValueError(f"Unsupported pointwise loss reduction: {reduction}")
 
 
+def pseudo_huber_from_squared_residual(
+    squared_residual: torch.Tensor,
+    delta: float,
+) -> torch.Tensor:
+    """Pseudo-Huber loss from r^2 without needing the residual sign."""
+    delta = max(float(delta), 1e-12)
+    return delta * delta * (torch.sqrt(1.0 + squared_residual / (delta * delta)) - 1.0)
+
+
 def reduce_weighted_pointwise_loss(
     values: torch.Tensor,
     weights: torch.Tensor,
@@ -56,6 +65,9 @@ def compute_pointwise_losses(
     batch: dict[str, Any],
     benchmark: Any,
     steady: bool = True,
+    residual_loss_mode: str = "mse",
+    pseudo_huber_delta: float = 1.0,
+    regularization_config: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute pointwise losses used by global and local objectives."""
     xy_f = batch["xy_f"]
@@ -64,12 +76,40 @@ def compute_pointwise_losses(
     targets = batch.get("targets_data")
 
     residuals = navier_stokes_residuals(model, xy_f, nu=benchmark.nu, steady=steady)
+    momentum_u_mse = residuals["f_u"].pow(2)
+    momentum_v_mse = residuals["f_v"].pow(2)
+    continuity_mse = residuals["f_c"].pow(2)
+    mode = str(residual_loss_mode).lower()
+    if mode == "pseudo_huber":
+        momentum_u_obj = pseudo_huber_from_squared_residual(
+            momentum_u_mse,
+            pseudo_huber_delta,
+        )
+        momentum_v_obj = pseudo_huber_from_squared_residual(
+            momentum_v_mse,
+            pseudo_huber_delta,
+        )
+    elif mode in {"mse", "mean_squared"}:
+        momentum_u_obj = momentum_u_mse
+        momentum_v_obj = momentum_v_mse
+    else:
+        raise ValueError(f"Unsupported residual_loss_mode: {residual_loss_mode}")
     pointwise: dict[str, torch.Tensor] = {
-        "momentum_u": residuals["f_u"].pow(2),
-        "momentum_v": residuals["f_v"].pow(2),
-        "continuity": residuals["f_c"].pow(2),
-        "pde": residuals["f_u"].pow(2) + residuals["f_v"].pow(2) + residuals["f_c"].pow(2),
+        "momentum_u": momentum_u_obj,
+        "momentum_v": momentum_v_obj,
+        "continuity": continuity_mse,
+        "pde": momentum_u_obj + momentum_v_obj + continuity_mse,
+        "raw_momentum_u_mse": momentum_u_mse,
+        "raw_momentum_v_mse": momentum_v_mse,
+        "raw_continuity_mse": continuity_mse,
     }
+    _add_reference_free_regularizers(
+        pointwise,
+        model,
+        xy_f,
+        residuals,
+        regularization_config or {},
+    )
 
     bc_pred = model(xy_bc)
     bc_ref = benchmark.exact_torch(xy_bc)
@@ -87,6 +127,39 @@ def compute_pointwise_losses(
         p_grad = navier_stokes_residuals(model, xy_data, nu=benchmark.nu, steady=steady)
         pointwise["pressure_gradient"] = (p_grad["p_x"] - targets["p_x"]).pow(2) + (p_grad["p_y"] - targets["p_y"]).pow(2)
     return pointwise
+
+
+def _add_reference_free_regularizers(
+    pointwise: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    xy_f: torch.Tensor,
+    residuals: dict[str, torch.Tensor],
+    cfg: dict[str, Any],
+) -> None:
+    speed_cfg = dict(cfg.get("speed_cap", {}))
+    if bool(speed_cfg.get("enabled", False)):
+        cap = float(speed_cfg.get("cap", 2.0))
+        speed = torch.sqrt(residuals["u"].pow(2) + residuals["v"].pow(2) + 1e-18)
+        pointwise["speed_cap"] = torch.relu(speed - cap).pow(2)
+
+    psi_cfg = dict(cfg.get("raw_psi_l2", {}))
+    auxiliary = None
+    if bool(psi_cfg.get("enabled", False)) and hasattr(model, "streamfunction_auxiliary"):
+        auxiliary = model.streamfunction_auxiliary(xy_f)
+        pointwise["raw_psi_l2"] = auxiliary["raw_psi"].pow(2)
+
+    pressure_cfg = dict(cfg.get("pressure_gradient_l2", {}))
+    if bool(pressure_cfg.get("enabled", False)):
+        pointwise["pressure_gradient_l2"] = (
+            residuals["p_x"].pow(2) + residuals["p_y"].pow(2)
+        )
+
+    vort_cfg = dict(cfg.get("vorticity_smoothness", {}))
+    if bool(vort_cfg.get("enabled", False)):
+        grad_omega = gradients(residuals["omega"], residuals["coords"])
+        pointwise["vorticity_smoothness"] = (
+            grad_omega[:, 0:1].pow(2) + grad_omega[:, 1:2].pow(2)
+        )
 
 
 def compute_global_losses(

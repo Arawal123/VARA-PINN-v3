@@ -16,16 +16,17 @@ model:
   # regularized lid and stationary walls. The older velocity hard-boundary and
   # plain streamfunction formulations remain available only as ablations.
   physics_formulation: hard_boundary_streamfunction_pressure
-  hard_boundary_corner_width: 0.02
-  hard_boundary_lid_vertical_power: 6
+  hard_boundary_corner_width: 0.06
+  hard_boundary_lid_vertical_power: 3
+  hard_boundary_correction_scale: 64
 
 optimizer:
   scheduler:
     enabled: true
-    total_steps: 12000
-    warmup_steps: 500
+    total_steps: 4000
+    warmup_steps: 300
     warmup_start_ratio: 0.2
-    min_lr_ratio: 0.05
+    min_lr_ratio: 0.08
   final_repair:
     # Optional guarded LBFGS repair. It is off by default; when enabled, it is
     # accepted only if the raw reference-free physics validation score improves.
@@ -40,7 +41,12 @@ optimizer:
 
 training:
   pointwise_reduction: mean
-  adaptive_cycles: 60
+  residual_loss_mode:
+    initial: pseudo_huber
+    switch_step: 1500
+    final: mse
+    pseudo_huber_delta: 1.0
+  adaptive_cycles: 20
   epochs_per_cycle: 200
   n_collocation: 2048
   n_boundary: 512
@@ -58,6 +64,37 @@ training:
     p: 0.0
     omega: 0.0
     pressure_gradient: 0.0
+    speed_cap: 0.1
+    raw_psi_l2: 0.0001
+    pressure_gradient_l2: 0.0001
+    vorticity_smoothness: 0.0
+
+losses:
+  speed_cap:
+    enabled: true
+    cap: 2.0
+  raw_psi_l2:
+    enabled: true
+  pressure_gradient_l2:
+    enabled: true
+  vorticity_smoothness:
+    enabled: false
+
+cavity_curriculum:
+  enabled: true
+  stages:
+    - until_step: 1000
+      corner_width: 0.08
+      lid_vertical_power: 3
+      correction_scale: 64
+    - until_step: 3000
+      corner_width: 0.06
+      lid_vertical_power: 3
+      correction_scale: 64
+    - until_step: 4000
+      corner_width: 0.05
+      lid_vertical_power: 3
+      correction_scale: 64
 
 loss_normalization:
   enabled: false
@@ -68,12 +105,12 @@ loss_normalization:
   warmup_steps: 0
 
 controller_v2:
-  total_steps: 12000
+  total_steps: 4000
   # Align every neutral controller boundary with Vanilla's 200-step
   # collocation refresh. When no action is accepted, both trajectories are
   # therefore exactly identical.
-  warmup_steps: 2000
-  control_blocks: 50
+  warmup_steps: 800
+  control_blocks: 16
   block_steps: 200
   probe_steps: 10
   gradient_probe_interior: 256
@@ -115,22 +152,19 @@ sampling:
 
 checkpoint:
   restore_best_before_final: true
+  score_mode: sum
   reference_free_metrics:
     - pde_residual_mean
     - momentum_residual_mean
     - boundary_condition_error
-    - continuity_residual_mean
-    - streamfunction_consistency_rmse
-    - centerline_pde_residual_mean
-    - centerline_continuity_residual_mean
   metric_floor: 1.0e-8
 
 convergence_early_stopping:
   enabled: true
   # These are minimums, not fixed budgets. A stage automatically continues to
-  # the full 12000-step ceiling whenever validity or stability is not achieved.
-  min_steps_initial: 8000
-  min_steps_warm_start: 4000
+  # the full 4000-step ceiling whenever validity or stability is not achieved.
+  min_steps_initial: 3000
+  min_steps_warm_start: 2000
   patience: 3
   relative_tolerance: 0.03
   latest_degradation_tolerance: 0.01
@@ -162,17 +196,17 @@ continuation_validity:
   max_pde_residual_mean: 0.30
   max_continuity_residual_mean: 0.001
   max_momentum_residual_mean: 0.30
-  max_boundary_condition_error: 0.12
+  max_boundary_condition_error: 1.0e-8
   max_speed_pred: 2.0
   min_speed_pred_mean: 0.05
-  max_streamfunction_consistency_rmse: 0.03
-  max_lid_cavity_primary_center_error: 0.12
+  max_streamfunction_consistency_rmse: 0.001
+  max_lid_cavity_primary_center_error: 0.10
   max_lid_cavity_topology_score: 0.18
   max_velocity_full_rel_l2: 0.85
   require_lid_cavity_topology_alignment: true
   min_primary_streamfunction_abs: 0.015
   min_detected_vortices: 1
-  max_detected_vortices: 4
+  max_detected_vortices: 2
   min_primary_vortex_wall_distance: 0.05
   max_final_checkpoint_physics_degradation: 0.05
   max_vara_vs_vanilla_physics_degradation: 0.02

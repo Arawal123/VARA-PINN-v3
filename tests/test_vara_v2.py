@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import torch
 
-from scripts.run_vara_v2_continuation import _load_base_config
+from scripts.run_vara_v2_continuation import _continuation_validity, _load_base_config
 from scripts.check_lid_cavity_re100_sanity import build_report
 from src.controllers import V2ControllerConfig, VARAV2Controller
 from src.evaluation.metrics import evaluate_on_grid
@@ -16,7 +16,7 @@ from src.evaluation.statistical_tests import (
     paired_bootstrap_improvement,
     wilcoxon_signed_rank,
 )
-from src.losses.base_losses import compute_global_losses
+from src.losses.base_losses import compute_global_losses, compute_pointwise_losses
 from src.losses.local_losses import compute_budgeted_patch_losses
 from src.models import (
     CavityHardBoundaryWrapper,
@@ -275,8 +275,13 @@ def test_continuation_overlay_inherits_lid_cavity_base_config():
     assert config["benchmark"] == "lid_driven_cavity"
     assert config["model"]["physics_formulation"] == "hard_boundary_streamfunction_pressure"
     assert config["model"]["output_dim"] == 2
-    assert config["training"]["adaptive_cycles"] == 60
-    assert config["controller_v2"]["total_steps"] == 12000
+    assert config["model"]["hard_boundary_corner_width"] == pytest.approx(0.06)
+    assert config["model"]["hard_boundary_lid_vertical_power"] == 3
+    assert config["model"]["hard_boundary_correction_scale"] == pytest.approx(64.0)
+    assert config["training"]["adaptive_cycles"] == 20
+    assert config["controller_v2"]["total_steps"] == 4000
+    assert config["training"]["residual_loss_mode"]["initial"] == "pseudo_huber"
+    assert config["checkpoint"]["score_mode"] == "sum"
     assert config["loss_normalization"]["enabled"] is False
     assert config["evaluation"]["controller_reference_metrics_enabled"] is False
     assert config["evaluation"]["checkpoint_reference_metrics_enabled"] is False
@@ -313,6 +318,101 @@ def test_hard_boundary_streamfunction_pressure_builds_for_lid_cavity_alias():
         build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0)),
         HardBoundaryStreamfunctionPressureWrapper,
     )
+
+
+def test_hard_boundary_streamfunction_correction_scale_is_configurable():
+    class UnitPsi(torch.nn.Module):
+        def forward(self, coords):
+            raw_psi = torch.ones((coords.shape[0], 1), dtype=coords.dtype, device=coords.device)
+            raw_p = torch.zeros_like(raw_psi)
+            return torch.cat([raw_psi, raw_p], dim=1)
+
+    coords = torch.tensor([[0.5, 0.5]], dtype=torch.float64)
+    small = HardBoundaryStreamfunctionPressureWrapper(
+        UnitPsi(),
+        (0.0, 1.0, 0.0, 1.0),
+        correction_scale=32.0,
+    )
+    large = HardBoundaryStreamfunctionPressureWrapper(
+        UnitPsi(),
+        (0.0, 1.0, 0.0, 1.0),
+        correction_scale=128.0,
+    )
+    small_correction = small.streamfunction_auxiliary(coords)["scaled_correction"]
+    large_correction = large.streamfunction_auxiliary(coords)["scaled_correction"]
+    assert large_correction.item() == pytest.approx(4.0 * small_correction.item())
+
+
+def test_reference_free_regularizers_and_pseudo_huber_are_available():
+    class SmoothBase(torch.nn.Module):
+        def forward(self, coords):
+            x = coords[:, 0:1]
+            y = coords[:, 1:2]
+            return torch.cat([x * y, x + y], dim=1)
+
+    benchmark = LidDrivenCavityQualitative(
+        reynolds=100.0,
+        lid_corner_regularization_width=0.05,
+    )
+    model = HardBoundaryStreamfunctionPressureWrapper(
+        SmoothBase(),
+        benchmark.bounds,
+        corner_width=0.05,
+    )
+    batch = {
+        "xy_f": torch.tensor(
+            [[0.25, 0.25], [0.5, 0.5], [0.75, 0.75]],
+            dtype=torch.float64,
+        ),
+        "xy_bc": torch.tensor(
+            [[0.0, 0.5], [1.0, 0.5], [0.5, 0.0], [0.5, 1.0]],
+            dtype=torch.float64,
+        ),
+    }
+    mse_pointwise = compute_pointwise_losses(model, batch, benchmark, True)
+    robust_pointwise = compute_pointwise_losses(
+        model,
+        batch,
+        benchmark,
+        True,
+        residual_loss_mode="pseudo_huber",
+        pseudo_huber_delta=1.0,
+        regularization_config={
+            "speed_cap": {"enabled": True, "cap": 0.01},
+            "raw_psi_l2": {"enabled": True},
+            "pressure_gradient_l2": {"enabled": True},
+        },
+    )
+    assert torch.mean(robust_pointwise["momentum_u"]) <= torch.mean(
+        mse_pointwise["momentum_u"]
+    )
+    assert "speed_cap" in robust_pointwise
+    assert "raw_psi_l2" in robust_pointwise
+    assert "pressure_gradient_l2" in robust_pointwise
+
+
+def test_missing_full_field_reference_does_not_invalidate_reliable_stage():
+    metrics = {
+        "has_reference": False,
+        "pde_residual_mean": 0.1,
+        "continuity_residual_mean": 1e-8,
+        "momentum_residual_mean": 0.1,
+        "boundary_condition_error": 0.0,
+        "speed_pred_max": 1.0,
+        "streamfunction_consistency_rmse": 1e-4,
+        "lid_cavity_primary_center_error": 0.05,
+        "lid_cavity_topology_score": 0.05,
+        "velocity_full_rel_l2": float("nan"),
+        "lid_cavity_topology_aligned": 1.0,
+        "primary_streamfunction_abs": 0.02,
+        "speed_pred_mean": 0.2,
+        "detected_vortex_count": 1,
+        "primary_vortex_center_x": 0.6,
+        "primary_vortex_center_y": 0.7,
+    }
+    config = load_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    validity = _continuation_validity(metrics, config)
+    assert validity["continuation_stage_valid"]
 
 
 def test_balanced_lid_cavity_boundary_sampler_reports_side_fractions():

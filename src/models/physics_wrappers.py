@@ -153,6 +153,7 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
         lid_velocity: float = 1.0,
         corner_width: float = 0.02,
         lid_vertical_power: int = 6,
+        correction_scale: float = 64.0,
     ) -> None:
         super().__init__()
         self.base = base
@@ -160,14 +161,18 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
         self.lid_velocity = float(lid_velocity)
         self.corner_width = max(float(corner_width), 1e-6)
         self.lid_vertical_power = max(2, int(lid_vertical_power))
+        self.correction_scale = float(correction_scale)
         self.physics_formulation = "hard_boundary_streamfunction_pressure"
+        self.latest_streamfunction_diagnostics: dict[str, float] = {}
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         with torch.enable_grad():
             working = coords if coords.requires_grad else coords.clone().detach().requires_grad_(True)
             raw = self.base(working)
-            psi_total = self.streamfunction(working, raw[:, 0:1])
+            components = self.streamfunction_components(working, raw[:, 0:1])
+            psi_total = components["psi_total"]
             p = raw[:, 1:2]
+            self._record_diagnostics(components)
             gradient = torch.autograd.grad(
                 psi_total,
                 working,
@@ -181,6 +186,13 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
             return torch.cat([u, v, p], dim=1)
 
     def streamfunction(self, coords: torch.Tensor, raw_psi: torch.Tensor) -> torch.Tensor:
+        return self.streamfunction_components(coords, raw_psi)["psi_total"]
+
+    def streamfunction_components(
+        self,
+        coords: torch.Tensor,
+        raw_psi: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         x0, x1, y0, y1 = self.bounds
         lx = max(x1 - x0, 1e-12)
         ly = max(y1 - y0, 1e-12)
@@ -195,9 +207,20 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
             * eta.pow(2)
             * (1.0 - eta).pow(2)
         )
-        # The factor keeps the correction O(1) near the cavity core while
-        # preserving zero value and zero first derivative on every wall.
-        return psi_lift + 256.0 * correction_envelope * raw_psi
+        scaled_correction = self.correction_scale * correction_envelope * raw_psi
+        return {
+            "raw_psi": raw_psi,
+            "psi_lift": psi_lift,
+            "correction_envelope": correction_envelope,
+            "scaled_correction": scaled_correction,
+            "psi_total": psi_lift + scaled_correction,
+        }
+
+    def streamfunction_auxiliary(self, coords: torch.Tensor) -> dict[str, torch.Tensor]:
+        raw = self.base(coords)
+        components = self.streamfunction_components(coords, raw[:, 0:1])
+        components["raw_p"] = raw[:, 1:2]
+        return components
 
     def _lid_profile(self, xi: torch.Tensor) -> torch.Tensor:
         left = _smoothstep01(xi / self.corner_width)
@@ -207,6 +230,15 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
     def _vertical_lid_shape(self, eta: torch.Tensor) -> torch.Tensor:
         power = self.lid_vertical_power
         return eta.pow(power) * (eta - 1.0)
+
+    def _record_diagnostics(self, components: dict[str, torch.Tensor]) -> None:
+        diagnostics: dict[str, float] = {}
+        for name in ["raw_psi", "scaled_correction", "psi_total"]:
+            values = components[name].detach()
+            diagnostics[f"{name}_mean"] = float(values.mean().cpu())
+            diagnostics[f"{name}_std"] = float(values.std(unbiased=False).cpu())
+            diagnostics[f"{name}_abs_max"] = float(values.abs().max().cpu())
+        self.latest_streamfunction_diagnostics = diagnostics
 
 
 def _smoothstep01(value: torch.Tensor) -> torch.Tensor:
