@@ -282,7 +282,7 @@ def test_continuation_overlay_inherits_lid_cavity_base_config():
     assert config["model"]["output_dim"] == 2
     assert config["model"]["hard_boundary_corner_width"] == pytest.approx(0.08)
     assert config["model"]["hard_boundary_lid_vertical_power"] == 2
-    assert config["model"]["hard_boundary_correction_scale"] == pytest.approx(32.0)
+    assert config["model"]["hard_boundary_correction_scale"] == pytest.approx(24.0)
     assert config["training"]["adaptive_cycles"] == 20
     assert config["controller_v2"]["total_steps"] == 4000
     assert config["training"]["residual_loss_mode"]["initial"] == "pseudo_huber"

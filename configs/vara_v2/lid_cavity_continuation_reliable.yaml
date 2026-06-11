@@ -18,7 +18,7 @@ model:
   physics_formulation: hard_boundary_streamfunction_pressure
   hard_boundary_corner_width: 0.08
   hard_boundary_lid_vertical_power: 2
-  hard_boundary_correction_scale: 32
+  hard_boundary_correction_scale: 24
 
 optimizer:
   scheduler:
@@ -77,11 +77,11 @@ training:
     p: 0.0
     omega: 0.0
     pressure_gradient: 0.0
-    speed_cap: 0.3
-    raw_psi_l2: 0.0001
+    speed_cap: 0.6
+    raw_psi_l2: 0.0005
     pressure_gradient_l2: 0.0001
     vorticity_smoothness: 0.0
-    near_wall_vorticity_l2: 0.0001
+    near_wall_vorticity_l2: 0.0003
 
 losses:
   speed_cap:
@@ -106,7 +106,7 @@ losses:
         weight: 0.60
       - until_step: 4000
         band_width: 0.06
-        weight: 1.0
+        weight: 0.75
   near_wall_vorticity_l2:
     enabled: true
     band_width: 0.10
@@ -119,15 +119,15 @@ cavity_curriculum:
     - until_step: 1000
       corner_width: 0.10
       lid_vertical_power: 2
-      correction_scale: 32
+      correction_scale: 16
     - until_step: 3000
       corner_width: 0.08
       lid_vertical_power: 2
-      correction_scale: 32
+      correction_scale: 24
     - until_step: 4000
       corner_width: 0.06
       lid_vertical_power: 2
-      correction_scale: 32
+      correction_scale: 24
 
 loss_normalization:
   enabled: false
@@ -197,9 +197,12 @@ checkpoint:
   reference_free_metrics:
     - pde_residual_mean
     - momentum_residual_mean
+    - core_pde_residual_mean
     - boundary_condition_error
     - near_wall_pde_residual_mean
     - near_wall_momentum_v_mean
+    - speed_pred_max
+    - omega_abs_95p
   metric_floor: 1.0e-8
 
 convergence_early_stopping:
