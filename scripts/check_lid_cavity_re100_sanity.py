@@ -27,6 +27,8 @@ VANILLA_REQUIRED = (
     "continuity_residual_mean",
     "momentum_residual_mean",
     "streamfunction_consistency_rmse",
+    "near_wall_pde_residual_mean",
+    "near_wall_momentum_v_mean",
 )
 
 
@@ -43,6 +45,11 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--config", default="configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    parser.add_argument(
+        "--preset",
+        choices=["fast_screen", "diagnostic", "reliable", "final"],
+        default="reliable",
+    )
     parser.add_argument("--output_dir", default="experiments/vara_v2/re100_sanity_gate")
     parser.add_argument("--results_dir", default=None, help="Validate an existing run instead of training.")
     parser.add_argument("--overwrite", action="store_true")
@@ -82,17 +89,6 @@ def _run_required_methods(args: argparse.Namespace, output_dir: Path, seeds: lis
     if args.method == "vanilla":
         _run_methods(args, output_dir, ["vanilla"], seeds=seeds, overwrite=True)
         return
-    vanilla_dir = output_dir / "_vanilla_gate"
-    _run_methods(args, vanilla_dir, ["vanilla"], seeds=seeds, overwrite=True)
-    vanilla_report = build_combined_report(vanilla_dir, "vanilla", seeds)
-    if not vanilla_report["passed"]:
-        save_json(
-            vanilla_report,
-            output_dir / "summary" / "re100_sanity_report.json",
-        )
-        raise SystemExit(
-            "Vanilla Re=100 failed sanity gates; VARA was not evaluated."
-        )
     _run_methods(args, output_dir, ["vanilla", "vara_v2"], seeds=seeds, overwrite=True)
 
 
@@ -116,6 +112,8 @@ def _run_methods(
         reliable=True,
         continue_on_invalid=True,
         quick=False,
+        preset=args.preset,
+        gate_vara_on_vanilla=True,
         overwrite=overwrite or bool(args.overwrite),
     )
     run_v2_continuation(run_args)
@@ -292,7 +290,17 @@ def _compare_vara_to_vanilla(
     tolerance = float(thresholds.get("max_vara_vs_vanilla_physics_degradation", 0.02))
     vanilla_metrics = vanilla["metrics"]
     vara_metrics = vara["metrics"]
-    for metric in ["boundary_condition_error", "pde_residual_mean", "momentum_residual_mean"]:
+    for metric in [
+        "boundary_condition_error",
+        "pde_residual_mean",
+        "momentum_residual_mean",
+        "continuity_residual_mean",
+        "speed_pred_max",
+        "detected_vortex_count",
+        "streamfunction_consistency_rmse",
+        "near_wall_pde_residual_mean",
+        "near_wall_momentum_v_mean",
+    ]:
         v0 = vanilla_metrics.get(metric, float("nan"))
         v1 = vara_metrics.get(metric, float("nan"))
         if np.isfinite(v0) and np.isfinite(v1) and v1 > v0 * (1.0 + tolerance):

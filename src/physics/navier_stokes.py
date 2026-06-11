@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 
 
@@ -23,14 +25,22 @@ def navier_stokes_residuals(
     nu: float,
     steady: bool = True,
     detach_coords: bool = True,
+    runtime_profile: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute velocity-pressure residuals for 2D incompressible Navier-Stokes."""
+    total_start = time.perf_counter()
     if detach_coords:
         xyt = coords.clone().detach().requires_grad_(True)
     else:
         xyt = coords.requires_grad_(True)
 
+    forward_start = time.perf_counter()
     out = model(xyt)
+    if runtime_profile is not None:
+        runtime_profile["forward_pass_sec"] = runtime_profile.get(
+            "forward_pass_sec", 0.0
+        ) + (time.perf_counter() - forward_start)
+    residual_start = time.perf_counter()
     u, v, p = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
     grad_u = gradients(u, xyt)
@@ -59,6 +69,13 @@ def navier_stokes_residuals(
     omega = v_x - u_y
     p_grad_norm = torch.sqrt(p_x * p_x + p_y * p_y + 1e-18)
     pde_residual = torch.sqrt(f_u * f_u + f_v * f_v + f_c * f_c + 1e-18)
+    if runtime_profile is not None:
+        runtime_profile["pde_residual_autograd_sec"] = runtime_profile.get(
+            "pde_residual_autograd_sec", 0.0
+        ) + (time.perf_counter() - residual_start)
+        runtime_profile["navier_stokes_total_sec"] = runtime_profile.get(
+            "navier_stokes_total_sec", 0.0
+        ) + (time.perf_counter() - total_start)
 
     return {
         "coords": xyt,
@@ -84,4 +101,3 @@ def navier_stokes_residuals(
         "p_grad_norm": p_grad_norm,
         "pde_residual": pde_residual,
     }
-

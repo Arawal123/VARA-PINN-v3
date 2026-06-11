@@ -36,6 +36,12 @@ from src.utils.io import save_json
 
 DEFAULT_REYNOLDS = [100, 150, 200, 300, 400, 600, 800, 1000, 1200, 1600, 2000, 2400, 3200]
 EXPLORATORY_REYNOLDS = [4000, 5000, 7500, 10000]
+PRESET_PATHS = {
+    "fast_screen": "configs/vara_v2/presets/fast_screen.yaml",
+    "diagnostic": "configs/vara_v2/presets/diagnostic.yaml",
+    "reliable": "configs/vara_v2/presets/reliable.yaml",
+    "final": "configs/vara_v2/presets/final.yaml",
+}
 
 
 def main() -> None:
@@ -52,6 +58,12 @@ def main() -> None:
     parser.add_argument("--output_dir", default="experiments/vara_v2/re_continuation")
     parser.add_argument("--enhanced_backbone", action="store_true")
     parser.add_argument(
+        "--preset",
+        choices=sorted(PRESET_PATHS),
+        default=None,
+        help="Shared runtime/accuracy preset applied identically to all methods.",
+    )
+    parser.add_argument(
         "--reliable",
         action="store_true",
         help="Use the physically guarded, longer, hard-boundary continuation protocol.",
@@ -61,7 +73,17 @@ def main() -> None:
         action="store_true",
         help="Continue a method chain after a stage fails reference-free validity checks.",
     )
+    parser.add_argument(
+        "--gate_vara_on_vanilla",
+        action="store_true",
+        help="At each Re, skip VARA V2 unless the matched Vanilla stage is valid.",
+    )
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument(
+        "--disable_stabilizers",
+        action="store_true",
+        help="Ablation: retain the formulation/budget but disable numerical stabilizers.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -77,6 +99,11 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     base = deep_update(base, load_config("configs/vara_v2/continuation.yaml"))
     if args.reliable:
         base = deep_update(base, load_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml"))
+    preset = getattr(args, "preset", None)
+    if preset:
+        base = deep_update(base, load_config(PRESET_PATHS[str(preset)]))
+    if bool(getattr(args, "disable_stabilizers", False)):
+        base = _without_cavity_stabilizers(base)
     if args.enhanced_backbone:
         base = deep_update(base, load_config("configs/vara_v2/enhanced_backbone.yaml"))
     if args.quick:
@@ -134,6 +161,23 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
             re_name = f"re_{int(round(reynolds)):04d}"
             for method in args.methods:
                 if method in failed_methods:
+                    continue
+                if (
+                    method == "vara_v2"
+                    and bool(getattr(args, "gate_vara_on_vanilla", False))
+                    and (
+                        "vanilla" not in per_method
+                        or not bool(
+                            per_method["vanilla"].get(
+                                "continuation_stage_valid", False
+                            )
+                        )
+                    )
+                ):
+                    print(
+                        f"seed={seed} Re={reynolds:g}: skipping VARA V2 because "
+                        "matched Vanilla did not pass."
+                    )
                     continue
                 method_dir = output / f"seed_{seed}" / re_name / method
                 config = deepcopy(base)
@@ -255,6 +299,36 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     return {"raw": raw, "comparisons": comparisons}
 
 
+def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
+    weights = dict(config.get("training", {}).get("weights", {}))
+    for name in (
+        "speed_cap",
+        "raw_psi_l2",
+        "pressure_gradient_l2",
+        "vorticity_smoothness",
+        "near_wall_vorticity_l2",
+    ):
+        weights[name] = 0.0
+    return deep_update(
+        config,
+        {
+            "training": {
+                "residual_loss_mode": "mse",
+                "weights": weights,
+            },
+            "losses": {
+                "speed_cap": {"enabled": False},
+                "raw_psi_l2": {"enabled": False},
+                "pressure_gradient_l2": {"enabled": False},
+                "vorticity_smoothness": {"enabled": False},
+                "near_wall_vorticity_l2": {"enabled": False},
+                "near_wall_momentum": {"enabled": False},
+            },
+            "cavity_curriculum": {"enabled": False},
+        },
+    )
+
+
 def _load_base_config(config_path: str | Path) -> dict[str, Any]:
     """Load continuation config, accepting overlay-only YAML files.
 
@@ -369,6 +443,15 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             cfg.get("max_lid_cavity_topology_score", np.inf)
         ),
         "velocity_full_rel_l2": float(cfg.get("max_velocity_full_rel_l2", np.inf)),
+        "near_wall_pde_residual_mean": float(
+            cfg.get("max_near_wall_pde_residual_mean", np.inf)
+        ),
+        "near_wall_momentum_v_mean": float(
+            cfg.get("max_near_wall_momentum_v_mean", np.inf)
+        ),
+        "core_pde_residual_mean": float(
+            cfg.get("max_core_pde_residual_mean", np.inf)
+        ),
     }
     reasons = []
     for name, maximum in checks.items():

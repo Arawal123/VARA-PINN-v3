@@ -63,14 +63,24 @@ def evaluate_on_grid(
     steady: bool = True,
     residual_interior_only: bool = False,
     include_reference_metrics: bool = True,
+    include_streamfunction_metrics: bool = True,
+    runtime_profile: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Compute global evaluation metrics without using them for adaptation."""
     start = time.time()
     coords = torch.tensor(coords_np, dtype=torch.float32, device=device)
     model.eval()
-    with torch.no_grad():
-        pred = model(coords)
-    residuals = navier_stokes_residuals(model, coords, nu=benchmark.nu, steady=steady)
+    residuals = navier_stokes_residuals(
+        model,
+        coords,
+        nu=benchmark.nu,
+        steady=steady,
+        runtime_profile=runtime_profile,
+    )
+    pred = torch.cat(
+        [residuals["u"], residuals["v"], residuals["p"]],
+        dim=1,
+    )
     has_reference = bool(include_reference_metrics) and bool(
         getattr(benchmark, "has_reference", True)
     )
@@ -192,13 +202,29 @@ def evaluate_on_grid(
         "wall_clock_eval_sec": time.time() - start,
         "num_eval_points": int(coords_np.shape[0]),
     }
-    metrics.update(_streamfunction_metrics(benchmark, coords_np, u, v))
+    if include_streamfunction_metrics:
+        streamfunction_start = time.perf_counter()
+        metrics.update(_streamfunction_metrics(benchmark, coords_np, u, v))
+        if runtime_profile is not None:
+            runtime_profile["streamfunction_diagnostics_sec"] = (
+                runtime_profile.get("streamfunction_diagnostics_sec", 0.0)
+                + time.perf_counter()
+                - streamfunction_start
+            )
     metrics.update(_direct_streamfunction_diagnostics(model, coords_np, device))
     if (
         include_reference_metrics
+        and include_streamfunction_metrics
         and benchmark.__class__.__name__.lower().startswith("liddrivencavity")
     ):
+        topology_start = time.perf_counter()
         metrics.update(_lid_cavity_topology_metrics(benchmark, coords_np, u, v))
+        if runtime_profile is not None:
+            runtime_profile["topology_diagnostics_sec"] = (
+                runtime_profile.get("topology_diagnostics_sec", 0.0)
+                + time.perf_counter()
+                - topology_start
+            )
     if has_reference and ref is not None:
         has_p_ref = bool(ref.get("has_p_reference", np.isfinite(ref.get("p", np.array([]))).any()))
         has_omega_ref = bool(ref.get("has_omega_reference", np.isfinite(ref.get("omega", np.array([]))).any()))
@@ -464,6 +490,8 @@ def _cavity_residual_geometry_metrics(
         & (coords_np[:, 1:2] <= y1 - wall_margin)
     )
     near_wall_mask = ~core_mask
+    side_wall_mask = left | right
+    top_wall_mask = top
     boundary_mask = benchmark.boundary_mask_np(coords_np)[:, None] if hasattr(benchmark, "boundary_mask_np") else np.zeros_like(corner_mask)
     corner_boundary_mask = corner_mask & boundary_mask
     return {
@@ -476,6 +504,14 @@ def _cavity_residual_geometry_metrics(
         "core_momentum_v_mean": _masked_mean(momentum_v, core_mask),
         "near_wall_momentum_u_mean": _masked_mean(momentum_u, near_wall_mask),
         "near_wall_momentum_v_mean": _masked_mean(momentum_v, near_wall_mask),
+        "near_wall_momentum_v_max": _masked_max(momentum_v, near_wall_mask),
+        "core_p_grad_mean": _masked_mean(p_grad, core_mask),
+        "near_wall_p_grad_mean": _masked_mean(p_grad, near_wall_mask),
+        "near_wall_p_grad_max": _masked_max(p_grad, near_wall_mask),
+        "side_wall_p_grad_mean": _masked_mean(p_grad, side_wall_mask),
+        "side_wall_p_grad_max": _masked_max(p_grad, side_wall_mask),
+        "top_wall_p_grad_mean": _masked_mean(p_grad, top_wall_mask),
+        "top_wall_p_grad_max": _masked_max(p_grad, top_wall_mask),
         "corner_p_grad_mean": _masked_mean(p_grad, corner_mask),
         "corner_boundary_error": _corner_boundary_error(model, benchmark, coords_np, corner_boundary_mask[:, 0], device),
     }
@@ -503,6 +539,16 @@ def _masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
     if selected.size == 0:
         return float("nan")
     return float(np.mean(selected))
+
+
+def _masked_max(values: np.ndarray, mask: np.ndarray) -> float:
+    flat_mask = np.asarray(mask).reshape(-1).astype(bool)
+    flat_values = np.asarray(values, dtype=float).reshape(-1)
+    selected = flat_values[flat_mask]
+    selected = selected[np.isfinite(selected)]
+    if selected.size == 0:
+        return float("nan")
+    return float(np.max(selected))
 
 
 def _corner_boundary_error(

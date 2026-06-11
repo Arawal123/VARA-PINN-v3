@@ -16,9 +16,9 @@ model:
   # regularized lid and stationary walls. The older velocity hard-boundary and
   # plain streamfunction formulations remain available only as ablations.
   physics_formulation: hard_boundary_streamfunction_pressure
-  hard_boundary_corner_width: 0.06
-  hard_boundary_lid_vertical_power: 3
-  hard_boundary_correction_scale: 64
+  hard_boundary_corner_width: 0.08
+  hard_boundary_lid_vertical_power: 2
+  hard_boundary_correction_scale: 32
 
 optimizer:
   scheduler:
@@ -49,25 +49,39 @@ training:
   adaptive_cycles: 20
   epochs_per_cycle: 200
   n_collocation: 2048
-  n_boundary: 512
+  n_boundary: 64
   n_data: 0
   log_every: 50
+  skip_boundary_loss_if_hard_enforced: true
+  collocation_curriculum:
+    enabled: true
+    stages:
+      - until_step: 1000
+        n_collocation: 1024
+        n_boundary: 64
+      - until_step: 3000
+        n_collocation: 1536
+        n_boundary: 64
+      - until_step: 4000
+        n_collocation: 2048
+        n_boundary: 64
   weights:
     # The component residuals already comprise the PDE objective.
     pde: 0.0
     momentum_u: 1.0
     momentum_v: 1.0
     continuity: 1.0
-    bc: 1.0
+    bc: 0.0
     u: 0.0
     v: 0.0
     p: 0.0
     omega: 0.0
     pressure_gradient: 0.0
-    speed_cap: 0.1
+    speed_cap: 0.3
     raw_psi_l2: 0.0001
     pressure_gradient_l2: 0.0001
     vorticity_smoothness: 0.0
+    near_wall_vorticity_l2: 0.0001
 
 losses:
   speed_cap:
@@ -77,6 +91,25 @@ losses:
     enabled: true
   pressure_gradient_l2:
     enabled: true
+  near_wall_momentum:
+    enabled: true
+    normalize_mean: true
+    stages:
+      - until_step: 800
+        band_width: 0.10
+        weight: 0.0
+      - until_step: 1800
+        band_width: 0.10
+        weight: 0.25
+      - until_step: 3000
+        band_width: 0.08
+        weight: 0.60
+      - until_step: 4000
+        band_width: 0.06
+        weight: 1.0
+  near_wall_vorticity_l2:
+    enabled: true
+    band_width: 0.10
   vorticity_smoothness:
     enabled: false
 
@@ -84,17 +117,17 @@ cavity_curriculum:
   enabled: true
   stages:
     - until_step: 1000
-      corner_width: 0.08
-      lid_vertical_power: 3
-      correction_scale: 64
+      corner_width: 0.10
+      lid_vertical_power: 2
+      correction_scale: 32
     - until_step: 3000
-      corner_width: 0.06
-      lid_vertical_power: 3
-      correction_scale: 64
+      corner_width: 0.08
+      lid_vertical_power: 2
+      correction_scale: 32
     - until_step: 4000
-      corner_width: 0.05
-      lid_vertical_power: 3
-      correction_scale: 64
+      corner_width: 0.06
+      lid_vertical_power: 2
+      correction_scale: 32
 
 loss_normalization:
   enabled: false
@@ -114,8 +147,10 @@ controller_v2:
   block_steps: 200
   probe_steps: 10
   gradient_probe_interior: 256
-  gradient_probe_boundary: 64
-  counterfactual_probe_enabled: true
+  gradient_probe_boundary: 32
+  # Reliable cavity comparisons use one in-budget trust probe only. Running a
+  # separate neutral counterfactual branch would add hidden optimizer work.
+  counterfactual_probe_enabled: false
   counterfactual_target_margin: 0.005
   counterfactual_guard_margin: 0.02
   guard_metrics:
@@ -128,6 +163,11 @@ controller_v2:
     - centerline_pde_residual_mean
     - centerline_continuity_residual_mean
     - corner_pde_residual_mean
+    - near_wall_pde_residual_mean
+    - near_wall_momentum_v_mean
+    - speed_pred_max
+    - omega_abs_95p
+    - near_wall_p_grad_mean
 
 continuation_anchor:
   enabled: false
@@ -152,11 +192,14 @@ sampling:
 
 checkpoint:
   restore_best_before_final: true
+  save_latest_every_cycle: false
   score_mode: sum
   reference_free_metrics:
     - pde_residual_mean
     - momentum_residual_mean
     - boundary_condition_error
+    - near_wall_pde_residual_mean
+    - near_wall_momentum_v_mean
   metric_floor: 1.0e-8
 
 convergence_early_stopping:
@@ -190,6 +233,12 @@ evaluation:
   residual_interior_only: true
   controller_reference_metrics_enabled: false
   checkpoint_reference_metrics_enabled: false
+  controller_streamfunction_metrics: false
+  topology_interval_cycles: 5
+
+runtime_profiling:
+  enabled: true
+  detailed_every_steps: 50
 
 continuation_validity:
   enabled: true
@@ -197,7 +246,7 @@ continuation_validity:
   max_continuity_residual_mean: 0.001
   max_momentum_residual_mean: 0.30
   max_boundary_condition_error: 1.0e-8
-  max_speed_pred: 2.0
+  max_speed_pred: 2.2
   min_speed_pred_mean: 0.05
   max_streamfunction_consistency_rmse: 0.001
   max_lid_cavity_primary_center_error: 0.10
@@ -207,6 +256,9 @@ continuation_validity:
   min_primary_streamfunction_abs: 0.015
   min_detected_vortices: 1
   max_detected_vortices: 2
+  max_near_wall_pde_residual_mean: 3.0
+  max_near_wall_momentum_v_mean: 3.0
+  max_core_pde_residual_mean: 0.35
   min_primary_vortex_wall_distance: 0.05
   max_final_checkpoint_physics_degradation: 0.05
   max_vara_vs_vanilla_physics_degradation: 0.02

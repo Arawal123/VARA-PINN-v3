@@ -34,14 +34,16 @@ def main() -> None:
     parser.add_argument("--output_dir", default="experiments/vara_v2/cavity_formulation_ablation_re100")
     parser.add_argument("--screening_steps", type=int, default=1200)
     parser.add_argument("--epochs_per_cycle", type=int, default=200)
-    parser.add_argument("--corner_widths", nargs="+", type=float, default=[0.04, 0.06, 0.08])
-    parser.add_argument("--lid_vertical_powers", nargs="+", type=int, default=[2, 3, 4])
-    parser.add_argument("--correction_scales", nargs="+", type=float, default=[32.0, 64.0, 128.0])
+    parser.add_argument("--corner_widths", nargs="+", type=float, default=[0.06, 0.08, 0.10])
+    parser.add_argument("--lid_vertical_powers", nargs="+", type=int, default=[2, 3])
+    parser.add_argument("--correction_scales", nargs="+", type=float, default=[32.0, 64.0])
     parser.add_argument("--speed_kill_step", type=int, default=400)
     parser.add_argument("--speed_kill_max", type=float, default=3.0)
     parser.add_argument("--pde_kill_step", type=int, default=800)
     parser.add_argument("--pde_kill_max", type=float, default=20.0)
     parser.add_argument("--vortex_kill_max", type=int, default=4)
+    parser.add_argument("--near_wall_kill_step", type=int, default=800)
+    parser.add_argument("--near_wall_momentum_v_kill_max", type=float, default=20.0)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     run(args)
@@ -195,6 +197,16 @@ def _run_candidate(
             break
         if step >= int(args.pde_kill_step) and float(metrics.get("pde_residual_mean", 0.0)) > float(args.pde_kill_max):
             early_stop_reason = f"pde_residual_mean>{args.pde_kill_max:g}@{step}"
+            break
+        if (
+            step >= int(args.near_wall_kill_step)
+            and float(metrics.get("near_wall_momentum_v_mean", 0.0))
+            > float(args.near_wall_momentum_v_kill_max)
+        ):
+            early_stop_reason = (
+                "near_wall_momentum_v_mean>"
+                f"{args.near_wall_momentum_v_kill_max:g}@{step}"
+            )
             break
         if step >= screening_steps and int(metrics.get("detected_vortex_count", 0)) > int(args.vortex_kill_max):
             early_stop_reason = f"detected_vortex_count>{args.vortex_kill_max}@{step}"

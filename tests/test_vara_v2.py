@@ -7,7 +7,11 @@ import pandas as pd
 import pytest
 import torch
 
-from scripts.run_vara_v2_continuation import _continuation_validity, _load_base_config
+from scripts.run_vara_v2_continuation import (
+    _continuation_validity,
+    _load_base_config,
+    _without_cavity_stabilizers,
+)
 from scripts.check_lid_cavity_re100_sanity import build_report
 from src.controllers import V2ControllerConfig, VARAV2Controller
 from src.evaluation.metrics import evaluate_on_grid
@@ -30,6 +34,7 @@ from src.physics.rectangular_benchmarks import LidDrivenCavityQualitative
 from src.sampling.boundary_sampler import BoundarySampler, boundary_side_fractions
 from src.physics.taylor_green import TaylorGreenVortex
 from src.training.checkpointing import save_checkpoint
+from src.training.checkpointing import load_checkpoint
 from src.training.vara_trainer import VARATrainer
 from src.training.vara_v2_trainer import VARAV2Trainer
 from src.utils.config import deep_update, load_config
@@ -275,9 +280,9 @@ def test_continuation_overlay_inherits_lid_cavity_base_config():
     assert config["benchmark"] == "lid_driven_cavity"
     assert config["model"]["physics_formulation"] == "hard_boundary_streamfunction_pressure"
     assert config["model"]["output_dim"] == 2
-    assert config["model"]["hard_boundary_corner_width"] == pytest.approx(0.06)
-    assert config["model"]["hard_boundary_lid_vertical_power"] == 3
-    assert config["model"]["hard_boundary_correction_scale"] == pytest.approx(64.0)
+    assert config["model"]["hard_boundary_corner_width"] == pytest.approx(0.08)
+    assert config["model"]["hard_boundary_lid_vertical_power"] == 2
+    assert config["model"]["hard_boundary_correction_scale"] == pytest.approx(32.0)
     assert config["training"]["adaptive_cycles"] == 20
     assert config["controller_v2"]["total_steps"] == 4000
     assert config["training"]["residual_loss_mode"]["initial"] == "pseudo_huber"
@@ -391,6 +396,106 @@ def test_reference_free_regularizers_and_pseudo_huber_are_available():
     assert "pressure_gradient_l2" in robust_pointwise
 
 
+def test_near_wall_momentum_curriculum_masks_only_training_objective():
+    class SmoothBase(torch.nn.Module):
+        def forward(self, coords):
+            x = coords[:, 0:1]
+            y = coords[:, 1:2]
+            return torch.cat([x * y, x + y], dim=1)
+
+    benchmark = LidDrivenCavityQualitative(reynolds=100.0)
+    model = HardBoundaryStreamfunctionPressureWrapper(
+        SmoothBase(),
+        benchmark.bounds,
+        corner_width=0.08,
+        lid_vertical_power=2,
+        correction_scale=32.0,
+    )
+    batch = {
+        "xy_f": torch.tensor(
+            [[0.01, 0.5], [0.5, 0.5]],
+            dtype=torch.float64,
+        ),
+        "xy_bc": torch.empty((0, 2), dtype=torch.float64),
+    }
+    pointwise = compute_pointwise_losses(
+        model,
+        batch,
+        benchmark,
+        True,
+        regularization_config={
+            "domain_bounds": benchmark.bounds,
+            "near_wall_momentum": {
+                "enabled": True,
+                "band_width": 0.1,
+                "weight": 0.0,
+                "normalize_mean": True,
+            },
+        },
+        compute_boundary_loss=False,
+    )
+    weights = pointwise["near_wall_momentum_weight_mean"].reshape(-1)
+    assert weights[0].item() == pytest.approx(0.0)
+    assert weights[1].item() == pytest.approx(2.0)
+    assert torch.isfinite(pointwise["raw_momentum_v_mse"]).all()
+
+
+def test_stabilizer_ablation_keeps_formulation_and_budget_but_disables_losses():
+    config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    ablated = _without_cavity_stabilizers(config)
+    assert (
+        ablated["model"]["physics_formulation"]
+        == config["model"]["physics_formulation"]
+    )
+    assert ablated["controller_v2"]["total_steps"] == config["controller_v2"]["total_steps"]
+    assert ablated["training"]["n_collocation"] == config["training"]["n_collocation"]
+    assert ablated["training"]["residual_loss_mode"] == "mse"
+    assert ablated["losses"]["near_wall_momentum"]["enabled"] is False
+    assert ablated["training"]["weights"]["speed_cap"] == 0.0
+
+
+def test_vara_v2_inherits_reliable_cavity_stabilizers_identically(tmp_path):
+    config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        config,
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "training": {"n_collocation": 8, "n_boundary": 4, "n_data": 0},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    trainer = VARAV2Trainer(config)
+    active = trainer._active_loss_config()
+    assert trainer.model.physics_formulation == "hard_boundary_streamfunction_pressure"
+    assert active["speed_cap"]["enabled"] is True
+    assert active["near_wall_momentum"]["enabled"] is True
+    assert active["near_wall_momentum"]["weight"] == pytest.approx(0.0)
+    assert trainer._residual_loss_settings()[0] == "pseudo_huber"
+    assert trainer._compute_boundary_training_loss(
+        config["training"]["weights"]
+    ) is False
+
+
+def test_checkpoint_restores_live_cavity_curriculum_state(tmp_path):
+    config = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    model = build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model.corner_width = 0.10
+    model.lid_vertical_power = 2
+    model.correction_scale = 32.0
+    path = tmp_path / "cavity.pt"
+    save_checkpoint(path, model, optimizer, config, {}, 10, 1)
+    model.corner_width = 0.06
+    model.lid_vertical_power = 3
+    model.correction_scale = 64.0
+    load_checkpoint(path, model)
+    assert model.corner_width == pytest.approx(0.10)
+    assert model.lid_vertical_power == 2
+    assert model.correction_scale == pytest.approx(32.0)
+
+
 def test_missing_full_field_reference_does_not_invalidate_reliable_stage():
     metrics = {
         "has_reference": False,
@@ -409,6 +514,9 @@ def test_missing_full_field_reference_does_not_invalidate_reliable_stage():
         "detected_vortex_count": 1,
         "primary_vortex_center_x": 0.6,
         "primary_vortex_center_y": 0.7,
+        "near_wall_pde_residual_mean": 0.2,
+        "near_wall_momentum_v_mean": 0.2,
+        "core_pde_residual_mean": 0.1,
     }
     config = load_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     validity = _continuation_validity(metrics, config)

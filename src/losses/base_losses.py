@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -68,14 +69,23 @@ def compute_pointwise_losses(
     residual_loss_mode: str = "mse",
     pseudo_huber_delta: float = 1.0,
     regularization_config: dict[str, Any] | None = None,
+    compute_boundary_loss: bool = True,
+    runtime_profile: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute pointwise losses used by global and local objectives."""
+    loss_start = time.perf_counter()
     xy_f = batch["xy_f"]
     xy_bc = batch["xy_bc"]
     xy_data = batch.get("xy_data")
     targets = batch.get("targets_data")
 
-    residuals = navier_stokes_residuals(model, xy_f, nu=benchmark.nu, steady=steady)
+    residuals = navier_stokes_residuals(
+        model,
+        xy_f,
+        nu=benchmark.nu,
+        steady=steady,
+        runtime_profile=runtime_profile,
+    )
     momentum_u_mse = residuals["f_u"].pow(2)
     momentum_v_mse = residuals["f_v"].pow(2)
     continuity_mse = residuals["f_c"].pow(2)
@@ -94,6 +104,13 @@ def compute_pointwise_losses(
         momentum_v_obj = momentum_v_mse
     else:
         raise ValueError(f"Unsupported residual_loss_mode: {residual_loss_mode}")
+    momentum_u_obj, momentum_v_obj, near_wall_logs = _apply_near_wall_curriculum(
+        momentum_u_obj,
+        momentum_v_obj,
+        residuals["coords"],
+        benchmark,
+        regularization_config or {},
+    )
     pointwise: dict[str, torch.Tensor] = {
         "momentum_u": momentum_u_obj,
         "momentum_v": momentum_v_obj,
@@ -103,6 +120,7 @@ def compute_pointwise_losses(
         "raw_momentum_v_mse": momentum_v_mse,
         "raw_continuity_mse": continuity_mse,
     }
+    pointwise.update(near_wall_logs)
     _add_reference_free_regularizers(
         pointwise,
         model,
@@ -111,22 +129,69 @@ def compute_pointwise_losses(
         regularization_config or {},
     )
 
-    bc_pred = model(xy_bc)
-    bc_ref = benchmark.exact_torch(xy_bc)
-    pointwise["bc"] = (bc_pred[:, 0:1] - bc_ref["u"]).pow(2) + (bc_pred[:, 1:2] - bc_ref["v"]).pow(2)
+    if compute_boundary_loss:
+        bc_pred = model(xy_bc)
+        bc_ref = benchmark.exact_torch(xy_bc)
+        pointwise["bc"] = (bc_pred[:, 0:1] - bc_ref["u"]).pow(2) + (
+            bc_pred[:, 1:2] - bc_ref["v"]
+        ).pow(2)
+    else:
+        pointwise["bc"] = xy_bc.new_zeros((xy_bc.shape[0], 1))
 
     if xy_data is not None and targets is not None and xy_data.shape[0] > 0 and getattr(benchmark, "has_reference", True):
         data_pred = model(xy_data)
-        omega_pred = navier_stokes_residuals(model, xy_data, nu=benchmark.nu, steady=steady)["omega"]
+        data_residuals = navier_stokes_residuals(
+            model,
+            xy_data,
+            nu=benchmark.nu,
+            steady=steady,
+            runtime_profile=runtime_profile,
+        )
+        omega_pred = data_residuals["omega"]
         p_pred_c = center_pressure(data_pred[:, 2:3])
         p_true_c = center_pressure(targets["p"])
         pointwise["u"] = (data_pred[:, 0:1] - targets["u"]).pow(2)
         pointwise["v"] = (data_pred[:, 1:2] - targets["v"]).pow(2)
         pointwise["p"] = (p_pred_c - p_true_c).pow(2)
         pointwise["omega"] = (omega_pred - targets["omega"]).pow(2)
-        p_grad = navier_stokes_residuals(model, xy_data, nu=benchmark.nu, steady=steady)
-        pointwise["pressure_gradient"] = (p_grad["p_x"] - targets["p_x"]).pow(2) + (p_grad["p_y"] - targets["p_y"]).pow(2)
+        pointwise["pressure_gradient"] = (
+            data_residuals["p_x"] - targets["p_x"]
+        ).pow(2) + (data_residuals["p_y"] - targets["p_y"]).pow(2)
+    if runtime_profile is not None:
+        runtime_profile["loss_construction_sec"] = runtime_profile.get(
+            "loss_construction_sec", 0.0
+        ) + (time.perf_counter() - loss_start)
     return pointwise
+
+
+def _apply_near_wall_curriculum(
+    momentum_u: torch.Tensor,
+    momentum_v: torch.Tensor,
+    coords: torch.Tensor,
+    benchmark: Any,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    wall_cfg = dict(cfg.get("near_wall_momentum", {}))
+    if not bool(wall_cfg.get("enabled", False)):
+        return momentum_u, momentum_v, {}
+    band = max(float(wall_cfg.get("band_width", 0.08)), 0.0)
+    near_wall_weight = min(max(float(wall_cfg.get("weight", 1.0)), 0.0), 1.0)
+    distance = _normalized_wall_distance(coords, benchmark.bounds)
+    near_wall = distance < band
+    weights = torch.where(
+        near_wall,
+        torch.full_like(distance, near_wall_weight),
+        torch.ones_like(distance),
+    )
+    if bool(wall_cfg.get("normalize_mean", True)):
+        weights = weights / weights.mean().clamp_min(1e-12)
+    return (
+        momentum_u * weights,
+        momentum_v * weights,
+        {
+            "near_wall_momentum_weight_mean": weights,
+        },
+    )
 
 
 def _add_reference_free_regularizers(
@@ -160,6 +225,31 @@ def _add_reference_free_regularizers(
         pointwise["vorticity_smoothness"] = (
             grad_omega[:, 0:1].pow(2) + grad_omega[:, 1:2].pow(2)
         )
+
+    near_wall_vort_cfg = dict(cfg.get("near_wall_vorticity_l2", {}))
+    if bool(near_wall_vort_cfg.get("enabled", False)):
+        band = max(float(near_wall_vort_cfg.get("band_width", 0.10)), 0.0)
+        distance = _normalized_wall_distance(
+            residuals["coords"],
+            cfg.get("domain_bounds", (0.0, 1.0, 0.0, 1.0)),
+        )
+        mask = (distance < band).to(dtype=residuals["omega"].dtype)
+        pointwise["near_wall_vorticity_l2"] = mask * residuals["omega"].pow(2)
+
+
+def _normalized_wall_distance(
+    coords: torch.Tensor,
+    bounds: tuple[float, float, float, float] | list[float] | None,
+) -> torch.Tensor:
+    x0, x1, y0, y1 = tuple(bounds or (0.0, 1.0, 0.0, 1.0))
+    width = max(float(x1 - x0), 1e-12)
+    height = max(float(y1 - y0), 1e-12)
+    x = coords[:, 0:1]
+    y = coords[:, 1:2]
+    return torch.minimum(
+        torch.minimum((x - x0) / width, (x1 - x) / width),
+        torch.minimum((y - y0) / height, (y1 - y) / height),
+    )
 
 
 def compute_global_losses(

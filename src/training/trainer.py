@@ -126,17 +126,18 @@ class ExperimentTrainer:
             self.checkpoint_dir = ensure_dir(root / "checkpoints")
             self.figure_dir = ensure_dir(root / "figures")
             self.table_dir = ensure_dir(root / "tables")
-            self.metrics_dir = ensure_dir(root / "metrics")
+            self.metrics_dir = root / "metrics"
         else:
             self.run_dir = ensure_dir(root / "logs" / self.run_id)
             self.checkpoint_dir = ensure_dir(root / "checkpoints" / self.run_id)
             self.figure_dir = ensure_dir(root / "figures" / self.run_id)
             self.table_dir = ensure_dir(root / "tables" / self.run_id)
-            self.metrics_dir = ensure_dir(root / "metrics" / self.run_id)
+            self.metrics_dir = root / "metrics" / self.run_id
         save_config(config, self.run_dir / "config_snapshot.yaml")
 
         self.metrics_logger = CSVLogger(self.run_dir / "metrics.csv")
         self.loss_logger = CSVLogger(self.run_dir / "losses.csv")
+        self.runtime_logger = CSVLogger(self.run_dir / "runtime_profile.csv")
         self.action_logger = JSONListLogger(self.run_dir / "action_log.json")
         self.weak_logger = JSONListLogger(self.run_dir / "weak_region_log.json")
         self.score_logger = JSONListLogger(self.run_dir / "patch_scores.json")
@@ -144,6 +145,7 @@ class ExperimentTrainer:
         self.action_records: list[dict[str, Any]] = []
         self.last_losses: dict[str, float] = {}
         self.last_boundary_sampling_summary: dict[str, float] = {}
+        self._print_runtime_environment()
 
         t_bounds = getattr(self.benchmark, "t_bounds", None)
         sampler_cfg = config.get("sampling", {})
@@ -203,6 +205,7 @@ class ExperimentTrainer:
         load_optimizer = bool(warm_cfg.get("load_optimizer", False))
         try:
             payload = load_checkpoint(path, self.model, self.optimizer if load_optimizer else None)
+            self._sync_benchmark_corner_to_model()
         except RuntimeError as exc:
             raise RuntimeError(
                 f"Could not warm-start from {path}. Check that the model architecture matches the checkpoint."
@@ -263,14 +266,30 @@ class ExperimentTrainer:
         raise NotImplementedError(f"Unknown benchmark: {name}.")
 
     def initial_batch(self) -> dict[str, Any]:
+        n_f, n_bc, n_data = self._training_sample_counts()
+        started = time.perf_counter()
+        xy_f = self.uniform_sampler.sample(n_f)
+        xy_bc = self._sample_boundary(n_bc)
+        xy_data = self._sample_data(n_data)
+        self._record_runtime("sampling", time.perf_counter() - started, phase="initial")
+        return self.make_batch(xy_f, xy_bc, xy_data)
+
+    def _training_sample_counts(self) -> tuple[int, int, int]:
         train_cfg = self.config.get("training", {})
         n_f = int(train_cfg.get("n_collocation", 1024))
         n_bc = int(train_cfg.get("n_boundary", 256))
         n_data = int(train_cfg.get("n_data", 256))
-        xy_f = self.uniform_sampler.sample(n_f)
-        xy_bc = self._sample_boundary(n_bc)
-        xy_data = self._sample_data(n_data)
-        return self.make_batch(xy_f, xy_bc, xy_data)
+        curriculum = dict(train_cfg.get("collocation_curriculum", {}))
+        if bool(curriculum.get("enabled", False)):
+            stages = list(curriculum.get("stages", []))
+            selected = stages[-1] if stages else {}
+            for stage in stages:
+                if self.global_step < int(stage.get("until_step", 0)):
+                    selected = stage
+                    break
+            n_f = int(selected.get("n_collocation", n_f))
+            n_bc = int(selected.get("n_boundary", n_bc))
+        return n_f, n_bc, n_data
 
     def _sample_data(self, n: int) -> torch.Tensor:
         """Sample reference data; time-dependent benchmarks use initial data only."""
@@ -329,16 +348,26 @@ class ExperimentTrainer:
         )
 
     def evaluate_metrics(self, coords: np.ndarray) -> dict[str, float]:
-        return evaluate_on_grid(
+        profile: dict[str, float] = {}
+        metrics = evaluate_on_grid(
             self.model,
             self.benchmark,
             coords,
             self.device,
             self.steady,
             residual_interior_only=self.residual_interior_only(),
+            runtime_profile=profile,
         )
+        self._record_runtime(
+            "evaluation_detail",
+            0.0,
+            phase="final",
+            profile=profile,
+        )
+        return metrics
 
     def controller_metrics(self, coords: np.ndarray) -> dict[str, float]:
+        started = time.perf_counter()
         enabled = bool(
             self.config.get("evaluation", {}).get(
                 "controller_reference_metrics_enabled",
@@ -356,9 +385,20 @@ class ExperimentTrainer:
                 self.steady,
                 residual_interior_only=self.residual_interior_only(),
                 include_reference_metrics=False,
+                include_streamfunction_metrics=bool(
+                    self.config.get("evaluation", {}).get(
+                        "controller_streamfunction_metrics",
+                        False,
+                    )
+                ),
             )
         )
         if enabled:
+            self._record_runtime(
+                "validation",
+                time.perf_counter() - started,
+                phase="controller_metrics",
+            )
             return metrics
         reference_names = (
             "u_rel_l2",
@@ -407,6 +447,11 @@ class ExperimentTrainer:
             + metrics["boundary_condition_error"]
         )
         metrics["controller_reference_metrics_enabled"] = False
+        self._record_runtime(
+            "validation",
+            time.perf_counter() - started,
+            phase="controller_metrics",
+        )
         return metrics
 
     def diagnostic_builder(self) -> DiagnosticMapBuilder:
@@ -461,18 +506,35 @@ class ExperimentTrainer:
                 break
             self._apply_cavity_curriculum()
             self.optimizer.zero_grad(set_to_none=True)
+            profile = self._step_runtime_profile()
+            objective_start = time.perf_counter()
             total, losses, local_logs = self._training_objective(
                 batch,
                 weights,
                 local_weights,
                 active_aux_losses,
                 pressure_anchor_patches,
+                runtime_profile=profile,
             )
+            self._record_runtime(
+                "loss_objective_total",
+                time.perf_counter() - objective_start,
+                cycle=cycle,
+                phase=log_prefix or "main",
+                profile=profile,
+            )
+            optimizer_start = time.perf_counter()
             total.backward()
             grad_norm = self._grad_norm()
             learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
+            self._record_runtime(
+                "backward_optimizer",
+                time.perf_counter() - optimizer_start,
+                cycle=cycle,
+                phase=log_prefix or "main",
+            )
 
             last_losses = {k: float(v.detach().cpu()) for k, v in losses.items()}
             last_losses.update(local_logs)
@@ -495,6 +557,7 @@ class ExperimentTrainer:
         local_weights: dict[str, dict[int, float]],
         active_aux_losses: set[str],
         pressure_anchor_patches: dict[int, float],
+        runtime_profile: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
         """Build the train objective used by Adam and guarded repair stages."""
         self.compute_tracker.record_objective(batch)
@@ -502,6 +565,7 @@ class ExperimentTrainer:
             pointwise = gradient_enhanced_pointwise_losses(self.model, batch, self.benchmark, self.steady)
         else:
             residual_mode, residual_delta = self._residual_loss_settings()
+            loss_config = self._active_loss_config()
             pointwise = compute_pointwise_losses(
                 self.model,
                 batch,
@@ -509,7 +573,9 @@ class ExperimentTrainer:
                 self.steady,
                 residual_loss_mode=residual_mode,
                 pseudo_huber_delta=residual_delta,
-                regularization_config=self.config.get("losses", {}),
+                regularization_config=loss_config,
+                compute_boundary_loss=self._compute_boundary_training_loss(weights),
+                runtime_profile=runtime_profile,
             )
         if "pressure_poisson" in active_aux_losses:
             pointwise["pressure_poisson"] = pressure_poisson_residual(
@@ -558,6 +624,42 @@ class ExperimentTrainer:
         local_logs.update(normalization_logs)
         return total, losses, local_logs
 
+    def _active_loss_config(self) -> dict[str, Any]:
+        cfg = deepcopy(dict(self.config.get("losses", {})))
+        cfg["domain_bounds"] = tuple(self.benchmark.bounds)
+        curriculum = dict(cfg.get("near_wall_momentum", {}))
+        stages = list(curriculum.get("stages", []))
+        if bool(curriculum.get("enabled", False)) and stages:
+            selected = stages[-1]
+            for stage in stages:
+                if self.global_step < int(stage.get("until_step", 0)):
+                    selected = stage
+                    break
+            curriculum.update(
+                {
+                    "band_width": float(
+                        selected.get("band_width", curriculum.get("band_width", 0.08))
+                    ),
+                    "weight": float(selected.get("weight", 1.0)),
+                }
+            )
+            cfg["near_wall_momentum"] = curriculum
+            self.current_cavity_curriculum.update(
+                {
+                    "near_wall_momentum_band_width": curriculum["band_width"],
+                    "near_wall_momentum_weight": curriculum["weight"],
+                }
+            )
+        return cfg
+
+    def _compute_boundary_training_loss(self, weights: dict[str, float]) -> bool:
+        train_cfg = dict(self.config.get("training", {}))
+        formulation = str(self.config.get("model", {}).get("physics_formulation", "direct"))
+        skip = bool(train_cfg.get("skip_boundary_loss_if_hard_enforced", False))
+        if skip and formulation == "hard_boundary_streamfunction_pressure":
+            return False
+        return float(weights.get("bc", 0.0)) != 0.0
+
     def _apply_cavity_curriculum(self) -> None:
         cfg = dict(self.config.get("cavity_curriculum", {}))
         if not bool(cfg.get("enabled", False)):
@@ -579,7 +681,11 @@ class ExperimentTrainer:
         if hasattr(model, "correction_scale") and "correction_scale" in selected:
             model.correction_scale = float(selected["correction_scale"])
         if hasattr(self.benchmark, "lid_corner_regularization_width") and "corner_width" in selected:
-            self.benchmark.lid_corner_regularization_width = float(selected["corner_width"])
+            object.__setattr__(
+                self.benchmark,
+                "lid_corner_regularization_width",
+                float(selected["corner_width"]),
+            )
         self.current_cavity_curriculum = {
             "cavity_curriculum_corner_width": float(
                 getattr(model, "corner_width", float("nan"))
@@ -591,6 +697,16 @@ class ExperimentTrainer:
                 getattr(model, "correction_scale", float("nan"))
             ),
         }
+
+    def _sync_benchmark_corner_to_model(self) -> None:
+        if hasattr(self.model, "corner_width") and hasattr(
+            self.benchmark, "lid_corner_regularization_width"
+        ):
+            object.__setattr__(
+                self.benchmark,
+                "lid_corner_regularization_width",
+                float(self.model.corner_width),
+            )
 
     def _residual_loss_settings(self) -> tuple[str, float]:
         cfg = self.config.get("training", {}).get("residual_loss_mode", "mse")
@@ -616,6 +732,67 @@ class ExperimentTrainer:
                 except (TypeError, ValueError):
                     continue
         return logs
+
+    def _step_runtime_profile(self) -> dict[str, float] | None:
+        cfg = dict(self.config.get("runtime_profiling", {}))
+        if not bool(cfg.get("enabled", False)):
+            return None
+        every = max(1, int(cfg.get("detailed_every_steps", 50)))
+        return {} if self.global_step % every == 0 else None
+
+    def _record_runtime(
+        self,
+        name: str,
+        seconds: float,
+        *,
+        cycle: int | str = "",
+        phase: str = "",
+        profile: dict[str, float] | None = None,
+    ) -> None:
+        seconds = max(0.0, float(seconds))
+        self.compute_tracker.add_phase_time(name, seconds)
+        row: dict[str, Any] = {
+            "step": int(self.global_step),
+            "cycle": cycle,
+            "phase": phase,
+            "component": name,
+            "seconds": seconds,
+        }
+        if profile:
+            for component, value in profile.items():
+                self.compute_tracker.add_phase_time(component, float(value))
+                row[component] = float(value)
+        cfg = dict(self.config.get("runtime_profiling", {}))
+        if not bool(cfg.get("enabled", False)):
+            return
+        every = max(1, int(cfg.get("detailed_every_steps", 50)))
+        frequent = name in {"loss_objective_total", "backward_optimizer"}
+        if not frequent or self.global_step % every == 0:
+            self.runtime_logger.log(row)
+
+    def _print_runtime_environment(self) -> None:
+        n_f, n_bc, _ = self._training_sample_counts()
+        validation_cfg = self.config.get("validation", {})
+        total_steps = int(
+            self.config.get("controller_v2", {}).get(
+                "total_steps",
+                int(self.config.get("training", {}).get("adaptive_cycles", 1))
+                * int(self.config.get("training", {}).get("epochs_per_cycle", 1)),
+            )
+        )
+        gpu_name = (
+            torch.cuda.get_device_name(self.device)
+            if self.device.type == "cuda" and torch.cuda.is_available()
+            else "none"
+        )
+        dtype = next(self.model.parameters()).dtype
+        print(
+            "Runtime environment: "
+            f"cuda_available={torch.cuda.is_available()} "
+            f"gpu={gpu_name} device={self.device} dtype={dtype} "
+            f"planned_steps={total_steps} n_collocation={n_f} n_boundary={n_bc} "
+            f"validation={validation_cfg.get('nx', 50)}x{validation_cfg.get('ny', 50)}"
+        )
 
     def normalize_training_losses(
         self,
@@ -1016,10 +1193,8 @@ class ExperimentTrainer:
         control_state: Any | None = None,
         adaptive: bool = True,
     ) -> dict[str, Any]:
-        train_cfg = self.config.get("training", {})
-        n_f = int(train_cfg.get("n_collocation", batch["xy_f"].shape[0]))
-        n_bc = int(train_cfg.get("n_boundary", batch["xy_bc"].shape[0]))
-        n_data = int(train_cfg.get("n_data", batch["xy_data"].shape[0]))
+        n_f, n_bc, n_data = self._training_sample_counts()
+        started = time.perf_counter()
         if adaptive:
             priorities = control_state.sampling_priorities if control_state is not None else {}
             xy_f = self.adaptive_sampler.sample_interior(n_f, maps, coords, weak_regions, priorities)
@@ -1031,7 +1206,9 @@ class ExperimentTrainer:
             xy_f = self.uniform_sampler.sample(n_f)
             xy_data = self._sample_data(n_data)
         xy_bc = self._sample_boundary(n_bc)
-        return self.make_batch(xy_f, xy_bc, xy_data)
+        result = self.make_batch(xy_f, xy_bc, xy_data)
+        self._record_runtime("sampling", time.perf_counter() - started, phase="resample")
+        return result
 
     def evaluate_and_save_final(self) -> dict[str, float]:
         self._restore_best_checkpoint_if_enabled()
@@ -1040,6 +1217,29 @@ class ExperimentTrainer:
         metrics = self.evaluate_metrics(coords)
         self.compute_tracker.add_phase_time("evaluation", time.perf_counter() - phase_start)
         metrics["final_total_loss"] = float(self.last_losses.get("total", float("nan")))
+        for name in (
+            "speed_cap",
+            "raw_psi_l2",
+            "pressure_gradient_l2",
+            "vorticity_smoothness",
+            "near_wall_vorticity_l2",
+            "near_wall_momentum_weight_mean",
+        ):
+            metrics[f"final_training_{name}"] = float(
+                self.last_losses.get(name, float("nan"))
+            )
+        metrics["stabilizers_enabled"] = bool(
+            any(
+                bool(dict(value).get("enabled", False))
+                for value in self.config.get("losses", {}).values()
+                if isinstance(value, dict)
+            )
+            or isinstance(
+                self.config.get("training", {}).get("residual_loss_mode"),
+                dict,
+            )
+            or bool(self.config.get("cavity_curriculum", {}).get("enabled", False))
+        )
         metrics["optimizer_stage"] = self.optimizer_stage
         for key, value in self.final_repair_status.items():
             metrics[f"final_repair_{key}"] = value
@@ -1108,7 +1308,10 @@ class ExperimentTrainer:
         save_json(metrics, self.run_dir / "summary.json")
         pd.DataFrame([metrics]).to_csv(self.table_dir / "summary.csv", index=False)
         pd.DataFrame([metrics]).to_csv(self.run_dir / "summary_table.csv", index=False)
+        plotting_start = time.perf_counter()
         self.save_plots(X, Y, coords)
+        self._record_runtime("plotting", time.perf_counter() - plotting_start, phase="final")
+        checkpoint_start = time.perf_counter()
         save_checkpoint(
             self.checkpoint_dir / "final.pt",
             self.model,
@@ -1118,7 +1321,17 @@ class ExperimentTrainer:
             self.global_step,
             -1,
         )
+        self._record_runtime(
+            "checkpoint_save",
+            time.perf_counter() - checkpoint_start,
+            phase="final",
+        )
         save_intervention_timeline(self.action_records, self.figure_dir / "intervention_timeline.png")
+        # Re-save after plotting/checkpoint timings are available.
+        metrics.update(self.compute_tracker.summary())
+        save_json(metrics, self.run_dir / "summary.json")
+        pd.DataFrame([metrics]).to_csv(self.table_dir / "summary.csv", index=False)
+        pd.DataFrame([metrics]).to_csv(self.run_dir / "summary_table.csv", index=False)
         return metrics
 
     def save_plots(self, X: np.ndarray, Y: np.ndarray, coords: np.ndarray) -> None:
@@ -1271,10 +1484,28 @@ class ExperimentTrainer:
 
     def maybe_checkpoint(self, cycle: int, metrics: dict[str, float]) -> None:
         score = self._checkpoint_score(metrics)
-        save_checkpoint(self.checkpoint_dir / "latest.pt", self.model, self.optimizer, self.config, metrics, self.global_step, cycle)
-        if score < self.best_score:
+        started = time.perf_counter()
+        checkpoint_cfg = dict(self.config.get("checkpoint", {}))
+        improved = score < self.best_score
+        if bool(checkpoint_cfg.get("save_latest_every_cycle", True)):
+            save_checkpoint(
+                self.checkpoint_dir / "latest.pt",
+                self.model,
+                self.optimizer,
+                self.config,
+                metrics,
+                self.global_step,
+                cycle,
+            )
+        if improved:
             self.best_score = score
             save_checkpoint(self.checkpoint_dir / "best.pt", self.model, self.optimizer, self.config, metrics, self.global_step, cycle)
+        self._record_runtime(
+            "checkpoint_save",
+            time.perf_counter() - started,
+            cycle=cycle,
+            phase="best" if improved else "latest",
+        )
 
     def _checkpoint_score(self, metrics: dict[str, Any]) -> float:
         evaluation_cfg = self.config.get("evaluation", {})
@@ -1393,6 +1624,7 @@ class ExperimentTrainer:
         path = self.checkpoint_dir / "best.pt"
         if bool(cfg.get("restore_best_before_final", False)) and path.exists():
             payload = load_checkpoint(path, self.model, optimizer=None)
+            self._sync_benchmark_corner_to_model()
             self.final_repair_status["restored_best_checkpoint"] = True
             self.final_repair_status["best_checkpoint_epoch"] = payload.get("epoch")
 

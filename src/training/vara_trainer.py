@@ -1000,10 +1000,7 @@ class VARATrainer(ExperimentTrainer):
         return metrics
 
     def _validation_metrics(self, coords: np.ndarray) -> dict[str, float]:
-        phase_start = time.perf_counter()
-        metrics = self.controller_metrics(coords)
-        self.compute_tracker.add_phase_time("evaluation", time.perf_counter() - phase_start)
-        return metrics
+        return self.controller_metrics(coords)
 
     def _diagnose_local(
         self,

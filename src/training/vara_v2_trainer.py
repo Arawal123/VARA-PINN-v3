@@ -335,11 +335,11 @@ class VARAV2Trainer(ExperimentTrainer):
                 self.compute_tracker.record_applied_optimizer_steps(probe_steps)
 
             if not counterfactual and not committed:
-                # A rejected probe must not silently remove effective training
-                # steps from VARA. Restart the full neutral block from the
-                # restored pre-probe state.
-                self.global_step = block_start_step
-                remaining = block_steps
+                # The rejected probe consumed part of the fixed compute
+                # budget. Restore the state, but do not hide extra optimizer
+                # work by replaying those steps.
+                self.global_step = block_start_step + probe_steps
+                remaining = block_steps - probe_steps
             else:
                 remaining = block_steps - probe_steps
             self._train_v2_steps(
@@ -400,9 +400,25 @@ class VARAV2Trainer(ExperimentTrainer):
         for local_step in range(int(steps)):
             if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
                 break
+            self._apply_cavity_curriculum()
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            profile = self._step_runtime_profile()
+            objective_start = time.perf_counter()
+            residual_mode, residual_delta = self._residual_loss_settings()
+            pointwise = compute_pointwise_losses(
+                self.model,
+                batch,
+                self.benchmark,
+                self.steady,
+                residual_loss_mode=residual_mode,
+                pseudo_huber_delta=residual_delta,
+                regularization_config=self._active_loss_config(),
+                compute_boundary_loss=self._compute_boundary_training_loss(
+                    scalar_weights
+                ),
+                runtime_profile=profile,
+            )
             losses = compute_budgeted_patch_losses(
                 pointwise,
                 batch,
@@ -416,11 +432,25 @@ class VARAV2Trainer(ExperimentTrainer):
             continuation_anchor, continuation_weight = self.continuation_anchor_loss(batch)
             continuation_replay, replay_weight = self.continuation_replay_loss()
             total = total + anchor + continuation_anchor + continuation_replay
+            self._record_runtime(
+                "loss_objective_total",
+                time.perf_counter() - objective_start,
+                cycle=cycle,
+                phase=phase,
+                profile=profile,
+            )
+            optimizer_start = time.perf_counter()
             total.backward()
             grad_norm = self._grad_norm()
             learning_rate = self.prepare_optimizer_step()
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step(applied=applied)
+            self._record_runtime(
+                "backward_optimizer",
+                time.perf_counter() - optimizer_start,
+                cycle=cycle,
+                phase=phase,
+            )
             if probe:
                 self.compute_tracker.record_probe_step()
             logs = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -432,6 +462,10 @@ class VARAV2Trainer(ExperimentTrainer):
             logs["total"] = float(total.detach().cpu())
             logs["grad_norm"] = grad_norm
             logs["learning_rate"] = learning_rate
+            logs["residual_loss_mode"] = residual_mode
+            logs["pseudo_huber_delta"] = float(residual_delta)
+            logs.update(self.current_cavity_curriculum)
+            logs.update(self._model_auxiliary_logs())
             logs.update(normalization_logs)
             logs.update(self.last_boundary_sampling_summary)
             self.last_losses = logs
@@ -487,6 +521,7 @@ class VARAV2Trainer(ExperimentTrainer):
             self.steady,
             residual_interior_only=self.residual_interior_only(),
             include_reference_metrics=False,
+            include_streamfunction_metrics=False,
         )
         selected = {
             name: float(metrics[name])
@@ -521,6 +556,12 @@ class VARAV2Trainer(ExperimentTrainer):
             self._probe_batch,
             self.benchmark,
             self.steady,
+            residual_loss_mode=self._residual_loss_settings()[0],
+            pseudo_huber_delta=self._residual_loss_settings()[1],
+            regularization_config=self._active_loss_config(),
+            compute_boundary_loss=self._compute_boundary_training_loss(
+                dict(self.config.get("training", {}).get("weights", {}))
+            ),
         )
         parameters = self._influence_parameters()
         # The aggregate PDE entry is the sum of the three equation entries.
@@ -598,10 +639,8 @@ class VARAV2Trainer(ExperimentTrainer):
         maps: dict[str, np.ndarray],
         coords: np.ndarray,
     ) -> dict[str, Any]:
-        train_cfg = self.config.get("training", {})
-        n_f = int(train_cfg.get("n_collocation", 2048))
-        n_bc = int(train_cfg.get("n_boundary", 768))
-        n_data = int(train_cfg.get("n_data", 0))
+        n_f, n_bc, n_data = self._training_sample_counts()
+        started = time.perf_counter()
         neutral_mass = np.full(
             self.patch_grid.num_patches,
             1.0 / self.patch_grid.num_patches,
@@ -636,7 +675,9 @@ class VARAV2Trainer(ExperimentTrainer):
         xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)
         xy_bc = self._sample_boundary(n_bc)
         xy_data = self._sample_data(n_data)
-        return self.make_batch(xy_f, xy_bc, xy_data)
+        result = self.make_batch(xy_f, xy_bc, xy_data)
+        self._record_runtime("sampling", time.perf_counter() - started, phase="v2_resample")
+        return result
 
     @staticmethod
     def _candidate_score(candidate: V2Candidate, raw: np.ndarray, names: list[str]) -> float:

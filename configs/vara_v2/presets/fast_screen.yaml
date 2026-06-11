@@ -1,0 +1,39 @@
+training:
+  adaptive_cycles: 6
+  epochs_per_cycle: 200
+  n_collocation: 1024
+  n_boundary: 64
+  collocation_curriculum:
+    enabled: true
+    stages:
+      - until_step: 600
+        n_collocation: 768
+        n_boundary: 64
+      - until_step: 1200
+        n_collocation: 1024
+        n_boundary: 64
+
+controller_v2:
+  total_steps: 1200
+  warmup_steps: 200
+  control_blocks: 5
+  block_steps: 200
+  probe_steps: 10
+
+optimizer:
+  scheduler:
+    total_steps: 1200
+    warmup_steps: 150
+
+validation:
+  nx: 40
+  ny: 40
+
+test:
+  nx: 48
+  ny: 48
+
+visualization:
+  nx: 96
+  ny: 96
+

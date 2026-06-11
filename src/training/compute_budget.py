@@ -125,7 +125,7 @@ class ComputeTracker:
         evaluation = self.phase_seconds.get("evaluation", 0.0)
         accounted = optimization + diagnostics + evaluation
         overhead = max(0.0, total - accounted)
-        return {
+        summary = {
             "compute_budget_enabled": self.enabled,
             "compute_budget_type": self.budget_type if self.enabled else "disabled",
             "compute_budget_value": self.budget_value if self.enabled else None,
@@ -148,6 +148,10 @@ class ComputeTracker:
             "probe_optimizer_steps": self.probe_optimizer_steps,
             "rollback_optimizer_steps": self.rollback_optimizer_steps,
         }
+        for name, seconds in sorted(self.phase_seconds.items()):
+            summary[f"runtime_{name}_sec"] = float(seconds)
+        summary["seconds_per_optimizer_step"] = total / max(self.optimizer_steps, 1)
+        return summary
 
 
 def _batch_size(value: Any) -> int:

@@ -39,9 +39,11 @@ class DiagnosticMapBuilder:
         mode = mode.lower()
         coords = torch.tensor(coords_np, dtype=torch.float32, device=self.device)
         self.model.eval()
-        with torch.no_grad():
-            pred = self.model(coords)
         residuals = navier_stokes_residuals(self.model, coords, nu=self.benchmark.nu, steady=self.steady)
+        pred = torch.cat(
+            [residuals["u"], residuals["v"], residuals["p"]],
+            dim=1,
+        )
 
         u_pred = pred[:, 0:1].detach().cpu().numpy()
         v_pred = pred[:, 1:2].detach().cpu().numpy()
@@ -56,7 +58,9 @@ class DiagnosticMapBuilder:
             "v_pred": v_pred,
             "p_pred": center_pressure(p_pred),
             "omega_pred": omega_pred,
+            "omega_abs": np.abs(omega_pred),
             "speed_pred": speed_pred,
+            "pressure_gradient_norm": np.sqrt(p_x * p_x + p_y * p_y),
             "continuity_residual": np.abs(residuals["f_c"].detach().cpu().numpy()),
             "momentum_u_residual": np.abs(residuals["f_u"].detach().cpu().numpy()),
             "momentum_v_residual": np.abs(residuals["f_v"].detach().cpu().numpy()),
