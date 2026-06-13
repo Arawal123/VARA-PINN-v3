@@ -410,7 +410,7 @@ def _apply_re_aware_cavity_settings(
             },
             "training": {
                 "residual_loss_mode": {
-                    "switch_step": max(1, int(round(total_steps * 0.80))),
+                    "switch_step": max(1, int(round(total_steps * 0.95))),
                 },
                 "weights": {
                     "speed_cap": float(regime["speed_cap_weight"]),

@@ -1268,6 +1268,7 @@ class ExperimentTrainer:
 
     def evaluate_and_save_final(self) -> dict[str, float]:
         self._restore_best_checkpoint_if_enabled()
+        self._validate_final_cavity_state()
         X, Y, coords = self.test_grid()
         phase_start = time.perf_counter()
         metrics = self.evaluate_metrics(coords)
@@ -1542,7 +1543,8 @@ class ExperimentTrainer:
         score = self._checkpoint_score(metrics)
         started = time.perf_counter()
         checkpoint_cfg = dict(self.config.get("checkpoint", {}))
-        improved = score < self.best_score
+        eligible = self._checkpoint_is_final_restore_eligible()
+        improved = eligible and score < self.best_score
         if bool(checkpoint_cfg.get("save_latest_every_cycle", True)):
             save_checkpoint(
                 self.checkpoint_dir / "latest.pt",
@@ -1581,6 +1583,7 @@ class ExperimentTrainer:
                 + metrics.get("omega_rel_l2", 0.0)
             )
         checkpoint_cfg = dict(self.config.get("checkpoint", {}))
+        metric_weights = dict(checkpoint_cfg.get("metric_weights", {}))
         metric_names = list(
             checkpoint_cfg.get(
                 "reference_free_metrics",
@@ -1594,17 +1597,41 @@ class ExperimentTrainer:
         )
         floor = float(checkpoint_cfg.get("metric_floor", 1e-8))
         values = [
-            max(float(metrics[name]), floor)
+            (
+                max(float(metrics[name]), floor),
+                float(metric_weights.get(name, 1.0)),
+            )
             for name in metric_names
             if name in metrics and math.isfinite(float(metrics[name]))
         ]
         if values:
+            speed = float(metrics.get("speed_pred_max", float("nan")))
+            speed_gate = float(
+                self.config.get("continuation_validity", {}).get(
+                    "max_speed_pred",
+                    math.inf,
+                )
+            )
+            speed_penalty = (
+                max(speed - speed_gate, 0.0) ** 2
+                if math.isfinite(speed) and math.isfinite(speed_gate)
+                else 0.0
+            )
+            speed_penalty *= float(checkpoint_cfg.get("speed_hinge_weight", 1.0))
             if str(checkpoint_cfg.get("score_mode", "geometric_mean")).lower() in {
                 "sum",
                 "additive",
             }:
-                return float(sum(values))
-            return float(math.exp(sum(math.log(value) for value in values) / len(values)))
+                return float(
+                    sum(value * weight for value, weight in values)
+                    + speed_penalty
+                )
+            total_weight = sum(weight for _value, weight in values)
+            geometric = math.exp(
+                sum(weight * math.log(value) for value, weight in values)
+                / max(total_weight, 1e-12)
+            )
+            return float(geometric + speed_penalty)
         pde = float(metrics.get("unweighted_pde_loss", float("nan")))
         boundary = float(metrics.get("unweighted_bc_loss", float("nan")))
         if math.isfinite(pde) and math.isfinite(boundary):
@@ -1680,9 +1707,117 @@ class ExperimentTrainer:
         path = self.checkpoint_dir / "best.pt"
         if bool(cfg.get("restore_best_before_final", False)) and path.exists():
             payload = load_checkpoint(path, self.model, optimizer=None)
+            if not self._checkpoint_payload_is_final_restore_eligible(payload):
+                raise ValueError(
+                    "Reliable best checkpoint is not eligible for final restore."
+                )
             self._sync_benchmark_corner_to_model()
             self.final_repair_status["restored_best_checkpoint"] = True
             self.final_repair_status["best_checkpoint_epoch"] = payload.get("epoch")
+
+    def _final_cavity_stage(self) -> dict[str, Any]:
+        stages = list(self.config.get("cavity_curriculum", {}).get("stages", []))
+        return dict(stages[-1]) if stages else {}
+
+    def _checkpoint_min_restore_step(self) -> int:
+        cfg = dict(self.config.get("checkpoint", {}))
+        total_steps = int(
+            self.config.get("controller_v2", {}).get(
+                "total_steps",
+                self.config.get("optimizer", {})
+                .get("scheduler", {})
+                .get("total_steps", 0),
+            )
+        )
+        fraction = min(
+            max(float(cfg.get("eligible_final_fraction", 0.0)), 0.0),
+            1.0,
+        )
+        return max(0, int(math.ceil(total_steps * (1.0 - fraction))))
+
+    def _runtime_matches_final_cavity_stage(
+        self,
+        runtime_state: dict[str, Any] | None = None,
+    ) -> bool:
+        cfg = dict(self.config.get("checkpoint", {}))
+        if not bool(cfg.get("require_final_cavity_stage", False)):
+            return True
+        final_stage = self._final_cavity_stage()
+        if not final_stage:
+            return True
+        state = runtime_state or {
+            "corner_width": getattr(self.model, "corner_width", float("nan")),
+            "lid_vertical_power": getattr(
+                self.model, "lid_vertical_power", float("nan")
+            ),
+            "correction_scale": getattr(
+                self.model, "correction_scale", float("nan")
+            ),
+        }
+        return (
+            math.isclose(
+                float(state.get("corner_width", float("nan"))),
+                float(final_stage["corner_width"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and int(state.get("lid_vertical_power", -1))
+            == int(final_stage["lid_vertical_power"])
+            and math.isclose(
+                float(state.get("correction_scale", float("nan"))),
+                float(final_stage["correction_scale"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
+
+    def _checkpoint_is_final_restore_eligible(self) -> bool:
+        return (
+            self.global_step >= self._checkpoint_min_restore_step()
+            and self._runtime_matches_final_cavity_stage()
+        )
+
+    def _checkpoint_payload_is_final_restore_eligible(
+        self,
+        payload: dict[str, Any],
+    ) -> bool:
+        return (
+            int(payload.get("epoch", -1)) >= self._checkpoint_min_restore_step()
+            and self._runtime_matches_final_cavity_stage(
+                dict(payload.get("model_runtime_state", {}))
+            )
+        )
+
+    def _validate_final_cavity_state(self) -> None:
+        cfg = dict(self.config.get("checkpoint", {}))
+        if not bool(cfg.get("require_final_cavity_stage", False)):
+            return
+        formulation = str(
+            self.config.get("model", {}).get("physics_formulation", "")
+        )
+        if formulation != "hard_boundary_streamfunction_pressure":
+            raise ValueError(
+                "Reliable final evaluation requires "
+                "hard_boundary_streamfunction_pressure."
+            )
+        if not self._runtime_matches_final_cavity_stage():
+            raise ValueError(
+                "Reliable final evaluation model does not match the final "
+                "cavity curriculum stage."
+            )
+        controller_steps = int(
+            self.config.get("controller_v2", {}).get("total_steps", -1)
+        )
+        scheduler_steps = int(
+            self.config.get("optimizer", {})
+            .get("scheduler", {})
+            .get("total_steps", -1)
+        )
+        if controller_steps != scheduler_steps:
+            raise ValueError(
+                "Reliable final evaluation requires matching controller and "
+                "optimizer total steps."
+            )
 
     def _collapsed(self, metrics: dict[str, Any]) -> bool:
         if not bool(metrics.get("collapse_evaluated", True)):

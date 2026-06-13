@@ -44,7 +44,7 @@ training:
   pointwise_reduction: mean
   residual_loss_mode:
     initial: pseudo_huber
-    switch_step: 3200
+    switch_step: 3800
     final: mse
     pseudo_huber_delta: 1.0
   adaptive_cycles: 20
@@ -148,8 +148,8 @@ re_aware_cavity:
       speed_cap_weight: 0.60
       raw_psi_l2_weight: 0.0005
       near_wall_vorticity_l2_weight: 0.0002
-      near_wall_fraction: 0.30
-      near_wall_momentum_weights: [1.00, 1.25, 1.50, 1.50]
+      near_wall_fraction: 0.25
+      near_wall_momentum_weights: [1.00, 1.20, 1.35, 1.35]
       topology:
         max_primary_center_error: 0.10
         max_topology_score: 0.18
@@ -251,6 +251,8 @@ sampling:
 
 checkpoint:
   restore_best_before_final: true
+  eligible_final_fraction: 0.25
+  require_final_cavity_stage: true
   save_latest_every_cycle: false
   score_mode: sum
   reference_free_metrics:
@@ -260,8 +262,16 @@ checkpoint:
     - boundary_condition_error
     - near_wall_pde_residual_mean
     - near_wall_momentum_v_mean
-    - speed_pred_max
     - omega_abs_95p
+  metric_weights:
+    pde_residual_mean: 1.0
+    momentum_residual_mean: 1.0
+    core_pde_residual_mean: 2.0
+    boundary_condition_error: 1.0
+    near_wall_pde_residual_mean: 0.5
+    near_wall_momentum_v_mean: 0.5
+    omega_abs_95p: 0.02
+  speed_hinge_weight: 1.0
   metric_floor: 1.0e-8
 
 convergence_early_stopping:

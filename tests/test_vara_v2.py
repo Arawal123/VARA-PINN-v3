@@ -307,11 +307,15 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
 
     assert low["model"]["hard_boundary_corner_width"] == pytest.approx(0.09)
     assert low["model"]["hard_boundary_correction_scale"] == pytest.approx(22.0)
-    assert low["training"]["residual_loss_mode"]["switch_step"] == 3200
+    assert low["training"]["residual_loss_mode"]["switch_step"] == 3800
     assert low["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
         0.12
     )
-    assert low["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.30)
+    assert low["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.25)
+    assert [
+        stage["weight"]
+        for stage in low["losses"]["near_wall_momentum"]["stages"]
+    ] == pytest.approx([1.0, 1.2, 1.35, 1.35])
     assert low["continuation_validity"]["max_detected_vortices"] == 2
     assert low["continuation_validity"]["require_lid_cavity_topology_alignment"] is True
 
@@ -549,7 +553,7 @@ def test_near_wall_vorticity_penalizes_only_quantile_excess():
 def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     for reynolds, fraction, band in [
-        (100.0, 0.30, 0.12),
+        (100.0, 0.25, 0.12),
         (400.0, 0.40, 0.06),
         (1600.0, 0.50, 0.03),
     ]:
@@ -775,6 +779,114 @@ def test_checkpoint_restores_live_cavity_curriculum_state(tmp_path):
     assert model.corner_width == pytest.approx(0.10)
     assert model.lid_vertical_power == 2
     assert model.correction_scale == pytest.approx(32.0)
+
+
+def test_reliable_checkpoint_eligibility_requires_final_window_and_stage(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = _apply_re_aware_cavity_settings(base, 100.0)
+    config = deep_update(
+        config,
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    assert trainer._checkpoint_min_restore_step() == 3000
+    trainer.global_step = 600
+    trainer.model.corner_width = 0.10
+    trainer.model.lid_vertical_power = 2
+    trainer.model.correction_scale = 18.0
+    trainer.maybe_checkpoint(0, {"pde_residual_mean": 0.01})
+    assert not (trainer.checkpoint_dir / "best.pt").exists()
+
+    trainer.global_step = 3200
+    trainer.model.corner_width = 0.09
+    trainer.model.lid_vertical_power = 2
+    trainer.model.correction_scale = 22.0
+    trainer.maybe_checkpoint(
+        1,
+        {
+            "pde_residual_mean": 1.0,
+            "momentum_residual_mean": 1.0,
+            "core_pde_residual_mean": 1.0,
+            "near_wall_pde_residual_mean": 1.0,
+            "near_wall_momentum_v_mean": 1.0,
+            "omega_abs_95p": 1.0,
+            "speed_pred_max": 1.0,
+        },
+    )
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+
+    diagnostic = deep_update(
+        base,
+        load_config("configs/vara_v2/presets/diagnostic.yaml"),
+    )
+    diagnostic = _apply_re_aware_cavity_settings(diagnostic, 100.0)
+    diagnostic = deep_update(
+        diagnostic,
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {
+                "root": str(tmp_path / "diagnostic"),
+                "flat_layout": True,
+            },
+        },
+    )
+    assert VARATrainer(
+        diagnostic,
+        mode="vanilla",
+    )._checkpoint_min_restore_step() == 1500
+
+
+def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    metrics = {
+        "pde_residual_mean": 1.0,
+        "momentum_residual_mean": 1.0,
+        "core_pde_residual_mean": 1.0,
+        "boundary_condition_error": 0.0,
+        "near_wall_pde_residual_mean": 1.0,
+        "near_wall_momentum_v_mean": 1.0,
+        "omega_abs_95p": 1.0,
+        "speed_pred_max": 1.0,
+    }
+    below_gate = trainer._checkpoint_score(metrics)
+    assert trainer._checkpoint_score({**metrics, "speed_pred_max": 2.0}) == pytest.approx(
+        below_gate
+    )
+    assert trainer._checkpoint_score({**metrics, "speed_pred_max": 3.2}) > below_gate
+    assert trainer._checkpoint_score(
+        {**metrics, "core_pde_residual_mean": 2.0}
+    ) == pytest.approx(below_gate + 2.0)
+
+
+def test_reliable_final_state_guard_rejects_early_curriculum_values(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    trainer.model.corner_width = 0.10
+    trainer.model.correction_scale = 18.0
+    with pytest.raises(ValueError, match="final cavity curriculum stage"):
+        trainer._validate_final_cavity_state()
 
 
 def test_missing_full_field_reference_does_not_invalidate_reliable_stage():
