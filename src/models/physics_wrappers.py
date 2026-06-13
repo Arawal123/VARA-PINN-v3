@@ -154,6 +154,7 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
         corner_width: float = 0.02,
         lid_vertical_power: int = 6,
         correction_scale: float = 64.0,
+        correction_wall_boost: float = 0.0,
     ) -> None:
         super().__init__()
         self.base = base
@@ -162,6 +163,7 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
         self.corner_width = max(float(corner_width), 1e-6)
         self.lid_vertical_power = max(2, int(lid_vertical_power))
         self.correction_scale = float(correction_scale)
+        self.correction_wall_boost = max(float(correction_wall_boost), 0.0)
         self.physics_formulation = "hard_boundary_streamfunction_pressure"
         self.latest_streamfunction_diagnostics: dict[str, float] = {}
 
@@ -201,12 +203,17 @@ class HardBoundaryStreamfunctionPressureWrapper(nn.Module):
         horizontal = self._lid_profile(xi)
         vertical = self._vertical_lid_shape(eta)
         psi_lift = self.lid_velocity * ly * horizontal * vertical
-        correction_envelope = (
+        horizontal_correction = (
             xi.pow(2)
             * (1.0 - xi).pow(2)
-            * eta.pow(2)
-            * (1.0 - eta).pow(2)
+            * (1.0 + self.correction_wall_boost * (xi - 0.5).pow(2))
         )
+        vertical_correction = (
+            eta.pow(2)
+            * (1.0 - eta).pow(2)
+            * (1.0 + self.correction_wall_boost * (eta - 0.5).pow(2))
+        )
+        correction_envelope = horizontal_correction * vertical_correction
         scaled_correction = self.correction_scale * correction_envelope * raw_psi
         return {
             "raw_psi": raw_psi,

@@ -151,6 +151,9 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
                 correction_scale=float(
                     model_cfg.get("hard_boundary_correction_scale", 64.0)
                 ),
+                correction_wall_boost=float(
+                    model_cfg.get("hard_boundary_correction_wall_boost", 0.0)
+                ),
             )
         return CavityHardBoundaryWrapper(
             model,

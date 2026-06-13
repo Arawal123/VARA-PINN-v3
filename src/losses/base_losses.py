@@ -175,7 +175,11 @@ def _apply_near_wall_curriculum(
     if not bool(wall_cfg.get("enabled", False)):
         return momentum_u, momentum_v, {}
     band = max(float(wall_cfg.get("band_width", 0.08)), 0.0)
-    near_wall_weight = min(max(float(wall_cfg.get("weight", 1.0)), 0.0), 1.0)
+    maximum_weight = max(float(wall_cfg.get("max_weight", 3.0)), 1.0)
+    near_wall_weight = min(
+        max(float(wall_cfg.get("weight", 1.0)), 1e-12),
+        maximum_weight,
+    )
     distance = _normalized_wall_distance(coords, benchmark.bounds)
     near_wall = distance < band
     weights = torch.where(
@@ -229,12 +233,24 @@ def _add_reference_free_regularizers(
     near_wall_vort_cfg = dict(cfg.get("near_wall_vorticity_l2", {}))
     if bool(near_wall_vort_cfg.get("enabled", False)):
         band = max(float(near_wall_vort_cfg.get("band_width", 0.10)), 0.0)
+        quantile = min(
+            max(float(near_wall_vort_cfg.get("quantile", 0.95)), 0.0),
+            1.0,
+        )
         distance = _normalized_wall_distance(
             residuals["coords"],
             cfg.get("domain_bounds", (0.0, 1.0, 0.0, 1.0)),
         )
-        mask = (distance < band).to(dtype=residuals["omega"].dtype)
-        pointwise["near_wall_vorticity_l2"] = mask * residuals["omega"].pow(2)
+        near_wall = distance < band
+        omega_abs = residuals["omega"].abs()
+        threshold_source = omega_abs[near_wall]
+        if threshold_source.numel() == 0:
+            threshold_source = omega_abs.reshape(-1)
+        threshold = torch.quantile(threshold_source.detach(), quantile)
+        mask = near_wall.to(dtype=omega_abs.dtype)
+        pointwise["near_wall_vorticity_l2"] = (
+            mask * torch.relu(omega_abs - threshold).pow(2)
+        )
 
 
 def _normalized_wall_distance(

@@ -655,11 +655,13 @@ class VARAV2Trainer(ExperimentTrainer):
         if sampling_is_neutral:
             # Exact baseline equivalence before a sampling action is
             # committed: same sampler, same seed, and same point count.
-            xy_f_np = self.uniform_sampler.sample_numpy(n_f)
+            xy_f_np = self._sample_interior_numpy(n_f)
         else:
+            n_wall = self._near_wall_sample_count(n_f)
+            n_available = n_f - n_wall
             uniform_mass = float(self.v2_config.min_uniform_mass)
-            n_uniform = int(round(n_f * uniform_mass))
-            n_adaptive = n_f - n_uniform
+            n_uniform = int(round(n_available * uniform_mass))
+            n_adaptive = n_available - n_uniform
             pieces = [self.uniform_sampler.sample_numpy(n_uniform)]
             if n_adaptive > 0:
                 patch_ids = list(range(self.patch_grid.num_patches))
@@ -670,7 +672,8 @@ class VARAV2Trainer(ExperimentTrainer):
                         self.v2_controller.state.sampling_mass,
                     )
                 )
-            xy_f_np = np.vstack(pieces)
+            core_points = np.vstack(pieces)
+            xy_f_np = self._sample_interior_numpy(n_f, core_points)
             self.adaptive_sampler.rng.shuffle(xy_f_np)
         xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)
         xy_bc = self._sample_boundary(n_bc)

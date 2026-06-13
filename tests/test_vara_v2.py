@@ -11,6 +11,7 @@ from scripts.run_vara_v2_continuation import (
     _apply_re_aware_cavity_settings,
     _continuation_validity,
     _load_base_config,
+    _validate_reliable_config,
     _without_cavity_stabilizers,
 )
 from scripts.check_lid_cavity_re100_sanity import build_report
@@ -21,7 +22,11 @@ from src.evaluation.statistical_tests import (
     paired_bootstrap_improvement,
     wilcoxon_signed_rank,
 )
-from src.losses.base_losses import compute_global_losses, compute_pointwise_losses
+from src.losses.base_losses import (
+    _add_reference_free_regularizers,
+    compute_global_losses,
+    compute_pointwise_losses,
+)
 from src.losses.local_losses import compute_budgeted_patch_losses
 from src.models import (
     CavityHardBoundaryWrapper,
@@ -306,6 +311,7 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     assert low["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
         0.12
     )
+    assert low["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.30)
     assert low["continuation_validity"]["max_detected_vortices"] == 2
     assert low["continuation_validity"]["require_lid_cavity_topology_alignment"] is True
 
@@ -315,6 +321,7 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     assert mid["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
         0.06
     )
+    assert mid["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.40)
     assert mid["continuation_validity"]["max_detected_vortices"] == 4
 
     assert high["model"]["hard_boundary_corner_width"] == pytest.approx(0.05)
@@ -322,6 +329,7 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     assert high["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
         0.03
     )
+    assert high["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.50)
     assert high["continuation_validity"]["max_detected_vortices"] == 8
     assert high["continuation_validity"]["require_lid_cavity_topology_alignment"] is False
 
@@ -491,16 +499,226 @@ def test_near_wall_momentum_curriculum_masks_only_training_objective():
             "near_wall_momentum": {
                 "enabled": True,
                 "band_width": 0.1,
-                "weight": 0.0,
+                "weight": 2.0,
                 "normalize_mean": True,
             },
         },
         compute_boundary_loss=False,
     )
     weights = pointwise["near_wall_momentum_weight_mean"].reshape(-1)
-    assert weights[0].item() == pytest.approx(0.0)
-    assert weights[1].item() == pytest.approx(2.0)
+    assert weights[0].item() > weights[1].item()
+    assert weights.mean().item() == pytest.approx(1.0)
     assert torch.isfinite(pointwise["raw_momentum_v_mse"]).all()
+
+
+def test_near_wall_vorticity_penalizes_only_quantile_excess():
+    coords = torch.tensor(
+        [[0.01, 0.5], [0.02, 0.5], [0.03, 0.5], [0.50, 0.50]],
+        dtype=torch.float64,
+    )
+    omega = torch.tensor([[1.0], [2.0], [20.0], [100.0]], dtype=torch.float64)
+    pointwise = {}
+    _add_reference_free_regularizers(
+        pointwise,
+        torch.nn.Identity(),
+        coords,
+        {
+            "coords": coords,
+            "omega": omega,
+            "u": torch.zeros_like(omega),
+            "v": torch.zeros_like(omega),
+            "p_x": torch.zeros_like(omega),
+            "p_y": torch.zeros_like(omega),
+        },
+        {
+            "domain_bounds": (0.0, 1.0, 0.0, 1.0),
+            "near_wall_vorticity_l2": {
+                "enabled": True,
+                "band_width": 0.1,
+                "quantile": 0.5,
+            },
+        },
+    )
+    penalty = pointwise["near_wall_vorticity_l2"].reshape(-1)
+    assert penalty[0].item() == pytest.approx(0.0)
+    assert penalty[1].item() == pytest.approx(0.0)
+    assert penalty[2].item() > 0.0
+    assert penalty[3].item() == pytest.approx(0.0)
+
+
+def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    for reynolds, fraction, band in [
+        (100.0, 0.30, 0.12),
+        (400.0, 0.40, 0.06),
+        (1600.0, 0.50, 0.03),
+    ]:
+        config = _apply_re_aware_cavity_settings(base, reynolds)
+        config = deep_update(
+            config,
+            {
+                "device": "cpu",
+                "model": {"hidden_layers": [8, 8]},
+                "experiments": {
+                    "root": str(tmp_path / f"re_{int(reynolds)}"),
+                    "flat_layout": True,
+                },
+            },
+        )
+        trainer = VARATrainer(config, mode="vanilla")
+        points = trainer._sample_interior_numpy(100)
+        n_wall = trainer._near_wall_sample_count(100)
+        guaranteed = points[-n_wall:]
+        distance = np.min(
+            np.column_stack(
+                [
+                    guaranteed[:, 0],
+                    1.0 - guaranteed[:, 0],
+                    guaranteed[:, 1],
+                    1.0 - guaranteed[:, 1],
+                ]
+            ),
+            axis=1,
+        )
+        assert points.shape == (100, 2)
+        assert n_wall == round(100 * fraction)
+        assert np.all(distance < band)
+        assert np.all(guaranteed[:, 0] > 0.0)
+        assert np.all(guaranteed[:, 0] < 1.0)
+        assert np.all(guaranteed[:, 1] > 0.0)
+        assert np.all(guaranteed[:, 1] < 1.0)
+        assert np.all(
+            np.maximum(
+                np.minimum(guaranteed[:, 0], 1.0 - guaranteed[:, 0]),
+                np.minimum(guaranteed[:, 1], 1.0 - guaranteed[:, 1]),
+            )
+            >= 0.02 * band
+        )
+
+
+def test_vanilla_and_vara_share_near_wall_sampling_budget(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = _apply_re_aware_cavity_settings(base, 400.0)
+    common = {
+        "device": "cpu",
+        "model": {"hidden_layers": [8, 8]},
+        "training": {
+            "n_collocation": 40,
+            "n_boundary": 4,
+            "n_data": 0,
+            "collocation_curriculum": {"enabled": False},
+        },
+        "continuation_replay": {"enabled": False},
+    }
+    vanilla = VARATrainer(
+        deep_update(
+            config,
+            {
+                **common,
+                "experiments": {
+                    "root": str(tmp_path / "vanilla"),
+                    "flat_layout": True,
+                },
+            },
+        ),
+        mode="vanilla",
+    )
+    vara = VARAV2Trainer(
+        deep_update(
+            config,
+            {
+                **common,
+                "experiments": {
+                    "root": str(tmp_path / "vara"),
+                    "flat_layout": True,
+                },
+            },
+        )
+    )
+    assert vanilla._near_wall_sample_count(40) == 16
+    assert vara._near_wall_sample_count(40) == 16
+    assert vanilla.initial_batch()["xy_f"].shape[0] == 40
+    assert vara.initial_batch()["xy_f"].shape[0] == 40
+
+
+def test_hard_boundary_correction_boost_preserves_walls_and_near_wall_authority():
+    class UnitPsi(torch.nn.Module):
+        def forward(self, coords):
+            return torch.cat(
+                [torch.ones_like(coords[:, 0:1]), torch.zeros_like(coords[:, 0:1])],
+                dim=1,
+            )
+
+    plain = HardBoundaryStreamfunctionPressureWrapper(
+        UnitPsi(),
+        (0.0, 1.0, 0.0, 1.0),
+        correction_scale=1.0,
+        correction_wall_boost=0.0,
+    )
+    boosted = HardBoundaryStreamfunctionPressureWrapper(
+        UnitPsi(),
+        (0.0, 1.0, 0.0, 1.0),
+        correction_scale=1.0,
+        correction_wall_boost=8.0,
+    )
+    walls = torch.tensor(
+        [[0.0, 0.4], [1.0, 0.4], [0.5, 0.0], [0.5, 1.0]],
+        dtype=torch.float64,
+    )
+    assert torch.allclose(
+        plain(walls)[:, :2],
+        boosted(walls)[:, :2],
+        atol=1e-12,
+    )
+    near_wall = torch.tensor([[0.05, 0.5]], dtype=torch.float64, requires_grad=True)
+    plain_correction = plain.streamfunction_auxiliary(near_wall)["scaled_correction"]
+    boosted_correction = boosted.streamfunction_auxiliary(near_wall)["scaled_correction"]
+    assert boosted_correction.item() > plain_correction.item()
+    plain_gradient = torch.autograd.grad(
+        plain_correction,
+        near_wall,
+        grad_outputs=torch.ones_like(plain_correction),
+    )[0]
+    boosted_gradient = torch.autograd.grad(
+        boosted_correction,
+        near_wall,
+        grad_outputs=torch.ones_like(boosted_correction),
+    )[0]
+    assert abs(boosted_gradient[0, 0].item()) > abs(plain_gradient[0, 0].item())
+
+
+def test_reliable_config_guard_rejects_legacy_formulation_and_budget_mismatch():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    resolved = _apply_re_aware_cavity_settings(base, 100.0)
+    _validate_reliable_config(resolved, "reliable", require_materialized=True)
+    for preset, expected in [
+        ("fast_screen", 1200),
+        ("diagnostic", 2000),
+        ("reliable", 4000),
+    ]:
+        preset_config = deep_update(
+            base,
+            load_config(f"configs/vara_v2/presets/{preset}.yaml"),
+        )
+        preset_config = _apply_re_aware_cavity_settings(preset_config, 100.0)
+        _validate_reliable_config(
+            preset_config,
+            preset,
+            require_materialized=True,
+        )
+        assert preset_config["controller_v2"]["total_steps"] == expected
+    with pytest.raises(ValueError, match="physics_formulation"):
+        _validate_reliable_config(
+            deep_update(resolved, {"model": {"physics_formulation": "cavity_hard_boundary"}}),
+            "reliable",
+            require_materialized=True,
+        )
+    with pytest.raises(ValueError, match="total_steps"):
+        _validate_reliable_config(
+            deep_update(resolved, {"optimizer": {"scheduler": {"total_steps": 2000}}}),
+            "reliable",
+            require_materialized=True,
+        )
 
 
 def test_stabilizer_ablation_keeps_formulation_and_budget_but_disables_losses():
@@ -534,7 +752,7 @@ def test_vara_v2_inherits_reliable_cavity_stabilizers_identically(tmp_path):
     assert trainer.model.physics_formulation == "hard_boundary_streamfunction_pressure"
     assert active["speed_cap"]["enabled"] is True
     assert active["near_wall_momentum"]["enabled"] is True
-    assert active["near_wall_momentum"]["weight"] == pytest.approx(0.0)
+    assert active["near_wall_momentum"]["weight"] == pytest.approx(1.0)
     assert trainer._residual_loss_settings()[0] == "pseudo_huber"
     assert trainer._compute_boundary_training_loss(
         config["training"]["weights"]

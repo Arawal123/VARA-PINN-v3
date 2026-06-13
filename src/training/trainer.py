@@ -268,7 +268,7 @@ class ExperimentTrainer:
     def initial_batch(self) -> dict[str, Any]:
         n_f, n_bc, n_data = self._training_sample_counts()
         started = time.perf_counter()
-        xy_f = self.uniform_sampler.sample(n_f)
+        xy_f = self._sample_interior(n_f)
         xy_bc = self._sample_boundary(n_bc)
         xy_data = self._sample_data(n_data)
         self._record_runtime("sampling", time.perf_counter() - started, phase="initial")
@@ -290,6 +290,58 @@ class ExperimentTrainer:
             n_f = int(selected.get("n_collocation", n_f))
             n_bc = int(selected.get("n_boundary", n_bc))
         return n_f, n_bc, n_data
+
+    def _near_wall_sample_count(self, n: int) -> int:
+        cfg = dict(self.config.get("sampling", {}).get("cavity_near_wall", {}))
+        if not self._is_lid_driven_cavity() or not bool(cfg.get("enabled", False)):
+            return 0
+        fraction = min(max(float(cfg.get("fraction", 0.0)), 0.0), 1.0)
+        return min(max(int(round(int(n) * fraction)), 0), int(n))
+
+    def _sample_near_wall_numpy(self, n: int) -> np.ndarray:
+        if n <= 0:
+            return self.uniform_sampler.sample_numpy(0)
+        cfg = dict(self.config.get("sampling", {}).get("cavity_near_wall", {}))
+        band = min(max(float(cfg.get("band_width", 0.08)), 1e-6), 0.49)
+        unit = self.uniform_sampler.sample_numpy(n)
+        x0, x1, y0, y1 = self.benchmark.bounds
+        u = (unit[:, 0] - x0) / max(x1 - x0, 1e-12)
+        v = (unit[:, 1] - y0) / max(y1 - y0, 1e-12)
+        normal_floor = min(max(0.02 * band, 1e-6), 0.5 * band)
+        normal = normal_floor + u * (band - normal_floor)
+        tangent = band + v * (1.0 - 2.0 * band)
+        side = np.arange(n) % 4
+        xi = np.where(side == 0, normal, np.where(side == 1, 1.0 - normal, tangent))
+        eta = np.where(side == 2, normal, np.where(side == 3, 1.0 - normal, tangent))
+        points = unit.copy()
+        points[:, 0] = x0 + xi * (x1 - x0)
+        points[:, 1] = y0 + eta * (y1 - y0)
+        return points
+
+    def _sample_interior_numpy(
+        self,
+        n: int,
+        core_points: np.ndarray | None = None,
+    ) -> np.ndarray:
+        n_wall = self._near_wall_sample_count(n)
+        n_core = int(n) - n_wall
+        if core_points is None:
+            core_points = self.uniform_sampler.sample_numpy(n_core)
+        if int(core_points.shape[0]) != n_core:
+            raise ValueError(
+                f"Expected {n_core} core collocation points, got {core_points.shape[0]}."
+            )
+        wall_points = self._sample_near_wall_numpy(n_wall)
+        return np.vstack([core_points, wall_points]) if n_wall else core_points
+
+    def _sample_interior(
+        self,
+        n: int,
+        core_points: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        core_numpy = None if core_points is None else core_points.detach().cpu().numpy()
+        points = self._sample_interior_numpy(n, core_numpy)
+        return torch.tensor(points, dtype=torch.float32, device=self.device)
 
     def _sample_data(self, n: int) -> torch.Tensor:
         """Sample reference data; time-dependent benchmarks use initial data only."""
@@ -1197,13 +1249,17 @@ class ExperimentTrainer:
         started = time.perf_counter()
         if adaptive:
             priorities = control_state.sampling_priorities if control_state is not None else {}
-            xy_f = self.adaptive_sampler.sample_interior(n_f, maps, coords, weak_regions, priorities)
+            n_core = n_f - self._near_wall_sample_count(n_f)
+            core = self.adaptive_sampler.sample_interior(
+                n_core, maps, coords, weak_regions, priorities
+            )
+            xy_f = self._sample_interior(n_f, core)
             if getattr(self.benchmark, "t_bounds", None) is not None:
                 xy_data = self._sample_data(n_data)
             else:
                 xy_data = self.adaptive_sampler.sample_interior(n_data, maps, coords, weak_regions, priorities)
         else:
-            xy_f = self.uniform_sampler.sample(n_f)
+            xy_f = self._sample_interior(n_f)
             xy_data = self._sample_data(n_data)
         xy_bc = self._sample_boundary(n_bc)
         result = self.make_batch(xy_f, xy_bc, xy_data)

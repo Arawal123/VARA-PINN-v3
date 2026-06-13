@@ -43,6 +43,12 @@ PRESET_PATHS = {
     "reliable": "configs/vara_v2/presets/reliable.yaml",
     "final": "configs/vara_v2/presets/final.yaml",
 }
+PRESET_STEPS = {
+    "fast_screen": 1200,
+    "diagnostic": 2000,
+    "reliable": 4000,
+    "final": 6000,
+}
 
 
 def main() -> None:
@@ -139,6 +145,13 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                 },
             },
         )
+    if args.reliable and not args.quick:
+        for reynolds in args.reynolds:
+            _validate_reliable_config(
+                _apply_re_aware_cavity_settings(base, float(reynolds)),
+                preset,
+                require_materialized=True,
+            )
     if args.device:
         base["device"] = args.device
     reference_map = _load_full_field_reference_map(args.full_field_reference_map)
@@ -438,6 +451,11 @@ def _apply_re_aware_cavity_settings(
             },
             "sampling": {
                 "cavity_boundary": {"corner_width": corner_widths[-1]},
+                "cavity_near_wall": {
+                    "enabled": True,
+                    "fraction": float(regime["near_wall_fraction"]),
+                    "band_width": band,
+                },
             },
             "continuation_validity": {
                 "max_lid_cavity_primary_center_error": float(
@@ -453,6 +471,47 @@ def _apply_re_aware_cavity_settings(
             },
         },
     )
+
+
+def _validate_reliable_config(
+    config: dict[str, Any],
+    preset: str | None,
+    *,
+    require_materialized: bool = False,
+) -> None:
+    expected_steps = PRESET_STEPS.get(str(preset), 4000)
+    model_cfg = dict(config.get("model", {}))
+    train_cfg = dict(config.get("training", {}))
+    controller_cfg = dict(config.get("controller_v2", {}))
+    scheduler_cfg = dict(config.get("optimizer", {}).get("scheduler", {}))
+    failures = []
+    if model_cfg.get("physics_formulation") != "hard_boundary_streamfunction_pressure":
+        failures.append("physics_formulation must be hard_boundary_streamfunction_pressure")
+    if int(train_cfg.get("n_data", -1)) != 0:
+        failures.append("training.n_data must be 0")
+    if not bool(train_cfg.get("skip_boundary_loss_if_hard_enforced", False)):
+        failures.append("hard-enforced boundary loss must be skipped")
+    if int(controller_cfg.get("total_steps", -1)) != expected_steps:
+        failures.append(f"controller_v2.total_steps must be {expected_steps}")
+    if int(scheduler_cfg.get("total_steps", -1)) != expected_steps:
+        failures.append(f"optimizer.scheduler.total_steps must be {expected_steps}")
+    planned_steps = int(train_cfg.get("adaptive_cycles", 0)) * int(
+        train_cfg.get("epochs_per_cycle", 0)
+    )
+    if planned_steps != expected_steps:
+        failures.append(f"training cycle budget must equal {expected_steps}")
+    schedule = dict(config.get("re_aware_cavity", {}))
+    if not bool(schedule.get("enabled", False)) or not schedule.get("regimes"):
+        failures.append("re_aware_cavity schedule must be enabled")
+    near_wall = dict(config.get("sampling", {}).get("cavity_near_wall", {}))
+    if require_materialized and (
+        not bool(near_wall.get("enabled", False))
+        or float(near_wall.get("fraction", 0.0)) <= 0.0
+        or float(near_wall.get("band_width", 0.0)) <= 0.0
+    ):
+        failures.append("Re-aware near-wall sampling must be materialized")
+    if failures:
+        raise ValueError("Invalid reliable cavity configuration: " + "; ".join(failures))
 
 
 def _save_validity_aware_montages(

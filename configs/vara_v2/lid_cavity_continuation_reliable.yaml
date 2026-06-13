@@ -19,6 +19,7 @@ model:
   hard_boundary_corner_width: 0.08
   hard_boundary_lid_vertical_power: 2
   hard_boundary_correction_scale: 24
+  hard_boundary_correction_wall_boost: 8.0
 
 optimizer:
   scheduler:
@@ -94,22 +95,24 @@ losses:
   near_wall_momentum:
     enabled: true
     normalize_mean: true
+    max_weight: 3.0
     stages:
       - until_step: 800
         band_width: 0.12
-        weight: 0.50
+        weight: 1.00
       - until_step: 1800
         band_width: 0.12
-        weight: 0.70
+        weight: 1.25
       - until_step: 3000
         band_width: 0.12
-        weight: 0.85
+        weight: 1.50
       - until_step: 4000
         band_width: 0.12
-        weight: 0.90
+        weight: 1.50
   near_wall_vorticity_l2:
     enabled: true
     band_width: 0.12
+    quantile: 0.95
   vorticity_smoothness:
     enabled: false
 
@@ -145,7 +148,8 @@ re_aware_cavity:
       speed_cap_weight: 0.60
       raw_psi_l2_weight: 0.0005
       near_wall_vorticity_l2_weight: 0.0002
-      near_wall_momentum_weights: [0.50, 0.70, 0.85, 0.90]
+      near_wall_fraction: 0.30
+      near_wall_momentum_weights: [1.00, 1.25, 1.50, 1.50]
       topology:
         max_primary_center_error: 0.10
         max_topology_score: 0.18
@@ -158,7 +162,8 @@ re_aware_cavity:
       speed_cap_weight: 0.45
       raw_psi_l2_weight: 0.0003
       near_wall_vorticity_l2_weight: 0.0001
-      near_wall_momentum_weights: [0.60, 0.80, 0.90, 0.95]
+      near_wall_fraction: 0.40
+      near_wall_momentum_weights: [1.00, 1.35, 1.75, 1.75]
       topology:
         max_primary_center_error: 0.16
         max_topology_score: 0.28
@@ -171,7 +176,8 @@ re_aware_cavity:
       speed_cap_weight: 0.30
       raw_psi_l2_weight: 0.00015
       near_wall_vorticity_l2_weight: 0.00005
-      near_wall_momentum_weights: [0.60, 0.80, 0.90, 0.95]
+      near_wall_fraction: 0.50
+      near_wall_momentum_weights: [1.00, 1.35, 1.75, 1.75]
       topology:
         max_primary_center_error: 0.25
         max_topology_score: 0.40
@@ -232,6 +238,10 @@ continuation_replay:
 sampling:
   uniform:
     engine: sobol
+  cavity_near_wall:
+    enabled: true
+    fraction: 0.30
+    band_width: 0.12
   cavity_boundary:
     enabled: true
     mode: balanced
