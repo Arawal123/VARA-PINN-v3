@@ -299,6 +299,99 @@ def test_continuation_overlay_inherits_lid_cavity_base_config():
     assert "unweighted_physics_validation_loss" in config["controller_v2"]["guard_metrics"]
 
 
+def test_uvp_soft_bc_formulation_returns_raw_fields_and_residuals():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = _apply_re_aware_cavity_settings(base, 100.0)
+    model = build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0))
+    points = torch.tensor(
+        [[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    prediction = model(points)
+    residuals = navier_stokes_residuals(model, points, nu=0.01, steady=True)
+    assert model.physics_formulation == "cavity_uvp_soft_bc"
+    assert prediction.shape == (3, 3)
+    assert all(torch.isfinite(residuals[name]).all() for name in ("f_u", "f_v", "f_c"))
+
+
+def test_uvp_soft_boundary_loss_covers_all_walls_and_pressure_gauge(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": 8,
+                "n_boundary": 16,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    walls = trainer._sample_boundary(16)
+    fractions = boundary_side_fractions(walls.detach().cpu().numpy(), trainer.benchmark.bounds)
+    assert all(
+        fractions[name] > 0.0
+        for name in (
+            "boundary_fraction_left",
+            "boundary_fraction_right",
+            "boundary_fraction_bottom",
+            "boundary_fraction_top",
+        )
+    )
+    assert trainer._compute_boundary_training_loss(config["training"]["weights"])
+    with torch.no_grad():
+        trainer.model.layers[-1].bias[2] = 1.0
+    assert trainer.pressure_gauge_loss().item() > 0.0
+
+
+def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    for preset, expected in (("diagnostic", 2000), ("reliable", 4000)):
+        config = deep_update(
+            base,
+            load_config(f"configs/vara_v2/presets/{preset}.yaml"),
+        )
+        config = _apply_re_aware_cavity_settings(config, 100.0)
+        _validate_reliable_config(config, preset, require_materialized=True)
+        assert config["model"]["physics_formulation"] == "cavity_uvp_soft_bc"
+        assert config["controller_v2"]["total_steps"] == expected
+        assert config["optimizer"]["scheduler"]["total_steps"] == expected
+        assert config["training"]["n_boundary"] >= 256
+        metrics = config["checkpoint"]["reference_free_metrics"]
+        assert "continuity_residual_mean" in metrics
+        assert not config["checkpoint"]["low_re_vortex_tiebreaker"]["enabled"]
+
+
+def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": 8,
+                "n_boundary": 16,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    vanilla = VARATrainer(config, mode="vanilla")
+    vara = VARAV2Trainer(config)
+    assert vanilla.model.physics_formulation == "cavity_uvp_soft_bc"
+    assert vara.model.physics_formulation == vanilla.model.physics_formulation
+    assert vara.config["training"]["weights"] == vanilla.config["training"]["weights"]
+
+
 def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     low = _apply_re_aware_cavity_settings(base, 100.0)
@@ -1180,6 +1273,7 @@ def test_checkpoint_vortex_tiebreaker_is_low_re_only(tmp_path):
 
 def test_reliable_final_state_guard_rejects_early_curriculum_values(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "hard_boundary_streamfunction_pressure"
     config = deep_update(
         _apply_re_aware_cavity_settings(base, 100.0),
         {

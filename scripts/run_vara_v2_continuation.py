@@ -73,7 +73,13 @@ def main() -> None:
     parser.add_argument(
         "--reliable",
         action="store_true",
-        help="Use the physically guarded, longer, hard-boundary continuation protocol.",
+        help="Use the physically guarded cavity continuation protocol.",
+    )
+    parser.add_argument(
+        "--cavity_base_formulation",
+        choices=["uvp_soft_bc", "hard_boundary_streamfunction_pressure"],
+        default=None,
+        help="Override the shared cavity formulation for both Vanilla and VARA.",
     )
     parser.add_argument(
         "--continue_on_invalid",
@@ -109,6 +115,9 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     preset = getattr(args, "preset", None)
     if preset:
         base = deep_update(base, load_config(PRESET_PATHS[str(preset)]))
+    cavity_base_formulation = getattr(args, "cavity_base_formulation", None)
+    if cavity_base_formulation:
+        base["cavity_base_formulation"] = str(cavity_base_formulation)
     if bool(getattr(args, "disable_stabilizers", False)):
         base = _without_cavity_stabilizers(base)
     if args.enhanced_backbone:
@@ -406,7 +415,7 @@ def _apply_re_aware_cavity_settings(
     wall_weights = [float(value) for value in regime["near_wall_momentum_weights"]]
     topology = dict(regime.get("topology", {}))
 
-    return deep_update(
+    resolved = deep_update(
         config,
         {
             "benchmark_params": {
@@ -523,6 +532,71 @@ def _apply_re_aware_cavity_settings(
             },
         },
     )
+    if str(resolved.get("cavity_base_formulation", "")).lower() != "uvp_soft_bc":
+        return resolved
+    boundary_count = max(int(resolved.get("training", {}).get("n_boundary", 0)), 256)
+    collocation_stages = []
+    for stage in resolved.get("training", {}).get("collocation_curriculum", {}).get(
+        "stages", []
+    ):
+        collocation_stages.append({**stage, "n_boundary": boundary_count})
+    return deep_update(
+        resolved,
+        {
+            "model": {
+                "physics_formulation": "cavity_uvp_soft_bc",
+                "output_dim": 3,
+            },
+            "training": {
+                "n_boundary": boundary_count,
+                "skip_boundary_loss_if_hard_enforced": False,
+                "collocation_curriculum": {"stages": collocation_stages},
+                "weights": {
+                    "pde": 0.0,
+                    "momentum_u": 1.0,
+                    "momentum_v": 1.0,
+                    "continuity": 1.0,
+                    "bc": 10.0,
+                    "speed_cap": 0.0,
+                    "raw_psi_l2": 0.0,
+                    "raw_psi_mean_l2": 0.0,
+                    "scaled_correction_mean_l2": 0.0,
+                    "scaled_correction_abs_max_hinge": 0.0,
+                    "top_reverse_u": 0.0,
+                    "bottom_positive_u": 0.0,
+                    "raw_pde_tail": 0.0,
+                    "pressure_gradient_l2": 0.0,
+                    "near_wall_vorticity_l2": 0.0,
+                },
+            },
+            "pressure_gauge": {"weight": 0.001},
+            "losses": {
+                "speed_cap": {"enabled": False},
+                "raw_psi_l2": {"enabled": False},
+                "correction_bubble": {"enabled": False},
+                "lid_shear_direction": {"enabled": False},
+                "raw_residual_tail": {"enabled": False},
+                "pressure_gradient_l2": {"enabled": False},
+                "near_wall_momentum": {"enabled": False},
+                "near_wall_vorticity_l2": {"enabled": False},
+            },
+            "cavity_curriculum": {"enabled": False},
+            "checkpoint": {
+                "require_final_cavity_stage": False,
+                "reference_free_metrics": [
+                    "pde_residual_mean",
+                    "continuity_residual_mean",
+                    "momentum_residual_mean",
+                    "boundary_condition_error",
+                    "core_pde_residual_mean",
+                    "near_wall_pde_residual_mean",
+                    "near_wall_momentum_v_mean",
+                ],
+                "low_re_vortex_tiebreaker": {"enabled": False},
+            },
+            "evaluation": {"controller_streamfunction_metrics": False},
+        },
+    )
 
 
 def _validate_reliable_config(
@@ -537,12 +611,30 @@ def _validate_reliable_config(
     controller_cfg = dict(config.get("controller_v2", {}))
     scheduler_cfg = dict(config.get("optimizer", {}).get("scheduler", {}))
     failures = []
-    if model_cfg.get("physics_formulation") != "hard_boundary_streamfunction_pressure":
-        failures.append("physics_formulation must be hard_boundary_streamfunction_pressure")
+    formulation = str(model_cfg.get("physics_formulation", ""))
+    allowed_formulations = {
+        "cavity_uvp_soft_bc",
+        "hard_boundary_streamfunction_pressure",
+    }
+    if formulation not in allowed_formulations:
+        failures.append(
+            "physics_formulation must be cavity_uvp_soft_bc or "
+            "hard_boundary_streamfunction_pressure"
+        )
     if int(train_cfg.get("n_data", -1)) != 0:
         failures.append("training.n_data must be 0")
-    if not bool(train_cfg.get("skip_boundary_loss_if_hard_enforced", False)):
+    skip_boundary = bool(train_cfg.get("skip_boundary_loss_if_hard_enforced", False))
+    if formulation == "hard_boundary_streamfunction_pressure" and not skip_boundary:
         failures.append("hard-enforced boundary loss must be skipped")
+    if formulation == "cavity_uvp_soft_bc":
+        if int(model_cfg.get("output_dim", -1)) != 3:
+            failures.append("cavity_uvp_soft_bc requires model.output_dim = 3")
+        if skip_boundary:
+            failures.append("cavity_uvp_soft_bc boundary loss must not be skipped")
+        if float(train_cfg.get("weights", {}).get("bc", 0.0)) <= 0.0:
+            failures.append("cavity_uvp_soft_bc requires a positive boundary weight")
+        if float(config.get("pressure_gauge", {}).get("weight", 0.0)) <= 0.0:
+            failures.append("cavity_uvp_soft_bc requires a positive pressure gauge")
     if int(controller_cfg.get("total_steps", -1)) != expected_steps:
         failures.append(f"controller_v2.total_steps must be {expected_steps}")
     if int(scheduler_cfg.get("total_steps", -1)) != expected_steps:

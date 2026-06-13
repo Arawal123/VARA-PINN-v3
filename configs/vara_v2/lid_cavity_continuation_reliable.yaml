@@ -1,4 +1,6 @@
 # Opt-in physically guarded continuation protocol. Legacy configs are unchanged.
+cavity_base_formulation: uvp_soft_bc
+
 benchmark_params:
   # The mathematical cavity has singular top corners. Use the same explicit
   # regularization in the target and hard-boundary output transform.
@@ -326,6 +328,10 @@ checkpoint:
     detected_vortex_weight: 0.05
     secondary_vortex_weight: 0.05
   metric_floor: 1.0e-8
+
+pressure_gauge:
+  # Removes the pressure nullspace without using reference data.
+  weight: 0.001
 
 convergence_early_stopping:
   enabled: true

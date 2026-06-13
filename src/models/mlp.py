@@ -165,6 +165,22 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
                 model_cfg.get("hard_boundary_lid_vertical_power", 6)
             ),
         )
+    if formulation == "cavity_uvp_soft_bc":
+        cavity_names = {
+            "lid_driven_cavity",
+            "lid-driven-cavity",
+            "lid_cavity",
+            "lid-cavity",
+            "cavity",
+        }
+        if str(config.get("benchmark", "")).lower() not in cavity_names:
+            raise ValueError(
+                "cavity_uvp_soft_bc is only valid for the lid-driven cavity benchmark."
+            )
+        if requested_out_dim != 3:
+            raise ValueError("cavity_uvp_soft_bc requires model.output_dim = 3.")
+        model.physics_formulation = formulation
+        return model
     if formulation != "direct":
         raise ValueError(f"Unsupported model.physics_formulation: {formulation}")
     return model
