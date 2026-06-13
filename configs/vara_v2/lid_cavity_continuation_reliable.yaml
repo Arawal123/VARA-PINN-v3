@@ -1,6 +1,28 @@
 # Opt-in physically guarded continuation protocol. Legacy configs are unchanged.
 cavity_base_formulation: uvp_soft_bc
 
+uvp_soft_bc:
+  # Momentum is already healthy at Re=100; tighten the two observed weak
+  # components without changing optimizer steps or collocation work.
+  continuity_weight: 5.0
+  boundary_weight: 25.0
+  diagnostic_boundary_samples: 384
+  reliable_boundary_samples: 512
+  diagnostic_validity:
+    max_continuity_residual_mean: 0.02
+    max_boundary_condition_error: 0.06
+  reliable_validity:
+    max_continuity_residual_mean: 0.01
+    max_boundary_condition_error: 0.03
+  checkpoint_metric_weights:
+    pde_residual_mean: 1.0
+    momentum_residual_mean: 1.0
+    core_pde_residual_mean: 0.75
+    continuity_residual_mean: 1.75
+    boundary_condition_error: 1.75
+    near_wall_pde_residual_mean: 0.5
+    near_wall_momentum_v_mean: 0.5
+
 benchmark_params:
   # The mathematical cavity has singular top corners. Use the same explicit
   # regularization in the target and hard-boundary output transform.

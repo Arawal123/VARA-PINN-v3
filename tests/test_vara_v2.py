@@ -362,9 +362,19 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert config["model"]["physics_formulation"] == "cavity_uvp_soft_bc"
         assert config["controller_v2"]["total_steps"] == expected
         assert config["optimizer"]["scheduler"]["total_steps"] == expected
-        assert config["training"]["n_boundary"] >= 256
+        assert config["training"]["weights"]["continuity"] == pytest.approx(5.0)
+        assert config["training"]["weights"]["bc"] == pytest.approx(25.0)
+        assert config["training"]["n_boundary"] == (384 if preset == "diagnostic" else 512)
+        assert config["continuation_validity"][
+            "max_continuity_residual_mean"
+        ] == pytest.approx(0.02 if preset == "diagnostic" else 0.01)
+        assert config["continuation_validity"][
+            "max_boundary_condition_error"
+        ] == pytest.approx(0.06 if preset == "diagnostic" else 0.03)
         metrics = config["checkpoint"]["reference_free_metrics"]
         assert "continuity_residual_mean" in metrics
+        assert "boundary_condition_error" in metrics
+        assert not any("rel_l2" in name for name in metrics)
         assert not config["checkpoint"]["low_re_vortex_tiebreaker"]["enabled"]
 
 
@@ -390,6 +400,62 @@ def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
     assert vanilla.model.physics_formulation == "cavity_uvp_soft_bc"
     assert vara.model.physics_formulation == vanilla.model.physics_formulation
     assert vara.config["training"]["weights"] == vanilla.config["training"]["weights"]
+    assert vara.config["continuation_validity"] == vanilla.config["continuation_validity"]
+    assert vara.config["checkpoint"] == vanilla.config["checkpoint"]
+
+
+def test_uvp_validity_is_soft_bc_aware_but_keeps_physics_gates():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    diagnostic = deep_update(
+        base,
+        load_config("configs/vara_v2/presets/diagnostic.yaml"),
+    )
+    diagnostic = _apply_re_aware_cavity_settings(diagnostic, 100.0)
+    valid = {
+        "pde_residual_mean": 0.20,
+        "continuity_residual_mean": 0.015,
+        "momentum_residual_mean": 0.20,
+        "boundary_condition_error": 0.05,
+        "speed_pred_max": 1.2,
+        "streamfunction_consistency_rmse": 99.0,
+        "lid_cavity_primary_center_error": 0.05,
+        "lid_cavity_topology_score": 0.05,
+        "lid_cavity_topology_aligned": 1.0,
+        "primary_streamfunction_abs": 0.02,
+        "speed_pred_mean": 0.2,
+        "detected_vortex_count": 1,
+        "primary_vortex_center_x": 0.6,
+        "primary_vortex_center_y": 0.7,
+        "near_wall_pde_residual_mean": 0.2,
+        "near_wall_momentum_v_mean": 0.2,
+        "core_pde_residual_mean": 0.2,
+    }
+    assert _continuation_validity(valid, diagnostic)["continuation_stage_valid"]
+    for metric, value in (
+        ("pde_residual_mean", 0.31),
+        ("momentum_residual_mean", 0.31),
+        ("core_pde_residual_mean", 0.36),
+        ("near_wall_pde_residual_mean", 3.1),
+        ("speed_pred_max", 2.3),
+    ):
+        assert not _continuation_validity(
+            {**valid, metric: value}, diagnostic
+        )["continuation_stage_valid"]
+
+
+def test_hard_boundary_validity_gates_remain_exact():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "hard_boundary_streamfunction_pressure"
+    hard = _apply_re_aware_cavity_settings(base, 100.0)
+    assert hard["continuation_validity"]["max_boundary_condition_error"] == pytest.approx(
+        1.0e-8
+    )
+    assert hard["continuation_validity"]["max_continuity_residual_mean"] == pytest.approx(
+        0.001
+    )
+    assert hard["continuation_validity"][
+        "max_streamfunction_consistency_rmse"
+    ] == pytest.approx(0.001)
 
 
 def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
@@ -1171,6 +1237,7 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
         "pde_residual_mean": 1.0,
         "momentum_residual_mean": 1.0,
         "core_pde_residual_mean": 1.0,
+        "continuity_residual_mean": 1.0,
         "boundary_condition_error": 0.0,
         "near_wall_pde_residual_mean": 1.0,
         "near_wall_momentum_v_mean": 1.0,
@@ -1184,7 +1251,16 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
     assert trainer._checkpoint_score({**metrics, "speed_pred_max": 3.2}) > below_gate
     assert trainer._checkpoint_score(
         {**metrics, "core_pde_residual_mean": 2.0}
-    ) == pytest.approx(below_gate + 2.0)
+    ) == pytest.approx(below_gate + 0.75)
+    assert trainer._checkpoint_score(
+        {**metrics, "continuity_residual_mean": 2.0}
+    ) == pytest.approx(below_gate + 1.75)
+    assert trainer._checkpoint_score(
+        {**metrics, "boundary_condition_error": 1.0}
+    ) == pytest.approx(below_gate + 1.75)
+    assert trainer._checkpoint_score(
+        {**metrics, "u_rel_l2": 1000.0, "velocity_full_rel_l2": 1000.0}
+    ) == pytest.approx(below_gate)
 
 
 def test_checkpoint_score_does_not_prioritize_direction_losses(tmp_path):
@@ -1216,6 +1292,7 @@ def test_checkpoint_score_does_not_prioritize_direction_losses(tmp_path):
 
 def test_checkpoint_vortex_tiebreaker_is_low_re_only(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "hard_boundary_streamfunction_pressure"
     common = {
         "device": "cpu",
         "model": {"hidden_layers": [8, 8]},

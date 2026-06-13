@@ -534,7 +534,17 @@ def _apply_re_aware_cavity_settings(
     )
     if str(resolved.get("cavity_base_formulation", "")).lower() != "uvp_soft_bc":
         return resolved
-    boundary_count = max(int(resolved.get("training", {}).get("n_boundary", 0)), 256)
+    uvp_cfg = dict(resolved.get("uvp_soft_bc", {}))
+    diagnostic_budget = total_steps <= PRESET_STEPS["diagnostic"]
+    boundary_key = (
+        "diagnostic_boundary_samples"
+        if diagnostic_budget
+        else "reliable_boundary_samples"
+    )
+    boundary_count = int(uvp_cfg.get(boundary_key, 384 if diagnostic_budget else 512))
+    validity_key = "diagnostic_validity" if diagnostic_budget else "reliable_validity"
+    uvp_validity = dict(uvp_cfg.get(validity_key, {}))
+    checkpoint_weights = dict(uvp_cfg.get("checkpoint_metric_weights", {}))
     collocation_stages = []
     for stage in resolved.get("training", {}).get("collocation_curriculum", {}).get(
         "stages", []
@@ -555,8 +565,8 @@ def _apply_re_aware_cavity_settings(
                     "pde": 0.0,
                     "momentum_u": 1.0,
                     "momentum_v": 1.0,
-                    "continuity": 1.0,
-                    "bc": 10.0,
+                    "continuity": float(uvp_cfg.get("continuity_weight", 5.0)),
+                    "bc": float(uvp_cfg.get("boundary_weight", 25.0)),
                     "speed_cap": 0.0,
                     "raw_psi_l2": 0.0,
                     "raw_psi_mean_l2": 0.0,
@@ -585,16 +595,18 @@ def _apply_re_aware_cavity_settings(
                 "require_final_cavity_stage": False,
                 "reference_free_metrics": [
                     "pde_residual_mean",
-                    "continuity_residual_mean",
                     "momentum_residual_mean",
-                    "boundary_condition_error",
                     "core_pde_residual_mean",
+                    "continuity_residual_mean",
+                    "boundary_condition_error",
                     "near_wall_pde_residual_mean",
                     "near_wall_momentum_v_mean",
                 ],
+                "metric_weights": checkpoint_weights,
                 "low_re_vortex_tiebreaker": {"enabled": False},
             },
             "evaluation": {"controller_streamfunction_metrics": False},
+            "continuation_validity": uvp_validity,
         },
     )
 
@@ -741,15 +753,13 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             "continuation_stage_valid": True,
             "continuation_invalid_reasons": "",
         }
+    formulation = str(config.get("model", {}).get("physics_formulation", ""))
     checks = {
         "pde_residual_mean": float(cfg.get("max_pde_residual_mean", np.inf)),
         "continuity_residual_mean": float(cfg.get("max_continuity_residual_mean", np.inf)),
         "momentum_residual_mean": float(cfg.get("max_momentum_residual_mean", np.inf)),
         "boundary_condition_error": float(cfg.get("max_boundary_condition_error", np.inf)),
         "speed_pred_max": float(cfg.get("max_speed_pred", np.inf)),
-        "streamfunction_consistency_rmse": float(
-            cfg.get("max_streamfunction_consistency_rmse", np.inf)
-        ),
         "lid_cavity_primary_center_error": float(
             cfg.get("max_lid_cavity_primary_center_error", np.inf)
         ),
@@ -766,6 +776,10 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             cfg.get("max_core_pde_residual_mean", np.inf)
         ),
     }
+    if formulation != "cavity_uvp_soft_bc":
+        checks["streamfunction_consistency_rmse"] = float(
+            cfg.get("max_streamfunction_consistency_rmse", np.inf)
+        )
     reasons = []
     for name, maximum in checks.items():
         try:

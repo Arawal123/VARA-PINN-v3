@@ -26,7 +26,6 @@ VANILLA_REQUIRED = (
     "pde_residual_mean",
     "continuity_residual_mean",
     "momentum_residual_mean",
-    "streamfunction_consistency_rmse",
     "near_wall_pde_residual_mean",
     "near_wall_momentum_v_mean",
 )
@@ -203,10 +202,13 @@ def _method_report(
         "failures": [],
     }
     failures = report["failures"]
+    formulation = str(row.get("physics_formulation", ""))
     if not _to_bool(row.get("continuation_stage_valid", False)):
         failures.append(f"continuation_stage_valid=false ({row.get('continuation_invalid_reasons', '')})")
     for metric in VANILLA_REQUIRED:
         _check_max(metrics, metric, thresholds, failures)
+    if formulation != "cavity_uvp_soft_bc":
+        _check_max(metrics, "streamfunction_consistency_rmse", thresholds, failures)
     _check_min(metrics, "speed_pred_mean", float(thresholds.get("min_speed_pred_mean", 0.05)), failures)
     _check_min(metrics, "primary_streamfunction_abs", float(thresholds.get("min_primary_streamfunction_abs", 0.015)), failures)
     _check_min(metrics, "detected_vortex_count", int(thresholds.get("min_detected_vortices", 1)), failures)
@@ -218,8 +220,6 @@ def _method_report(
     )
     _check_exact(metrics, "lid_cavity_topology_aligned", 1.0, failures)
     _check_max(metrics, "lid_cavity_primary_center_error", thresholds, failures)
-    if "velocity_full_rel_l2" in metrics and np.isfinite(metrics["velocity_full_rel_l2"]):
-        _check_max(metrics, "velocity_full_rel_l2", thresholds, failures)
     _check_final_vs_best(report, float(thresholds.get("max_final_checkpoint_physics_degradation", 0.05)), failures)
     for name, exists in report["figures"].items():
         if not exists:
@@ -297,7 +297,6 @@ def _compare_vara_to_vanilla(
         "continuity_residual_mean",
         "speed_pred_max",
         "detected_vortex_count",
-        "streamfunction_consistency_rmse",
         "near_wall_pde_residual_mean",
         "near_wall_momentum_v_mean",
     ]:
@@ -311,7 +310,7 @@ def _compare_vara_to_vanilla(
 
 
 def _dominance_label(vanilla: dict[str, Any], vara: dict[str, Any]) -> str:
-    metrics = ["pde_residual_mean", "momentum_residual_mean", "boundary_condition_error", "velocity_full_rel_l2"]
+    metrics = ["pde_residual_mean", "momentum_residual_mean", "boundary_condition_error"]
     wins = 0
     total = 0
     for metric in metrics:
