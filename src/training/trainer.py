@@ -710,7 +710,11 @@ class ExperimentTrainer:
         skip = bool(train_cfg.get("skip_boundary_loss_if_hard_enforced", False))
         if skip and formulation == "hard_boundary_streamfunction_pressure":
             return False
-        return float(weights.get("bc", 0.0)) != 0.0
+        return any(
+            float(weight) != 0.0
+            for name, weight in weights.items()
+            if name == "bc" or name == "bc_uvp_balanced" or name.startswith("bc_")
+        )
 
     def _apply_cavity_curriculum(self) -> None:
         cfg = dict(self.config.get("cavity_curriculum", {}))
@@ -1078,8 +1082,20 @@ class ExperimentTrainer:
         after_metrics = self.evaluate_metrics(validation_coords)
         _, after_score = self._repair_score(after_metrics)
         tolerance = float(cfg.get("acceptance_tolerance", 0.0))
-        accepted = bool(after_score <= before_score * (1.0 + tolerance))
-        reason = "accepted" if accepted else "validation_score_worsened"
+        score_improved = bool(after_score <= before_score * (1.0 + tolerance))
+        pareto_safe, pareto_reason = self._repair_pareto_safe(
+            before_metrics,
+            after_metrics,
+            cfg,
+        )
+        accepted = score_improved and pareto_safe
+        reason = (
+            "accepted"
+            if accepted
+            else pareto_reason
+            if not pareto_safe
+            else "validation_score_worsened"
+        )
         if not accepted:
             self._restore_model_snapshot(model_snapshot)
             self.optimizer = previous_optimizer
@@ -1100,6 +1116,59 @@ class ExperimentTrainer:
         }
         self.metrics_logger.log({"cycle": cycle, "phase": log_prefix, **self.final_repair_status})
         return self.final_repair_status
+
+    def _repair_pareto_safe(
+        self,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        cfg: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        cfg = dict(cfg or self._final_repair_config())
+        guard = dict(cfg.get("pareto_guard", {}))
+        if (
+            str(self.config.get("model", {}).get("physics_formulation", ""))
+            != "cavity_uvp_soft_bc"
+            or not bool(guard.get("enabled", False))
+        ):
+            return True, "pareto_guard_disabled"
+        tolerance = max(float(guard.get("relative_tolerance", 0.05)), 0.0)
+        metrics = list(
+            guard.get(
+                "metrics",
+                [
+                    "pde_residual_mean",
+                    "momentum_residual_mean",
+                    "core_pde_residual_mean",
+                    "continuity_residual_mean",
+                    "boundary_condition_error",
+                    "u_boundary_rmse",
+                    "speed_pred_max",
+                ],
+            )
+        )
+        for name in metrics:
+            old = float(before.get(name, float("nan")))
+            new = float(after.get(name, float("nan")))
+            if not math.isfinite(old) or not math.isfinite(new):
+                return False, f"pareto_nonfinite_{name}"
+            if new > old * (1.0 + tolerance) + 1e-12:
+                return False, f"pareto_worsened_{name}"
+        validity = dict(self.config.get("continuation_validity", {}))
+        for name in guard.get(
+            "validity_gate_metrics",
+            [
+                "pde_residual_mean",
+                "momentum_residual_mean",
+                "core_pde_residual_mean",
+                "continuity_residual_mean",
+            ],
+        ):
+            maximum = float(validity.get(f"max_{name}", math.inf))
+            old = float(before.get(name, float("nan")))
+            new = float(after.get(name, float("nan")))
+            if math.isfinite(maximum) and old <= maximum < new:
+                return False, f"pareto_crossed_gate_{name}"
+        return True, "pareto_safe"
 
     def _final_repair_config(self) -> dict[str, Any]:
         optim_cfg = self.config.get("optimizer", {})

@@ -545,10 +545,10 @@ def _apply_re_aware_cavity_settings(
     validity_key = "diagnostic_validity" if diagnostic_budget else "reliable_validity"
     uvp_validity = dict(uvp_cfg.get(validity_key, {}))
     checkpoint_weights = dict(uvp_cfg.get("checkpoint_metric_weights", {}))
-    component_weights = {
+    component_relative_weights = {
         str(name): float(weight)
         for name, weight in dict(
-            uvp_cfg.get("boundary_component_weights", {})
+            uvp_cfg.get("boundary_component_relative_weights", {})
         ).items()
     }
     uvp_widths = dict(uvp_cfg.get("lid_corner_regularization_widths", {}))
@@ -586,6 +586,9 @@ def _apply_re_aware_cavity_settings(
                     "momentum_v": 1.0,
                     "continuity": float(uvp_cfg.get("continuity_weight", 5.0)),
                     "bc": float(uvp_cfg.get("boundary_weight", 25.0)),
+                    "bc_uvp_balanced": float(
+                        uvp_cfg.get("balanced_boundary_weight", 30.0)
+                    ),
                     "speed_cap": 0.0,
                     "raw_psi_l2": 0.0,
                     "raw_psi_mean_l2": 0.0,
@@ -593,10 +596,10 @@ def _apply_re_aware_cavity_settings(
                     "scaled_correction_abs_max_hinge": 0.0,
                     "top_reverse_u": 0.0,
                     "bottom_positive_u": 0.0,
-                    "raw_pde_tail": 0.0,
+                    "raw_pde_tail": 0.04,
                     "pressure_gradient_l2": 0.0,
                     "near_wall_vorticity_l2": 0.0,
-                    **component_weights,
+                    **{name: 0.0 for name in component_relative_weights},
                 },
             },
             "pressure_gauge": {"weight": 0.001},
@@ -605,10 +608,19 @@ def _apply_re_aware_cavity_settings(
                 "raw_psi_l2": {"enabled": False},
                 "correction_bubble": {"enabled": False},
                 "lid_shear_direction": {"enabled": False},
-                "raw_residual_tail": {"enabled": False},
                 "pressure_gradient_l2": {"enabled": False},
                 "near_wall_momentum": {"enabled": False},
                 "near_wall_vorticity_l2": {"enabled": False},
+                "uvp_boundary_balance": {
+                    "enabled": True,
+                    "relative_weights": component_relative_weights,
+                },
+                "raw_residual_tail": {
+                    "enabled": True,
+                    "threshold": 0.65,
+                    "core_margin": 0.08,
+                    "core_emphasis": 1.5,
+                },
             },
             "cavity_curriculum": {"enabled": False},
             "checkpoint": {
@@ -631,12 +643,31 @@ def _apply_re_aware_cavity_settings(
                     "enabled": True,
                     "score_metric": "uvp_reference_free_score",
                     "epochs": repair_epochs,
-                    "lr": 0.2,
+                    "lr": 0.08 if diagnostic_budget else 0.10,
                     "max_iter": 5,
                     "max_eval": 10,
                     "batch_multiplier": 1.5,
                     "residual_fraction": 0.25,
                     "acceptance_tolerance": 0.0,
+                    "pareto_guard": {
+                        "enabled": True,
+                        "relative_tolerance": 0.05,
+                        "metrics": [
+                            "pde_residual_mean",
+                            "momentum_residual_mean",
+                            "core_pde_residual_mean",
+                            "continuity_residual_mean",
+                            "boundary_condition_error",
+                            "u_boundary_rmse",
+                            "speed_pred_max",
+                        ],
+                        "validity_gate_metrics": [
+                            "pde_residual_mean",
+                            "momentum_residual_mean",
+                            "core_pde_residual_mean",
+                            "continuity_residual_mean",
+                        ],
+                    },
                 },
             },
             "benchmark_params": {
@@ -645,8 +676,8 @@ def _apply_re_aware_cavity_settings(
             "sampling": {
                 "cavity_boundary": {
                     "mode": "focused",
-                    "lid_fraction": 0.35,
-                    "corner_fraction": 0.15,
+                    "lid_fraction": 0.25,
+                    "corner_fraction": 0.08,
                     "corner_width": uvp_corner_width,
                 },
             },
@@ -688,8 +719,13 @@ def _validate_reliable_config(
             failures.append("cavity_uvp_soft_bc requires model.output_dim = 3")
         if skip_boundary:
             failures.append("cavity_uvp_soft_bc boundary loss must not be skipped")
-        if float(train_cfg.get("weights", {}).get("bc", 0.0)) <= 0.0:
-            failures.append("cavity_uvp_soft_bc requires a positive boundary weight")
+        boundary_weights = dict(train_cfg.get("weights", {}))
+        if not any(
+            float(weight) > 0.0
+            for name, weight in boundary_weights.items()
+            if name == "bc" or name == "bc_uvp_balanced" or name.startswith("bc_")
+        ):
+            failures.append("cavity_uvp_soft_bc requires a positive boundary objective")
         if float(config.get("pressure_gauge", {}).get("weight", 0.0)) <= 0.0:
             failures.append("cavity_uvp_soft_bc requires a positive pressure gauge")
     if int(controller_cfg.get("total_steps", -1)) != expected_steps:

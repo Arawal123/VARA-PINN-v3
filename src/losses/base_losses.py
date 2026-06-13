@@ -149,6 +149,22 @@ def compute_pointwise_losses(
             for wall, mask in wall_masks.items():
                 pointwise[f"bc_{wall}_u"] = u_error[mask]
                 pointwise[f"bc_{wall}_v"] = v_error[mask]
+            balance_cfg = dict(
+                (regularization_config or {}).get("uvp_boundary_balance", {})
+            )
+            if bool(balance_cfg.get("enabled", False)):
+                relative_weights = dict(balance_cfg.get("relative_weights", {}))
+                weighted = u_error.new_tensor(0.0)
+                weight_sum = 0.0
+                for wall in ("top", "bottom", "left", "right"):
+                    for component in ("u", "v"):
+                        name = f"bc_{wall}_{component}"
+                        values = pointwise[name]
+                        relative = float(relative_weights.get(name, 1.0))
+                        if values.numel() > 0 and relative > 0.0:
+                            weighted = weighted + relative * torch.mean(values)
+                            weight_sum += relative
+                pointwise["bc_uvp_balanced"] = weighted / max(weight_sum, 1e-12)
     else:
         pointwise["bc"] = xy_bc.new_zeros((xy_bc.shape[0], 1))
 
