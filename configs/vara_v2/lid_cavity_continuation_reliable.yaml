@@ -83,8 +83,9 @@ training:
     raw_psi_mean_l2: 0.002
     scaled_correction_mean_l2: 0.02
     scaled_correction_abs_max_hinge: 0.02
-    top_reverse_u: 0.25
-    bottom_positive_u: 0.15
+    top_reverse_u: 0.07
+    bottom_positive_u: 0.04
+    raw_pde_tail: 0.08
     pressure_gradient_l2: 0.0001
     vorticity_smoothness: 0.0
     near_wall_vorticity_l2: 0.0002
@@ -103,6 +104,11 @@ losses:
     band_width: 0.12
     corner_width: 0.09
     bottom_u_tolerance: 0.04
+  raw_residual_tail:
+    enabled: true
+    threshold: 0.50
+    core_margin: 0.08
+    core_emphasis: 2.0
   pressure_gradient_l2:
     enabled: true
   near_wall_momentum:
@@ -164,8 +170,11 @@ re_aware_cavity:
       scaled_correction_mean_l2_weight: 0.02
       scaled_correction_abs_max_hinge_weight: 0.02
       scaled_correction_abs_max_cap: 0.30
-      top_reverse_u_weight: 0.25
-      bottom_positive_u_weight: 0.15
+      top_reverse_u_weight: 0.07
+      bottom_positive_u_weight: 0.04
+      raw_pde_tail_weight: 0.08
+      raw_pde_tail_threshold: 0.50
+      raw_pde_tail_core_emphasis: 2.0
       near_wall_vorticity_l2_weight: 0.0002
       near_wall_fraction: 0.20
       near_wall_momentum_weights: [1.00, 1.15, 1.25, 1.25]
@@ -186,6 +195,9 @@ re_aware_cavity:
       scaled_correction_abs_max_cap: 0.40
       top_reverse_u_weight: 0.015
       bottom_positive_u_weight: 0.01
+      raw_pde_tail_weight: 0.05
+      raw_pde_tail_threshold: 0.75
+      raw_pde_tail_core_emphasis: 1.5
       near_wall_vorticity_l2_weight: 0.0001
       near_wall_fraction: 0.40
       near_wall_momentum_weights: [1.00, 1.35, 1.75, 1.75]
@@ -206,6 +218,9 @@ re_aware_cavity:
       scaled_correction_abs_max_cap: 0.60
       top_reverse_u_weight: 0.0
       bottom_positive_u_weight: 0.0
+      raw_pde_tail_weight: 0.02
+      raw_pde_tail_threshold: 1.00
+      raw_pde_tail_core_emphasis: 1.25
       near_wall_vorticity_l2_weight: 0.00005
       near_wall_fraction: 0.50
       near_wall_momentum_weights: [1.00, 1.35, 1.75, 1.75]
@@ -294,8 +309,6 @@ checkpoint:
     - near_wall_pde_residual_mean
     - near_wall_momentum_v_mean
     - omega_abs_95p
-    - top_reverse_u
-    - bottom_positive_u
   metric_weights:
     pde_residual_mean: 1.0
     momentum_residual_mean: 1.0
@@ -304,9 +317,14 @@ checkpoint:
     near_wall_pde_residual_mean: 0.5
     near_wall_momentum_v_mean: 0.5
     omega_abs_95p: 0.02
-    top_reverse_u: 0.5
-    bottom_positive_u: 0.5
   speed_hinge_weight: 1.0
+  low_re_vortex_tiebreaker:
+    enabled: true
+    max_re: 200
+    detected_vortex_limit: 2
+    secondary_vortex_limit: 1
+    detected_vortex_weight: 0.05
+    secondary_vortex_weight: 0.05
   metric_floor: 1.0e-8
 
 convergence_early_stopping:

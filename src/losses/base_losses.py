@@ -264,6 +264,36 @@ def _add_reference_free_regularizers(
             u - bottom_tolerance
         ).pow(2)
 
+    tail_cfg = dict(cfg.get("raw_residual_tail", {}))
+    if bool(tail_cfg.get("enabled", False)):
+        threshold = max(float(tail_cfg.get("threshold", 0.5)), 0.0)
+        core_margin = min(
+            max(float(tail_cfg.get("core_margin", 0.08)), 0.0),
+            0.49,
+        )
+        core_emphasis = max(float(tail_cfg.get("core_emphasis", 2.0)), 1.0)
+        x0, x1, y0, y1 = tuple(
+            cfg.get("domain_bounds", (0.0, 1.0, 0.0, 1.0))
+        )
+        width = max(float(x1 - x0), 1e-12)
+        height = max(float(y1 - y0), 1e-12)
+        xi = (residuals["coords"][:, 0:1] - x0) / width
+        eta = (residuals["coords"][:, 1:2] - y0) / height
+        core = (
+            (xi >= core_margin)
+            & (xi <= 1.0 - core_margin)
+            & (eta >= core_margin)
+            & (eta <= 1.0 - core_margin)
+        )
+        emphasis = torch.where(
+            core,
+            torch.full_like(xi, core_emphasis),
+            torch.ones_like(xi),
+        )
+        u_tail = torch.relu(residuals["f_u"].abs() - threshold).pow(2)
+        v_tail = torch.relu(residuals["f_v"].abs() - threshold).pow(2)
+        pointwise["raw_pde_tail"] = emphasis * (u_tail + v_tail)
+
     pressure_cfg = dict(cfg.get("pressure_gradient_l2", {}))
     if bool(pressure_cfg.get("enabled", False)):
         pointwise["pressure_gradient_l2"] = (

@@ -324,6 +324,7 @@ def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
         "scaled_correction_abs_max_hinge",
         "top_reverse_u",
         "bottom_positive_u",
+        "raw_pde_tail",
         "pressure_gradient_l2",
         "vorticity_smoothness",
         "near_wall_vorticity_l2",
@@ -341,6 +342,7 @@ def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
                 "raw_psi_l2": {"enabled": False},
                 "correction_bubble": {"enabled": False},
                 "lid_shear_direction": {"enabled": False},
+                "raw_residual_tail": {"enabled": False},
                 "pressure_gradient_l2": {"enabled": False},
                 "vorticity_smoothness": {"enabled": False},
                 "near_wall_vorticity_l2": {"enabled": False},
@@ -408,6 +410,7 @@ def _apply_re_aware_cavity_settings(
         config,
         {
             "benchmark_params": {
+                "reynolds": float(reynolds),
                 "lid_corner_regularization_width": corner_widths[-1],
             },
             "model": {
@@ -435,6 +438,7 @@ def _apply_re_aware_cavity_settings(
                     "bottom_positive_u": float(
                         regime["bottom_positive_u_weight"]
                     ),
+                    "raw_pde_tail": float(regime["raw_pde_tail_weight"]),
                     "near_wall_vorticity_l2": float(
                         regime["near_wall_vorticity_l2_weight"]
                     ),
@@ -456,6 +460,14 @@ def _apply_re_aware_cavity_settings(
                     "corner_width": corner_widths[-1],
                     "bottom_u_tolerance": (
                         0.04 if float(reynolds) <= 200.0 else 0.075
+                    ),
+                },
+                "raw_residual_tail": {
+                    "enabled": True,
+                    "threshold": float(regime["raw_pde_tail_threshold"]),
+                    "core_margin": 0.08,
+                    "core_emphasis": float(
+                        regime["raw_pde_tail_core_emphasis"]
                     ),
                 },
                 "near_wall_momentum": {
@@ -493,6 +505,9 @@ def _apply_re_aware_cavity_settings(
                     "fraction": float(regime["near_wall_fraction"]),
                     "band_width": band,
                 },
+            },
+            "evaluation": {
+                "controller_streamfunction_metrics": bool(reynolds <= 200.0),
             },
             "continuation_validity": {
                 "max_lid_cavity_primary_center_error": float(

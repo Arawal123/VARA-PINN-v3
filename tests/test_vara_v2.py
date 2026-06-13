@@ -321,8 +321,11 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
         0.02
     )
     assert low["losses"]["correction_bubble"]["abs_max_cap"] == pytest.approx(0.30)
-    assert low["training"]["weights"]["top_reverse_u"] == pytest.approx(0.25)
-    assert low["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.15)
+    assert low["training"]["weights"]["top_reverse_u"] == pytest.approx(0.07)
+    assert low["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.04)
+    assert low["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.08)
+    assert low["losses"]["raw_residual_tail"]["threshold"] == pytest.approx(0.50)
+    assert low["evaluation"]["controller_streamfunction_metrics"] is True
     assert low["losses"]["lid_shear_direction"]["bottom_u_tolerance"] == pytest.approx(
         0.04
     )
@@ -338,6 +341,7 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     )
     assert mid["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.40)
     assert mid["training"]["weights"]["top_reverse_u"] == pytest.approx(0.015)
+    assert mid["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.05)
     assert mid["continuation_validity"]["max_detected_vortices"] == 4
 
     assert high["model"]["hard_boundary_corner_width"] == pytest.approx(0.05)
@@ -348,6 +352,8 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     assert high["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.50)
     assert high["training"]["weights"]["top_reverse_u"] == pytest.approx(0.0)
     assert high["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.0)
+    assert high["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.02)
+    assert high["evaluation"]["controller_streamfunction_metrics"] is False
     assert high["losses"]["lid_shear_direction"]["enabled"] is False
     assert high["continuation_validity"]["max_detected_vortices"] == 8
     assert high["continuation_validity"]["require_lid_cavity_topology_alignment"] is False
@@ -703,6 +709,45 @@ def test_low_re_lid_shear_guards_detect_wrong_direction_and_exclude_corners():
     assert bottom[4].item() == pytest.approx(0.0)
 
 
+def test_raw_residual_tail_thresholds_both_momentum_terms_and_emphasizes_core():
+    coords = torch.tensor(
+        [[0.50, 0.50], [0.50, 0.50], [0.01, 0.50]],
+        dtype=torch.float64,
+    )
+    f_u = torch.tensor([[0.40], [1.00], [1.00]], dtype=torch.float64)
+    f_v = torch.tensor([[0.20], [0.80], [0.80]], dtype=torch.float64)
+    zeros = torch.zeros_like(f_u)
+    pointwise = {}
+    _add_reference_free_regularizers(
+        pointwise,
+        torch.nn.Identity(),
+        coords,
+        {
+            "coords": coords,
+            "u": zeros,
+            "v": zeros,
+            "omega": zeros,
+            "p_x": zeros,
+            "p_y": zeros,
+            "f_u": f_u,
+            "f_v": f_v,
+        },
+        {
+            "domain_bounds": (0.0, 1.0, 0.0, 1.0),
+            "raw_residual_tail": {
+                "enabled": True,
+                "threshold": 0.50,
+                "core_margin": 0.08,
+                "core_emphasis": 2.0,
+            },
+        },
+    )
+    tail = pointwise["raw_pde_tail"].reshape(-1)
+    assert tail[0].item() == pytest.approx(0.0)
+    assert tail[1].item() == pytest.approx(2.0 * (0.50**2 + 0.30**2))
+    assert tail[2].item() == pytest.approx(0.50**2 + 0.30**2)
+
+
 def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     for reynolds, fraction, band in [
@@ -804,12 +849,17 @@ def test_vanilla_and_vara_share_near_wall_sampling_budget(tmp_path):
         vanilla._active_loss_config()["lid_shear_direction"]
         == vara._active_loss_config()["lid_shear_direction"]
     )
+    assert (
+        vanilla._active_loss_config()["raw_residual_tail"]
+        == vara._active_loss_config()["raw_residual_tail"]
+    )
     for name in (
         "raw_psi_mean_l2",
         "scaled_correction_mean_l2",
         "scaled_correction_abs_max_hinge",
         "top_reverse_u",
         "bottom_positive_u",
+        "raw_pde_tail",
     ):
         assert (
             vanilla.config["training"]["weights"][name]
@@ -1044,7 +1094,7 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
     ) == pytest.approx(below_gate + 2.0)
 
 
-def test_checkpoint_score_includes_latest_direction_losses_without_reference(tmp_path):
+def test_checkpoint_score_does_not_prioritize_direction_losses(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     config = deep_update(
         _apply_re_aware_cavity_settings(base, 100.0),
@@ -1068,8 +1118,63 @@ def test_checkpoint_score_includes_latest_direction_losses_without_reference(tmp
     trainer.last_losses = {"top_reverse_u": 0.0, "bottom_positive_u": 0.0}
     baseline = trainer._checkpoint_score(metrics)
     trainer.last_losses = {"top_reverse_u": 0.2, "bottom_positive_u": 0.4}
-    assert trainer._checkpoint_score(metrics) == pytest.approx(
-        baseline + 0.5 * 0.2 + 0.5 * 0.4
+    assert trainer._checkpoint_score(metrics) == pytest.approx(baseline)
+
+
+def test_checkpoint_vortex_tiebreaker_is_low_re_only(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    common = {
+        "device": "cpu",
+        "model": {"hidden_layers": [8, 8]},
+    }
+    metrics = {
+        "pde_residual_mean": 1.0,
+        "momentum_residual_mean": 1.0,
+        "core_pde_residual_mean": 1.0,
+        "boundary_condition_error": 0.0,
+        "near_wall_pde_residual_mean": 1.0,
+        "near_wall_momentum_v_mean": 1.0,
+        "omega_abs_95p": 1.0,
+        "speed_pred_max": 1.0,
+        "detected_vortex_count": 4,
+        "secondary_vortex_count": 3,
+    }
+    low = VARATrainer(
+        deep_update(
+            _apply_re_aware_cavity_settings(base, 100.0),
+            {
+                **common,
+                "experiments": {
+                    "root": str(tmp_path / "low"),
+                    "flat_layout": True,
+                },
+            },
+        ),
+        mode="vanilla",
+    )
+    high = VARATrainer(
+        deep_update(
+            _apply_re_aware_cavity_settings(base, 1600.0),
+            {
+                **common,
+                "experiments": {
+                    "root": str(tmp_path / "high"),
+                    "flat_layout": True,
+                },
+            },
+        ),
+        mode="vanilla",
+    )
+    clean = {
+        **metrics,
+        "detected_vortex_count": 2,
+        "secondary_vortex_count": 1,
+    }
+    assert low._checkpoint_score(metrics) == pytest.approx(
+        low._checkpoint_score(clean) + 0.20
+    )
+    assert high._checkpoint_score(metrics) == pytest.approx(
+        high._checkpoint_score(clean)
     )
 
 

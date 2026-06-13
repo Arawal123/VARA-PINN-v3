@@ -1282,6 +1282,7 @@ class ExperimentTrainer:
             "scaled_correction_abs_max_hinge",
             "top_reverse_u",
             "bottom_positive_u",
+            "raw_pde_tail",
             "pressure_gradient_l2",
             "vorticity_smoothness",
             "near_wall_vorticity_l2",
@@ -1626,6 +1627,37 @@ class ExperimentTrainer:
                 else 0.0
             )
             speed_penalty *= float(checkpoint_cfg.get("speed_hinge_weight", 1.0))
+            topology_penalty = 0.0
+            topology_cfg = dict(
+                checkpoint_cfg.get("low_re_vortex_tiebreaker", {})
+            )
+            reynolds = float(
+                self.config.get("benchmark_params", {}).get(
+                    "reynolds",
+                    math.inf,
+                )
+            )
+            if bool(topology_cfg.get("enabled", False)) and reynolds <= float(
+                topology_cfg.get("max_re", 200.0)
+            ):
+                detected = metrics.get("detected_vortex_count")
+                secondary = metrics.get("secondary_vortex_count")
+                if detected is not None and math.isfinite(float(detected)):
+                    topology_penalty += float(
+                        topology_cfg.get("detected_vortex_weight", 0.05)
+                    ) * max(
+                        float(detected)
+                        - float(topology_cfg.get("detected_vortex_limit", 2)),
+                        0.0,
+                    )
+                if secondary is not None and math.isfinite(float(secondary)):
+                    topology_penalty += float(
+                        topology_cfg.get("secondary_vortex_weight", 0.05)
+                    ) * max(
+                        float(secondary)
+                        - float(topology_cfg.get("secondary_vortex_limit", 1)),
+                        0.0,
+                    )
             if str(checkpoint_cfg.get("score_mode", "geometric_mean")).lower() in {
                 "sum",
                 "additive",
@@ -1633,13 +1665,14 @@ class ExperimentTrainer:
                 return float(
                     sum(value * weight for value, weight in values)
                     + speed_penalty
+                    + topology_penalty
                 )
             total_weight = sum(weight for _value, weight in values)
             geometric = math.exp(
                 sum(weight * math.log(value) for value, weight in values)
                 / max(total_weight, 1e-12)
             )
-            return float(geometric + speed_penalty)
+            return float(geometric + speed_penalty + topology_penalty)
         pde = float(metrics.get("unweighted_pde_loss", float("nan")))
         boundary = float(metrics.get("unweighted_bc_loss", float("nan")))
         if math.isfinite(pde) and math.isfinite(boundary):
