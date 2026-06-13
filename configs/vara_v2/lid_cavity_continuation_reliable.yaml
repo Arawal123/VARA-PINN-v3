@@ -3,11 +3,26 @@ cavity_base_formulation: uvp_soft_bc
 
 uvp_soft_bc:
   # Momentum is already healthy at Re=100; tighten the two observed weak
-  # components without changing optimizer steps or collocation work.
-  continuity_weight: 5.0
-  boundary_weight: 25.0
+  # components without changing the main Adam budget or collocation work.
+  continuity_weight: 8.0
+  boundary_weight: 5.0
+  boundary_component_weights:
+    bc_top_u: 30.0
+    bc_top_v: 20.0
+    bc_bottom_u: 35.0
+    bc_bottom_v: 20.0
+    bc_left_u: 30.0
+    bc_left_v: 25.0
+    bc_right_u: 30.0
+    bc_right_v: 25.0
   diagnostic_boundary_samples: 384
   reliable_boundary_samples: 512
+  lid_corner_regularization_widths:
+    low_re: 0.05
+    mid_re: 0.04
+    high_re: 0.03
+  diagnostic_polish_steps: 15
+  reliable_polish_steps: 40
   diagnostic_validity:
     max_continuity_residual_mean: 0.02
     max_boundary_condition_error: 0.06
@@ -20,6 +35,7 @@ uvp_soft_bc:
     core_pde_residual_mean: 0.75
     continuity_residual_mean: 1.75
     boundary_condition_error: 1.75
+    u_boundary_rmse: 1.5
     near_wall_pde_residual_mean: 0.5
     near_wall_momentum_v_mean: 0.5
 

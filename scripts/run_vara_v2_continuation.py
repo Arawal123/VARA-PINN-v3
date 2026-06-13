@@ -545,6 +545,25 @@ def _apply_re_aware_cavity_settings(
     validity_key = "diagnostic_validity" if diagnostic_budget else "reliable_validity"
     uvp_validity = dict(uvp_cfg.get(validity_key, {}))
     checkpoint_weights = dict(uvp_cfg.get("checkpoint_metric_weights", {}))
+    component_weights = {
+        str(name): float(weight)
+        for name, weight in dict(
+            uvp_cfg.get("boundary_component_weights", {})
+        ).items()
+    }
+    uvp_widths = dict(uvp_cfg.get("lid_corner_regularization_widths", {}))
+    uvp_corner_width = float(
+        uvp_widths.get(
+            "low_re" if reynolds <= 200.0 else "mid_re" if reynolds <= 600.0 else "high_re",
+            0.05 if reynolds <= 200.0 else 0.04 if reynolds <= 600.0 else 0.03,
+        )
+    )
+    repair_epochs = int(
+        uvp_cfg.get(
+            "diagnostic_polish_steps" if diagnostic_budget else "reliable_polish_steps",
+            15 if diagnostic_budget else 40,
+        )
+    )
     collocation_stages = []
     for stage in resolved.get("training", {}).get("collocation_curriculum", {}).get(
         "stages", []
@@ -577,6 +596,7 @@ def _apply_re_aware_cavity_settings(
                     "raw_pde_tail": 0.0,
                     "pressure_gradient_l2": 0.0,
                     "near_wall_vorticity_l2": 0.0,
+                    **component_weights,
                 },
             },
             "pressure_gauge": {"weight": 0.001},
@@ -599,11 +619,36 @@ def _apply_re_aware_cavity_settings(
                     "core_pde_residual_mean",
                     "continuity_residual_mean",
                     "boundary_condition_error",
+                    "u_boundary_rmse",
                     "near_wall_pde_residual_mean",
                     "near_wall_momentum_v_mean",
                 ],
                 "metric_weights": checkpoint_weights,
                 "low_re_vortex_tiebreaker": {"enabled": False},
+            },
+            "optimizer": {
+                "final_repair": {
+                    "enabled": True,
+                    "score_metric": "uvp_reference_free_score",
+                    "epochs": repair_epochs,
+                    "lr": 0.2,
+                    "max_iter": 5,
+                    "max_eval": 10,
+                    "batch_multiplier": 1.5,
+                    "residual_fraction": 0.25,
+                    "acceptance_tolerance": 0.0,
+                },
+            },
+            "benchmark_params": {
+                "lid_corner_regularization_width": uvp_corner_width,
+            },
+            "sampling": {
+                "cavity_boundary": {
+                    "mode": "focused",
+                    "lid_fraction": 0.35,
+                    "corner_fraction": 0.15,
+                    "corner_width": uvp_corner_width,
+                },
             },
             "evaluation": {"controller_streamfunction_metrics": False},
             "continuation_validity": uvp_validity,

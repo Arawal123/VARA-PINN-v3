@@ -1147,6 +1147,14 @@ class ExperimentTrainer:
 
     def _repair_score(self, metrics: dict[str, Any]) -> tuple[str, float]:
         preferred = self._final_repair_config().get("score_metric")
+        if (
+            str(preferred) == "uvp_reference_free_score"
+            and str(
+                self.config.get("model", {}).get("physics_formulation", "")
+            )
+            == "cavity_uvp_soft_bc"
+        ):
+            return "uvp_reference_free_score", self._checkpoint_score(metrics)
         candidates = [
             str(preferred) if preferred else "",
             "cavity_benchmark_score",

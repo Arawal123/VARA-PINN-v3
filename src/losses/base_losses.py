@@ -132,9 +132,23 @@ def compute_pointwise_losses(
     if compute_boundary_loss:
         bc_pred = model(xy_bc)
         bc_ref = benchmark.exact_torch(xy_bc)
-        pointwise["bc"] = (bc_pred[:, 0:1] - bc_ref["u"]).pow(2) + (
-            bc_pred[:, 1:2] - bc_ref["v"]
-        ).pow(2)
+        u_error = (bc_pred[:, 0:1] - bc_ref["u"]).pow(2)
+        v_error = (bc_pred[:, 1:2] - bc_ref["v"]).pow(2)
+        pointwise["bc"] = u_error + v_error
+        if getattr(model, "physics_formulation", "") == "cavity_uvp_soft_bc":
+            x0, x1, y0, y1 = benchmark.bounds
+            x = xy_bc[:, 0]
+            y = xy_bc[:, 1]
+            tolerance = 1e-6 * max(float(x1 - x0), float(y1 - y0), 1.0)
+            wall_masks = {
+                "top": torch.isclose(y, y.new_tensor(y1), atol=tolerance, rtol=0.0),
+                "bottom": torch.isclose(y, y.new_tensor(y0), atol=tolerance, rtol=0.0),
+                "left": torch.isclose(x, x.new_tensor(x0), atol=tolerance, rtol=0.0),
+                "right": torch.isclose(x, x.new_tensor(x1), atol=tolerance, rtol=0.0),
+            }
+            for wall, mask in wall_masks.items():
+                pointwise[f"bc_{wall}_u"] = u_error[mask]
+                pointwise[f"bc_{wall}_v"] = v_error[mask]
     else:
         pointwise["bc"] = xy_bc.new_zeros((xy_bc.shape[0], 1))
 

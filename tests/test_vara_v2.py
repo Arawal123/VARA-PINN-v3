@@ -350,6 +350,48 @@ def test_uvp_soft_boundary_loss_covers_all_walls_and_pressure_gauge(tmp_path):
     assert trainer.pressure_gauge_loss().item() > 0.0
 
 
+def test_uvp_component_boundary_losses_are_wall_specific():
+    config = {
+        "benchmark": "lid_driven_cavity",
+        "model": {
+            "physics_formulation": "cavity_uvp_soft_bc",
+            "input_dim": 2,
+            "output_dim": 3,
+            "hidden_layers": [8, 8],
+        },
+    }
+    model = build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0))
+    benchmark = LidDrivenCavityQualitative(
+        reynolds=100.0,
+        lid_corner_regularization_width=0.05,
+    )
+    xy_f = torch.tensor(
+        [[0.25, 0.25], [0.75, 0.75]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    walls = torch.tensor(
+        [[0.5, 1.0], [0.5, 0.0], [0.0, 0.5], [1.0, 0.5]],
+        dtype=torch.float32,
+    )
+    batch = {"xy_f": xy_f, "xy_bc": walls, "xy_data": None, "targets_data": None}
+    pointwise = compute_pointwise_losses(model, batch, benchmark, True)
+    names = [
+        f"bc_{wall}_{component}"
+        for wall in ("top", "bottom", "left", "right")
+        for component in ("u", "v")
+    ]
+    assert all(pointwise[name].numel() == 1 for name in names)
+
+    extra_bottom = torch.tensor([[0.2, 0.0], [0.8, 0.0]], dtype=torch.float32)
+    expanded = {**batch, "xy_bc": torch.cat([walls, extra_bottom], dim=0)}
+    expanded_pointwise = compute_pointwise_losses(model, expanded, benchmark, True)
+    assert torch.allclose(
+        pointwise["bc_top_u"],
+        expanded_pointwise["bc_top_u"],
+    )
+
+
 def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing():
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     for preset, expected in (("diagnostic", 2000), ("reliable", 4000)):
@@ -362,9 +404,26 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert config["model"]["physics_formulation"] == "cavity_uvp_soft_bc"
         assert config["controller_v2"]["total_steps"] == expected
         assert config["optimizer"]["scheduler"]["total_steps"] == expected
-        assert config["training"]["weights"]["continuity"] == pytest.approx(5.0)
-        assert config["training"]["weights"]["bc"] == pytest.approx(25.0)
+        assert config["training"]["weights"]["continuity"] == pytest.approx(8.0)
+        assert config["training"]["weights"]["bc"] == pytest.approx(5.0)
         assert config["training"]["n_boundary"] == (384 if preset == "diagnostic" else 512)
+        assert config["training"]["weights"]["bc_top_u"] > config["training"]["weights"][
+            "bc_top_v"
+        ]
+        assert config["training"]["weights"]["bc_bottom_u"] > config["training"][
+            "weights"
+        ]["bc_bottom_v"]
+        boundary_cfg = config["sampling"]["cavity_boundary"]
+        assert boundary_cfg["mode"] == "focused"
+        assert boundary_cfg["lid_fraction"] == pytest.approx(0.35)
+        assert boundary_cfg["corner_fraction"] == pytest.approx(0.15)
+        assert config["benchmark_params"][
+            "lid_corner_regularization_width"
+        ] == pytest.approx(0.05)
+        repair = config["optimizer"]["final_repair"]
+        assert repair["enabled"]
+        assert repair["epochs"] == (15 if preset == "diagnostic" else 40)
+        assert repair["score_metric"] == "uvp_reference_free_score"
         assert config["continuation_validity"][
             "max_continuity_residual_mean"
         ] == pytest.approx(0.02 if preset == "diagnostic" else 0.01)
@@ -374,6 +433,7 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         metrics = config["checkpoint"]["reference_free_metrics"]
         assert "continuity_residual_mean" in metrics
         assert "boundary_condition_error" in metrics
+        assert "u_boundary_rmse" in metrics
         assert not any("rel_l2" in name for name in metrics)
         assert not config["checkpoint"]["low_re_vortex_tiebreaker"]["enabled"]
 
@@ -402,6 +462,51 @@ def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
     assert vara.config["training"]["weights"] == vanilla.config["training"]["weights"]
     assert vara.config["continuation_validity"] == vanilla.config["continuation_validity"]
     assert vara.config["checkpoint"] == vanilla.config["checkpoint"]
+    assert vara.config["optimizer"]["final_repair"] == vanilla.config["optimizer"][
+        "final_repair"
+    ]
+
+
+def test_uvp_corner_width_is_decoupled_from_hard_boundary_schedule():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    for reynolds, uvp_width in ((100.0, 0.05), (400.0, 0.04), (1600.0, 0.03)):
+        config = _apply_re_aware_cavity_settings(base, reynolds)
+        assert config["benchmark_params"][
+            "lid_corner_regularization_width"
+        ] == pytest.approx(uvp_width)
+        assert config["model"]["hard_boundary_corner_width"] != pytest.approx(
+            uvp_width
+        )
+
+
+def test_uvp_polish_score_is_reference_free_checkpoint_score(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    metrics = {
+        "pde_residual_mean": 0.1,
+        "momentum_residual_mean": 0.1,
+        "core_pde_residual_mean": 0.1,
+        "continuity_residual_mean": 0.01,
+        "boundary_condition_error": 0.02,
+        "u_boundary_rmse": 0.03,
+        "near_wall_pde_residual_mean": 0.2,
+        "near_wall_momentum_v_mean": 0.1,
+        "speed_pred_max": 1.0,
+        "u_rel_l2": 1000.0,
+        "velocity_full_rel_l2": 1000.0,
+        "lid_cavity_primary_center_error": 1000.0,
+    }
+    name, score = trainer._repair_score(metrics)
+    assert name == "uvp_reference_free_score"
+    assert score == pytest.approx(trainer._checkpoint_score(metrics))
 
 
 def test_uvp_validity_is_soft_bc_aware_but_keeps_physics_gates():
