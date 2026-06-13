@@ -319,6 +319,11 @@ def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
     for name in (
         "speed_cap",
         "raw_psi_l2",
+        "raw_psi_mean_l2",
+        "scaled_correction_mean_l2",
+        "scaled_correction_abs_max_hinge",
+        "top_reverse_u",
+        "bottom_positive_u",
         "pressure_gradient_l2",
         "vorticity_smoothness",
         "near_wall_vorticity_l2",
@@ -334,6 +339,8 @@ def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
             "losses": {
                 "speed_cap": {"enabled": False},
                 "raw_psi_l2": {"enabled": False},
+                "correction_bubble": {"enabled": False},
+                "lid_shear_direction": {"enabled": False},
                 "pressure_gradient_l2": {"enabled": False},
                 "vorticity_smoothness": {"enabled": False},
                 "near_wall_vorticity_l2": {"enabled": False},
@@ -415,12 +422,40 @@ def _apply_re_aware_cavity_settings(
                 "weights": {
                     "speed_cap": float(regime["speed_cap_weight"]),
                     "raw_psi_l2": float(regime["raw_psi_l2_weight"]),
+                    "raw_psi_mean_l2": float(
+                        regime["raw_psi_mean_l2_weight"]
+                    ),
+                    "scaled_correction_mean_l2": float(
+                        regime["scaled_correction_mean_l2_weight"]
+                    ),
+                    "scaled_correction_abs_max_hinge": float(
+                        regime["scaled_correction_abs_max_hinge_weight"]
+                    ),
+                    "top_reverse_u": float(regime["top_reverse_u_weight"]),
+                    "bottom_positive_u": float(
+                        regime["bottom_positive_u_weight"]
+                    ),
                     "near_wall_vorticity_l2": float(
                         regime["near_wall_vorticity_l2_weight"]
                     ),
                 },
             },
             "losses": {
+                "correction_bubble": {
+                    "enabled": True,
+                    "abs_max_cap": float(
+                        regime["scaled_correction_abs_max_cap"]
+                    ),
+                },
+                "lid_shear_direction": {
+                    "enabled": bool(
+                        float(regime["top_reverse_u_weight"]) > 0.0
+                        or float(regime["bottom_positive_u_weight"]) > 0.0
+                    ),
+                    "band_width": band,
+                    "corner_width": corner_widths[-1],
+                    "bottom_u_tolerance": 0.075,
+                },
                 "near_wall_momentum": {
                     "stages": [
                         {

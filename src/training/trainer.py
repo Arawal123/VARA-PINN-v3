@@ -1277,6 +1277,11 @@ class ExperimentTrainer:
         for name in (
             "speed_cap",
             "raw_psi_l2",
+            "raw_psi_mean_l2",
+            "scaled_correction_mean_l2",
+            "scaled_correction_abs_max_hinge",
+            "top_reverse_u",
+            "bottom_positive_u",
             "pressure_gradient_l2",
             "vorticity_smoothness",
             "near_wall_vorticity_l2",

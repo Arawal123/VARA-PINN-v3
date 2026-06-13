@@ -217,6 +217,53 @@ def _add_reference_free_regularizers(
         auxiliary = model.streamfunction_auxiliary(xy_f)
         pointwise["raw_psi_l2"] = auxiliary["raw_psi"].pow(2)
 
+    bubble_cfg = dict(cfg.get("correction_bubble", {}))
+    if bool(bubble_cfg.get("enabled", False)) and hasattr(
+        model, "streamfunction_auxiliary"
+    ):
+        if auxiliary is None:
+            auxiliary = model.streamfunction_auxiliary(xy_f)
+        raw_mean_l2 = auxiliary["raw_psi"].mean().pow(2)
+        correction = auxiliary["scaled_correction"]
+        correction_mean_l2 = correction.mean().pow(2)
+        correction_cap = max(float(bubble_cfg.get("abs_max_cap", 0.30)), 0.0)
+        correction_excess = torch.relu(
+            correction.abs().max() - correction_cap
+        ).pow(2)
+        pointwise["raw_psi_mean_l2"] = torch.ones_like(
+            auxiliary["raw_psi"]
+        ) * raw_mean_l2
+        pointwise["scaled_correction_mean_l2"] = (
+            torch.ones_like(correction) * correction_mean_l2
+        )
+        pointwise["scaled_correction_abs_max_hinge"] = (
+            torch.ones_like(correction) * correction_excess
+        )
+
+    shear_cfg = dict(cfg.get("lid_shear_direction", {}))
+    if bool(shear_cfg.get("enabled", False)):
+        x0, x1, y0, y1 = tuple(
+            cfg.get("domain_bounds", (0.0, 1.0, 0.0, 1.0))
+        )
+        width = max(float(x1 - x0), 1e-12)
+        height = max(float(y1 - y0), 1e-12)
+        xi = (residuals["coords"][:, 0:1] - x0) / width
+        eta = (residuals["coords"][:, 1:2] - y0) / height
+        band = min(max(float(shear_cfg.get("band_width", 0.08)), 0.0), 0.49)
+        corner_width = min(
+            max(float(shear_cfg.get("corner_width", 0.08)), 0.0),
+            0.49,
+        )
+        away_from_corners = (xi >= corner_width) & (xi <= 1.0 - corner_width)
+        top = away_from_corners & (eta >= 1.0 - band)
+        bottom = away_from_corners & (eta <= band)
+        u = residuals["u"]
+        bottom_tolerance = float(shear_cfg.get("bottom_u_tolerance", 0.075))
+        pointwise["top_reverse_u"] = top.to(u.dtype) * torch.relu(-u).pow(2)
+        pointwise["bottom_positive_u"] = bottom.to(u.dtype) * torch.relu(
+            u - bottom_tolerance
+        ).pow(2)
+
     pressure_cfg = dict(cfg.get("pressure_gradient_l2", {}))
     if bool(pressure_cfg.get("enabled", False)):
         pointwise["pressure_gradient_l2"] = (

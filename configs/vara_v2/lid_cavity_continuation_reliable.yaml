@@ -80,6 +80,11 @@ training:
     pressure_gradient: 0.0
     speed_cap: 0.6
     raw_psi_l2: 0.0005
+    raw_psi_mean_l2: 0.002
+    scaled_correction_mean_l2: 0.02
+    scaled_correction_abs_max_hinge: 0.02
+    top_reverse_u: 0.05
+    bottom_positive_u: 0.03
     pressure_gradient_l2: 0.0001
     vorticity_smoothness: 0.0
     near_wall_vorticity_l2: 0.0002
@@ -90,6 +95,14 @@ losses:
     cap: 2.0
   raw_psi_l2:
     enabled: true
+  correction_bubble:
+    enabled: true
+    abs_max_cap: 0.30
+  lid_shear_direction:
+    enabled: true
+    band_width: 0.12
+    corner_width: 0.09
+    bottom_u_tolerance: 0.075
   pressure_gradient_l2:
     enabled: true
   near_wall_momentum:
@@ -147,6 +160,12 @@ re_aware_cavity:
       correction_scales: [18, 22, 22]
       speed_cap_weight: 0.60
       raw_psi_l2_weight: 0.0005
+      raw_psi_mean_l2_weight: 0.002
+      scaled_correction_mean_l2_weight: 0.02
+      scaled_correction_abs_max_hinge_weight: 0.02
+      scaled_correction_abs_max_cap: 0.30
+      top_reverse_u_weight: 0.05
+      bottom_positive_u_weight: 0.03
       near_wall_vorticity_l2_weight: 0.0002
       near_wall_fraction: 0.25
       near_wall_momentum_weights: [1.00, 1.20, 1.35, 1.35]
@@ -161,6 +180,12 @@ re_aware_cavity:
       correction_scales: [20, 26, 28]
       speed_cap_weight: 0.45
       raw_psi_l2_weight: 0.0003
+      raw_psi_mean_l2_weight: 0.001
+      scaled_correction_mean_l2_weight: 0.01
+      scaled_correction_abs_max_hinge_weight: 0.01
+      scaled_correction_abs_max_cap: 0.40
+      top_reverse_u_weight: 0.015
+      bottom_positive_u_weight: 0.01
       near_wall_vorticity_l2_weight: 0.0001
       near_wall_fraction: 0.40
       near_wall_momentum_weights: [1.00, 1.35, 1.75, 1.75]
@@ -175,6 +200,12 @@ re_aware_cavity:
       correction_scales: [24, 30, 32]
       speed_cap_weight: 0.30
       raw_psi_l2_weight: 0.00015
+      raw_psi_mean_l2_weight: 0.0002
+      scaled_correction_mean_l2_weight: 0.002
+      scaled_correction_abs_max_hinge_weight: 0.002
+      scaled_correction_abs_max_cap: 0.60
+      top_reverse_u_weight: 0.0
+      bottom_positive_u_weight: 0.0
       near_wall_vorticity_l2_weight: 0.00005
       near_wall_fraction: 0.50
       near_wall_momentum_weights: [1.00, 1.35, 1.75, 1.75]

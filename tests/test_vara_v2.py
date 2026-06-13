@@ -316,6 +316,13 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
         stage["weight"]
         for stage in low["losses"]["near_wall_momentum"]["stages"]
     ] == pytest.approx([1.0, 1.2, 1.35, 1.35])
+    assert low["training"]["weights"]["raw_psi_mean_l2"] == pytest.approx(0.002)
+    assert low["training"]["weights"]["scaled_correction_mean_l2"] == pytest.approx(
+        0.02
+    )
+    assert low["losses"]["correction_bubble"]["abs_max_cap"] == pytest.approx(0.30)
+    assert low["training"]["weights"]["top_reverse_u"] == pytest.approx(0.05)
+    assert low["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.03)
     assert low["continuation_validity"]["max_detected_vortices"] == 2
     assert low["continuation_validity"]["require_lid_cavity_topology_alignment"] is True
 
@@ -326,6 +333,7 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
         0.06
     )
     assert mid["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.40)
+    assert mid["training"]["weights"]["top_reverse_u"] == pytest.approx(0.015)
     assert mid["continuation_validity"]["max_detected_vortices"] == 4
 
     assert high["model"]["hard_boundary_corner_width"] == pytest.approx(0.05)
@@ -334,6 +342,9 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
         0.03
     )
     assert high["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.50)
+    assert high["training"]["weights"]["top_reverse_u"] == pytest.approx(0.0)
+    assert high["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.0)
+    assert high["losses"]["lid_shear_direction"]["enabled"] is False
     assert high["continuation_validity"]["max_detected_vortices"] == 8
     assert high["continuation_validity"]["require_lid_cavity_topology_alignment"] is False
 
@@ -550,6 +561,144 @@ def test_near_wall_vorticity_penalizes_only_quantile_excess():
     assert penalty[3].item() == pytest.approx(0.0)
 
 
+def test_correction_bubble_losses_target_global_mean_not_local_variation():
+    class AuxiliaryModel(torch.nn.Module):
+        def __init__(self, raw, correction):
+            super().__init__()
+            self.raw = raw
+            self.correction = correction
+
+        def streamfunction_auxiliary(self, coords):
+            return {
+                "raw_psi": self.raw.to(coords),
+                "scaled_correction": self.correction.to(coords),
+            }
+
+    coords = torch.tensor([[0.25, 0.25], [0.75, 0.75]], dtype=torch.float64)
+    residuals = {
+        "coords": coords,
+        "u": torch.zeros((2, 1), dtype=torch.float64),
+        "v": torch.zeros((2, 1), dtype=torch.float64),
+        "omega": torch.zeros((2, 1), dtype=torch.float64),
+        "p_x": torch.zeros((2, 1), dtype=torch.float64),
+        "p_y": torch.zeros((2, 1), dtype=torch.float64),
+    }
+    cfg = {
+        "correction_bubble": {
+            "enabled": True,
+            "abs_max_cap": 0.30,
+        }
+    }
+    bubble = {}
+    _add_reference_free_regularizers(
+        bubble,
+        AuxiliaryModel(
+            torch.tensor([[2.0], [2.0]]),
+            torch.tensor([[0.20], [0.20]]),
+        ),
+        coords,
+        residuals,
+        cfg,
+    )
+    assert bubble["raw_psi_mean_l2"].mean().item() > 0.0
+    assert bubble["scaled_correction_mean_l2"].mean().item() > 0.0
+
+    local = {}
+    _add_reference_free_regularizers(
+        local,
+        AuxiliaryModel(
+            torch.tensor([[2.0], [-2.0]]),
+            torch.tensor([[0.20], [-0.20]]),
+        ),
+        coords,
+        residuals,
+        cfg,
+    )
+    assert local["raw_psi_mean_l2"].mean().item() == pytest.approx(0.0)
+    assert local["scaled_correction_mean_l2"].mean().item() == pytest.approx(0.0)
+    assert local["scaled_correction_abs_max_hinge"].mean().item() == pytest.approx(
+        0.0
+    )
+
+
+def test_correction_bubble_abs_max_uses_hinge_cap():
+    class AuxiliaryModel(torch.nn.Module):
+        def streamfunction_auxiliary(self, coords):
+            return {
+                "raw_psi": torch.tensor([[1.0], [-1.0]], dtype=coords.dtype),
+                "scaled_correction": torch.tensor(
+                    [[0.20], [-0.50]], dtype=coords.dtype
+                ),
+            }
+
+    coords = torch.tensor([[0.25, 0.25], [0.75, 0.75]], dtype=torch.float64)
+    pointwise = {}
+    zeros = torch.zeros((2, 1), dtype=torch.float64)
+    _add_reference_free_regularizers(
+        pointwise,
+        AuxiliaryModel(),
+        coords,
+        {
+            "coords": coords,
+            "u": zeros,
+            "v": zeros,
+            "omega": zeros,
+            "p_x": zeros,
+            "p_y": zeros,
+        },
+        {"correction_bubble": {"enabled": True, "abs_max_cap": 0.30}},
+    )
+    assert pointwise["scaled_correction_abs_max_hinge"].mean().item() == pytest.approx(
+        0.04
+    )
+
+
+def test_low_re_lid_shear_guards_detect_wrong_direction_and_exclude_corners():
+    coords = torch.tensor(
+        [
+            [0.50, 0.95],
+            [0.50, 0.05],
+            [0.02, 0.95],
+            [0.98, 0.05],
+            [0.50, 0.50],
+        ],
+        dtype=torch.float64,
+    )
+    u = torch.tensor([[-0.4], [0.4], [-0.4], [0.4], [-0.4]], dtype=torch.float64)
+    zeros = torch.zeros_like(u)
+    pointwise = {}
+    _add_reference_free_regularizers(
+        pointwise,
+        torch.nn.Identity(),
+        coords,
+        {
+            "coords": coords,
+            "u": u,
+            "v": zeros,
+            "omega": zeros,
+            "p_x": zeros,
+            "p_y": zeros,
+        },
+        {
+            "domain_bounds": (0.0, 1.0, 0.0, 1.0),
+            "lid_shear_direction": {
+                "enabled": True,
+                "band_width": 0.10,
+                "corner_width": 0.08,
+                "bottom_u_tolerance": 0.075,
+            },
+        },
+    )
+    top = pointwise["top_reverse_u"].reshape(-1)
+    bottom = pointwise["bottom_positive_u"].reshape(-1)
+    assert top[0].item() > 0.0
+    assert bottom[1].item() > 0.0
+    assert top[2].item() == pytest.approx(0.0)
+    assert bottom[3].item() == pytest.approx(0.0)
+    assert top[4].item() == pytest.approx(0.0)
+    assert bottom[4].item() == pytest.approx(0.0)
+
+
 def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     for reynolds, fraction, band in [
@@ -643,6 +792,25 @@ def test_vanilla_and_vara_share_near_wall_sampling_budget(tmp_path):
     assert vara._near_wall_sample_count(40) == 16
     assert vanilla.initial_batch()["xy_f"].shape[0] == 40
     assert vara.initial_batch()["xy_f"].shape[0] == 40
+    assert (
+        vanilla._active_loss_config()["correction_bubble"]
+        == vara._active_loss_config()["correction_bubble"]
+    )
+    assert (
+        vanilla._active_loss_config()["lid_shear_direction"]
+        == vara._active_loss_config()["lid_shear_direction"]
+    )
+    for name in (
+        "raw_psi_mean_l2",
+        "scaled_correction_mean_l2",
+        "scaled_correction_abs_max_hinge",
+        "top_reverse_u",
+        "bottom_positive_u",
+    ):
+        assert (
+            vanilla.config["training"]["weights"][name]
+            == vara.config["training"]["weights"][name]
+        )
 
 
 def test_hard_boundary_correction_boost_preserves_walls_and_near_wall_authority():
