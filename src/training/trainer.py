@@ -1601,14 +1601,17 @@ class ExperimentTrainer:
             )
         )
         floor = float(checkpoint_cfg.get("metric_floor", 1e-8))
-        values = [
-            (
-                max(float(metrics[name]), floor),
-                float(metric_weights.get(name, 1.0)),
+        values = []
+        for name in metric_names:
+            value = metrics.get(name, self.last_losses.get(name))
+            if value is None or not math.isfinite(float(value)):
+                continue
+            values.append(
+                (
+                    max(float(value), floor),
+                    float(metric_weights.get(name, 1.0)),
+                )
             )
-            for name in metric_names
-            if name in metrics and math.isfinite(float(metrics[name]))
-        ]
         if values:
             speed = float(metrics.get("speed_pred_max", float("nan")))
             speed_gate = float(

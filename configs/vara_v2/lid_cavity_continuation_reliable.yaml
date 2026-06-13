@@ -45,7 +45,7 @@ training:
   residual_loss_mode:
     initial: pseudo_huber
     switch_step: 3800
-    final: mse
+    final: pseudo_huber
     pseudo_huber_delta: 1.0
   adaptive_cycles: 20
   epochs_per_cycle: 200
@@ -83,8 +83,8 @@ training:
     raw_psi_mean_l2: 0.002
     scaled_correction_mean_l2: 0.02
     scaled_correction_abs_max_hinge: 0.02
-    top_reverse_u: 0.05
-    bottom_positive_u: 0.03
+    top_reverse_u: 0.25
+    bottom_positive_u: 0.15
     pressure_gradient_l2: 0.0001
     vorticity_smoothness: 0.0
     near_wall_vorticity_l2: 0.0002
@@ -102,7 +102,7 @@ losses:
     enabled: true
     band_width: 0.12
     corner_width: 0.09
-    bottom_u_tolerance: 0.075
+    bottom_u_tolerance: 0.04
   pressure_gradient_l2:
     enabled: true
   near_wall_momentum:
@@ -164,11 +164,11 @@ re_aware_cavity:
       scaled_correction_mean_l2_weight: 0.02
       scaled_correction_abs_max_hinge_weight: 0.02
       scaled_correction_abs_max_cap: 0.30
-      top_reverse_u_weight: 0.05
-      bottom_positive_u_weight: 0.03
+      top_reverse_u_weight: 0.25
+      bottom_positive_u_weight: 0.15
       near_wall_vorticity_l2_weight: 0.0002
-      near_wall_fraction: 0.25
-      near_wall_momentum_weights: [1.00, 1.20, 1.35, 1.35]
+      near_wall_fraction: 0.20
+      near_wall_momentum_weights: [1.00, 1.15, 1.25, 1.25]
       topology:
         max_primary_center_error: 0.10
         max_topology_score: 0.18
@@ -294,6 +294,8 @@ checkpoint:
     - near_wall_pde_residual_mean
     - near_wall_momentum_v_mean
     - omega_abs_95p
+    - top_reverse_u
+    - bottom_positive_u
   metric_weights:
     pde_residual_mean: 1.0
     momentum_residual_mean: 1.0
@@ -302,6 +304,8 @@ checkpoint:
     near_wall_pde_residual_mean: 0.5
     near_wall_momentum_v_mean: 0.5
     omega_abs_95p: 0.02
+    top_reverse_u: 0.5
+    bottom_positive_u: 0.5
   speed_hinge_weight: 1.0
   metric_floor: 1.0e-8
 

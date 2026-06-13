@@ -311,18 +311,22 @@ def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
     assert low["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
         0.12
     )
-    assert low["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.25)
+    assert low["sampling"]["cavity_near_wall"]["fraction"] == pytest.approx(0.20)
     assert [
         stage["weight"]
         for stage in low["losses"]["near_wall_momentum"]["stages"]
-    ] == pytest.approx([1.0, 1.2, 1.35, 1.35])
+    ] == pytest.approx([1.0, 1.15, 1.25, 1.25])
     assert low["training"]["weights"]["raw_psi_mean_l2"] == pytest.approx(0.002)
     assert low["training"]["weights"]["scaled_correction_mean_l2"] == pytest.approx(
         0.02
     )
     assert low["losses"]["correction_bubble"]["abs_max_cap"] == pytest.approx(0.30)
-    assert low["training"]["weights"]["top_reverse_u"] == pytest.approx(0.05)
-    assert low["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.03)
+    assert low["training"]["weights"]["top_reverse_u"] == pytest.approx(0.25)
+    assert low["training"]["weights"]["bottom_positive_u"] == pytest.approx(0.15)
+    assert low["losses"]["lid_shear_direction"]["bottom_u_tolerance"] == pytest.approx(
+        0.04
+    )
+    assert low["training"]["residual_loss_mode"]["final"] == "pseudo_huber"
     assert low["continuation_validity"]["max_detected_vortices"] == 2
     assert low["continuation_validity"]["require_lid_cavity_topology_alignment"] is True
 
@@ -702,7 +706,7 @@ def test_low_re_lid_shear_guards_detect_wrong_direction_and_exclude_corners():
 def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     for reynolds, fraction, band in [
-        (100.0, 0.25, 0.12),
+        (100.0, 0.20, 0.12),
         (400.0, 0.40, 0.06),
         (1600.0, 0.50, 0.03),
     ]:
@@ -1038,6 +1042,35 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
     assert trainer._checkpoint_score(
         {**metrics, "core_pde_residual_mean": 2.0}
     ) == pytest.approx(below_gate + 2.0)
+
+
+def test_checkpoint_score_includes_latest_direction_losses_without_reference(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    metrics = {
+        "pde_residual_mean": 1.0,
+        "momentum_residual_mean": 1.0,
+        "core_pde_residual_mean": 1.0,
+        "boundary_condition_error": 0.0,
+        "near_wall_pde_residual_mean": 1.0,
+        "near_wall_momentum_v_mean": 1.0,
+        "omega_abs_95p": 1.0,
+        "speed_pred_max": 1.0,
+    }
+    trainer.last_losses = {"top_reverse_u": 0.0, "bottom_positive_u": 0.0}
+    baseline = trainer._checkpoint_score(metrics)
+    trainer.last_losses = {"top_reverse_u": 0.2, "bottom_positive_u": 0.4}
+    assert trainer._checkpoint_score(metrics) == pytest.approx(
+        baseline + 0.5 * 0.2 + 0.5 * 0.4
+    )
 
 
 def test_reliable_final_state_guard_rejects_early_curriculum_values(tmp_path):

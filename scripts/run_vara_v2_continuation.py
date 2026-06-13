@@ -454,7 +454,9 @@ def _apply_re_aware_cavity_settings(
                     ),
                     "band_width": band,
                     "corner_width": corner_widths[-1],
-                    "bottom_u_tolerance": 0.075,
+                    "bottom_u_tolerance": (
+                        0.04 if float(reynolds) <= 200.0 else 0.075
+                    ),
                 },
                 "near_wall_momentum": {
                     "stages": [
