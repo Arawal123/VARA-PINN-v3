@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from scripts.run_vara_v2_continuation import (
+    _apply_re_aware_cavity_settings,
     _continuation_validity,
     _load_base_config,
     _without_cavity_stabilizers,
@@ -291,6 +292,68 @@ def test_continuation_overlay_inherits_lid_cavity_base_config():
     assert config["evaluation"]["controller_reference_metrics_enabled"] is False
     assert config["evaluation"]["checkpoint_reference_metrics_enabled"] is False
     assert "unweighted_physics_validation_loss" in config["controller_v2"]["guard_metrics"]
+
+
+def test_re_aware_cavity_settings_cover_low_mid_and_high_reynolds():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    low = _apply_re_aware_cavity_settings(base, 100.0)
+    mid = _apply_re_aware_cavity_settings(base, 400.0)
+    high = _apply_re_aware_cavity_settings(base, 1600.0)
+
+    assert low["model"]["hard_boundary_corner_width"] == pytest.approx(0.09)
+    assert low["model"]["hard_boundary_correction_scale"] == pytest.approx(22.0)
+    assert low["training"]["residual_loss_mode"]["switch_step"] == 3200
+    assert low["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
+        0.12
+    )
+    assert low["continuation_validity"]["max_detected_vortices"] == 2
+    assert low["continuation_validity"]["require_lid_cavity_topology_alignment"] is True
+
+    assert mid["model"]["hard_boundary_corner_width"] == pytest.approx(0.07)
+    assert mid["model"]["hard_boundary_lid_vertical_power"] == 3
+    assert mid["model"]["hard_boundary_correction_scale"] == pytest.approx(28.0)
+    assert mid["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
+        0.06
+    )
+    assert mid["continuation_validity"]["max_detected_vortices"] == 4
+
+    assert high["model"]["hard_boundary_corner_width"] == pytest.approx(0.05)
+    assert high["model"]["hard_boundary_correction_scale"] == pytest.approx(32.0)
+    assert high["losses"]["near_wall_momentum"]["stages"][-1]["band_width"] == pytest.approx(
+        0.03
+    )
+    assert high["continuation_validity"]["max_detected_vortices"] == 8
+    assert high["continuation_validity"]["require_lid_cavity_topology_alignment"] is False
+
+
+def test_high_re_validity_allows_physical_secondary_vortices_without_reference_gate():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    metrics = {
+        "has_reference": True,
+        "pde_residual_mean": 0.1,
+        "continuity_residual_mean": 1e-8,
+        "momentum_residual_mean": 0.1,
+        "boundary_condition_error": 0.0,
+        "speed_pred_max": 1.5,
+        "streamfunction_consistency_rmse": 1e-4,
+        "lid_cavity_primary_center_error": 0.20,
+        "lid_cavity_topology_score": 0.35,
+        "velocity_full_rel_l2": 10.0,
+        "lid_cavity_topology_aligned": 0.0,
+        "primary_streamfunction_abs": 0.02,
+        "speed_pred_mean": 0.2,
+        "detected_vortex_count": 5,
+        "primary_vortex_center_x": 0.6,
+        "primary_vortex_center_y": 0.7,
+        "near_wall_pde_residual_mean": 0.2,
+        "near_wall_momentum_v_mean": 0.2,
+        "core_pde_residual_mean": 0.1,
+    }
+    high = _apply_re_aware_cavity_settings(base, 1600.0)
+    low = _apply_re_aware_cavity_settings(base, 100.0)
+
+    assert _continuation_validity(metrics, high)["continuation_stage_valid"]
+    assert not _continuation_validity(metrics, low)["continuation_stage_valid"]
 
 
 def test_cavity_hard_boundary_accepts_lid_cavity_alias():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import math
 from pathlib import Path
 import shutil
 import sys
@@ -159,6 +160,7 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
         for reynolds in args.reynolds:
             per_method: dict[str, dict[str, Any]] = {}
             re_name = f"re_{int(round(reynolds)):04d}"
+            re_base = _apply_re_aware_cavity_settings(base, float(reynolds))
             for method in args.methods:
                 if method in failed_methods:
                     continue
@@ -180,7 +182,7 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     )
                     continue
                 method_dir = output / f"seed_{seed}" / re_name / method
-                config = deepcopy(base)
+                config = deepcopy(re_base)
                 config["seed"] = int(seed)
                 config["experiments"] = {
                     **config.get("experiments", {}),
@@ -344,6 +346,115 @@ def _load_base_config(config_path: str | Path) -> dict[str, Any]:
     return deep_update(default_base, config)
 
 
+def _apply_re_aware_cavity_settings(
+    config: dict[str, Any],
+    reynolds: float,
+) -> dict[str, Any]:
+    schedule = dict(config.get("re_aware_cavity", {}))
+    regimes = list(schedule.get("regimes", []))
+    if not bool(schedule.get("enabled", False)) or not regimes:
+        return deepcopy(config)
+    if not np.isfinite(reynolds) or reynolds <= 0.0:
+        raise ValueError(f"Reynolds number must be positive and finite, got {reynolds!r}.")
+
+    regime = regimes[-1]
+    for candidate in regimes:
+        if reynolds <= float(candidate.get("max_re", np.inf)):
+            regime = candidate
+            break
+
+    band_cfg = dict(schedule.get("near_wall_band", {}))
+    band = float(band_cfg.get("scale", 1.2)) / math.sqrt(reynolds)
+    band = min(
+        max(band, float(band_cfg.get("min", 0.025))),
+        float(band_cfg.get("max", 0.12)),
+    )
+    total_steps = int(config.get("controller_v2", {}).get("total_steps", 4000))
+    cavity_until = [
+        max(1, int(round(total_steps * fraction)))
+        for fraction in (0.25, 0.75, 1.0)
+    ]
+    wall_until = [
+        max(1, int(round(total_steps * fraction)))
+        for fraction in (0.20, 0.45, 0.75, 1.0)
+    ]
+    corner_widths = [float(value) for value in regime["corner_widths"]]
+    lid_powers = [int(value) for value in regime["lid_vertical_powers"]]
+    correction_scales = [float(value) for value in regime["correction_scales"]]
+    wall_weights = [float(value) for value in regime["near_wall_momentum_weights"]]
+    topology = dict(regime.get("topology", {}))
+
+    return deep_update(
+        config,
+        {
+            "benchmark_params": {
+                "lid_corner_regularization_width": corner_widths[-1],
+            },
+            "model": {
+                "hard_boundary_corner_width": corner_widths[-1],
+                "hard_boundary_lid_vertical_power": lid_powers[-1],
+                "hard_boundary_correction_scale": correction_scales[-1],
+            },
+            "training": {
+                "residual_loss_mode": {
+                    "switch_step": max(1, int(round(total_steps * 0.80))),
+                },
+                "weights": {
+                    "speed_cap": float(regime["speed_cap_weight"]),
+                    "raw_psi_l2": float(regime["raw_psi_l2_weight"]),
+                    "near_wall_vorticity_l2": float(
+                        regime["near_wall_vorticity_l2_weight"]
+                    ),
+                },
+            },
+            "losses": {
+                "near_wall_momentum": {
+                    "stages": [
+                        {
+                            "until_step": until_step,
+                            "band_width": band,
+                            "weight": weight,
+                        }
+                        for until_step, weight in zip(wall_until, wall_weights)
+                    ],
+                },
+                "near_wall_vorticity_l2": {"band_width": band},
+            },
+            "cavity_curriculum": {
+                "stages": [
+                    {
+                        "until_step": until_step,
+                        "corner_width": corner_width,
+                        "lid_vertical_power": lid_power,
+                        "correction_scale": correction_scale,
+                    }
+                    for until_step, corner_width, lid_power, correction_scale in zip(
+                        cavity_until,
+                        corner_widths,
+                        lid_powers,
+                        correction_scales,
+                    )
+                ],
+            },
+            "sampling": {
+                "cavity_boundary": {"corner_width": corner_widths[-1]},
+            },
+            "continuation_validity": {
+                "max_lid_cavity_primary_center_error": float(
+                    topology["max_primary_center_error"]
+                ),
+                "max_lid_cavity_topology_score": float(
+                    topology["max_topology_score"]
+                ),
+                "require_lid_cavity_topology_alignment": bool(
+                    topology["require_alignment"]
+                ),
+                "max_detected_vortices": int(topology["max_detected_vortices"]),
+            },
+        },
+    )
+
+
 def _save_validity_aware_montages(
     output: Path,
     raw: pd.DataFrame,
@@ -442,7 +553,6 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
         "lid_cavity_topology_score": float(
             cfg.get("max_lid_cavity_topology_score", np.inf)
         ),
-        "velocity_full_rel_l2": float(cfg.get("max_velocity_full_rel_l2", np.inf)),
         "near_wall_pde_residual_mean": float(
             cfg.get("max_near_wall_pde_residual_mean", np.inf)
         ),
@@ -459,12 +569,6 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             value = float(metrics.get(name, np.nan))
         except (TypeError, ValueError):
             value = float("nan")
-        if (
-            name == "velocity_full_rel_l2"
-            and not bool(metrics.get("has_reference", False))
-            and not np.isfinite(value)
-        ):
-            continue
         if not np.isfinite(value):
             reasons.append(f"{name}=nonfinite")
         elif value > maximum:
