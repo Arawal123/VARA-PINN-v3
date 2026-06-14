@@ -523,10 +523,24 @@ def _cavity_residual_geometry_metrics(
         & (coords_np[:, 0:1] <= x1 - top_corner_strip)
     )
     upper_core_mask = core_mask & (coords_np[:, 1:2] >= y0 + 0.50 * height)
+    right_interior_mask = (
+        (coords_np[:, 0:1] >= x0 + 0.78 * width)
+        & (coords_np[:, 0:1] <= x0 + 0.98 * width)
+        & (coords_np[:, 1:2] >= y0 + 0.15 * height)
+        & (coords_np[:, 1:2] <= y0 + 0.85 * height)
+    )
+    lower_core_mask = (
+        (coords_np[:, 0:1] >= x0 + 0.15 * width)
+        & (coords_np[:, 0:1] <= x0 + 0.85 * width)
+        & (coords_np[:, 1:2] >= y0 + 0.05 * height)
+        & (coords_np[:, 1:2] <= y0 + 0.35 * height)
+    )
     side_wall_mask = left | right
     top_wall_mask = top
     boundary_mask = benchmark.boundary_mask_np(coords_np)[:, None] if hasattr(benchmark, "boundary_mask_np") else np.zeros_like(corner_mask)
     corner_boundary_mask = corner_mask & boundary_mask
+    core_speed = _masked_mean(speed, core_mask)
+    upper_core_speed = _masked_mean(speed, upper_core_mask)
     return {
         "centerline_pde_residual_mean": _weighted_mean(pde, centerline_weight),
         "centerline_continuity_residual_mean": _weighted_mean(continuity, centerline_weight),
@@ -545,8 +559,13 @@ def _cavity_residual_geometry_metrics(
             continuity, top_band_mask
         ),
         "upper_core_pde_residual_mean": _masked_mean(pde, upper_core_mask),
-        "core_speed_mean": _masked_mean(speed, core_mask),
-        "upper_core_speed_mean": _masked_mean(speed, upper_core_mask),
+        "right_wall_interior_pde_residual_mean": _masked_mean(
+            pde, right_interior_mask
+        ),
+        "lower_core_pde_residual_mean": _masked_mean(pde, lower_core_mask),
+        "core_speed_mean": core_speed,
+        "upper_core_speed_mean": upper_core_speed,
+        "core_speed_ratio": core_speed / max(upper_core_speed, 1e-12),
         "core_p_grad_mean": _masked_mean(p_grad, core_mask),
         "near_wall_p_grad_mean": _masked_mean(p_grad, near_wall_mask),
         "near_wall_p_grad_max": _masked_max(p_grad, near_wall_mask),

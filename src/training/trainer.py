@@ -21,6 +21,7 @@ from src.losses.pressure_losses import pressure_anchor_loss
 from src.losses.vorticity_losses import vorticity_transport_residual
 from src.models import build_mlp_from_config
 from src.physics.kovasznay import KovasznayFlow
+from src.physics.navier_stokes import navier_stokes_residuals
 from src.physics.pressure_poisson import pressure_poisson_residual
 from src.physics.rectangular_benchmarks import (
     BoundaryStressBoxFlow,
@@ -85,6 +86,7 @@ class ExperimentTrainer:
         self.repair_rng = np.random.default_rng(self.seed + 7919)
         self.global_step = 0
         self.best_score = math.inf
+        self.best_checkpoint_core_ratio = float("nan")
         self.early_stop_history: list[float] = []
         self.early_stopped = False
         self.early_stop_step: int | None = None
@@ -356,10 +358,10 @@ class ExperimentTrainer:
         counts = {
             name: int(round(n * float(cfg.get(f"{name}_fraction", default))))
             for name, default in (
-                ("top_band", 0.20),
-                ("right_band", 0.15),
-                ("lower_band", 0.10),
-                ("left_band", 0.10),
+                ("top_band", 0.18),
+                ("right_band", 0.14),
+                ("lower_band", 0.12),
+                ("left_band", 0.11),
             )
         }
         specialized = sum(counts.values())
@@ -576,6 +578,68 @@ class ExperimentTrainer:
             profile=profile,
         )
         return metrics
+
+    def _lift_only_diagnostics(self, coords_np: np.ndarray) -> dict[str, Any]:
+        if not hasattr(self.model, "analytic_lift"):
+            return {}
+
+        class LiftOnlyModel(torch.nn.Module):
+            def __init__(self, wrapped: torch.nn.Module) -> None:
+                super().__init__()
+                self.wrapped = wrapped
+
+            def forward(self, coords: torch.Tensor) -> torch.Tensor:
+                return self.wrapped.analytic_lift(coords)
+
+        lift_model = LiftOnlyModel(self.model)
+        coords = torch.tensor(
+            coords_np,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        residuals = navier_stokes_residuals(
+            lift_model,
+            coords,
+            nu=self.benchmark.nu,
+            steady=self.steady,
+        )
+        lift = torch.cat(
+            [residuals["u"], residuals["v"], residuals["p"]],
+            dim=1,
+        )
+        speed = torch.sqrt(lift[:, 0:1].pow(2) + lift[:, 1:2].pow(2))
+        boundary_error = float("nan")
+        if hasattr(self.benchmark, "boundary_mask_np"):
+            mask = self.benchmark.boundary_mask_np(coords_np)
+            if np.any(mask):
+                mask_tensor = torch.as_tensor(
+                    mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                reference = self.benchmark.exact_torch(coords[mask_tensor])
+                error = torch.sqrt(
+                    (
+                        lift[mask_tensor, 0:1]
+                        - reference["u"]
+                    ).pow(2)
+                    + (
+                        lift[mask_tensor, 1:2]
+                        - reference["v"]
+                    ).pow(2)
+                )
+                boundary_error = float(error.mean().detach().cpu())
+        return {
+            "lift_only_continuity_residual_mean": float(
+                residuals["f_c"].abs().mean().detach().cpu()
+            ),
+            "lift_only_pde_residual_mean": float(
+                residuals["pde_residual"].mean().detach().cpu()
+            ),
+            "lift_only_boundary_condition_error": boundary_error,
+            "lift_only_speed_max": float(speed.max().detach().cpu()),
+            "lift_only_mode": str(getattr(self.model, "lift_mode", "")),
+        }
 
     def controller_metrics(self, coords: np.ndarray) -> dict[str, float]:
         started = time.perf_counter()
@@ -1307,12 +1371,52 @@ class ExperimentTrainer:
             )
         )
         for name in metrics:
+            if name in {
+                "core_speed_mean",
+                "upper_core_speed_mean",
+                "core_speed_ratio",
+            }:
+                continue
             old = float(before.get(name, float("nan")))
             new = float(after.get(name, float("nan")))
             if not math.isfinite(old) or not math.isfinite(new):
                 return False, f"pareto_nonfinite_{name}"
             if new > old * (1.0 + tolerance) + 1e-12:
                 return False, f"pareto_worsened_{name}"
+        ratio_guard = dict(guard.get("core_speed_ratio_guard", {}))
+        if (
+            str(self.config.get("model", {}).get("physics_formulation", ""))
+            == "cavity_uvp_velocity_lift"
+            and bool(ratio_guard.get("enabled", False))
+        ):
+            old_ratio = float(before.get("core_speed_ratio", float("nan")))
+            new_ratio = float(after.get("core_speed_ratio", float("nan")))
+            old_pde = float(before.get("pde_residual_mean", float("nan")))
+            new_pde = float(after.get("pde_residual_mean", float("nan")))
+            maximum_drop = max(
+                float(ratio_guard.get("maximum_relative_drop", 0.20)),
+                0.0,
+            )
+            substantial_improvement = min(
+                max(
+                    float(
+                        ratio_guard.get(
+                            "substantial_pde_improvement", 0.10
+                        )
+                    ),
+                    0.0,
+                ),
+                1.0,
+            )
+            if (
+                all(
+                    math.isfinite(value)
+                    for value in (old_ratio, new_ratio, old_pde, new_pde)
+                )
+                and new_ratio < old_ratio * (1.0 - maximum_drop)
+                and new_pde > old_pde * (1.0 - substantial_improvement)
+            ):
+                return False, "pareto_core_speed_ratio_collapsed"
         validity = dict(self.config.get("continuation_validity", {}))
         for name in guard.get(
             "validity_gate_metrics",
@@ -1557,13 +1661,44 @@ class ExperimentTrainer:
         metrics["model_architecture"] = str(model_cfg.get("architecture", "mlp"))
         metrics["physics_formulation"] = str(model_cfg.get("physics_formulation", "direct"))
         if metrics["physics_formulation"] == "cavity_uvp_velocity_lift":
-            core_speed = float(metrics.get("core_speed_mean", float("nan")))
-            upper_speed = float(
-                metrics.get("upper_core_speed_mean", float("nan"))
+            metrics["uvp_velocity_lift_mode"] = str(
+                getattr(
+                    self.model,
+                    "lift_mode",
+                    model_cfg.get("uvp_velocity_lift_mode", ""),
+                )
             )
+            metrics["uvp_velocity_lift_scale"] = float(
+                getattr(
+                    self.model,
+                    "lift_scale",
+                    model_cfg.get("uvp_velocity_lift_scale", float("nan")),
+                )
+            )
+            metrics["uvp_velocity_lift_vertical_power"] = int(
+                getattr(
+                    self.model,
+                    "lid_vertical_power",
+                    model_cfg.get(
+                        "uvp_velocity_lift_vertical_power", 0
+                    ),
+                )
+            )
+            metrics["uvp_velocity_lift_corner_width"] = float(
+                getattr(
+                    self.model,
+                    "corner_width",
+                    model_cfg.get(
+                        "uvp_velocity_lift_corner_width", float("nan")
+                    ),
+                )
+            )
+            metrics.update(self._lift_only_diagnostics(coords))
             metrics["lifted_uvp_diagnostics"] = {
                 "formulation": metrics["physics_formulation"],
                 "lift_enabled": True,
+                "mode": metrics["uvp_velocity_lift_mode"],
+                "scale": metrics["uvp_velocity_lift_scale"],
                 "lid_u_boundary_rmse": metrics.get(
                     "lid_u_boundary_rmse", float("nan")
                 ),
@@ -1579,9 +1714,22 @@ class ExperimentTrainer:
                 "upper_core_pde_residual_mean": metrics.get(
                     "upper_core_pde_residual_mean", float("nan")
                 ),
-                "core_speed_mean": core_speed,
-                "upper_core_speed_mean": upper_speed,
-                "speed_core_ratio": core_speed / max(upper_speed, 1e-12),
+                "core_speed_mean": metrics.get(
+                    "core_speed_mean", float("nan")
+                ),
+                "upper_core_speed_mean": metrics.get(
+                    "upper_core_speed_mean", float("nan")
+                ),
+                "core_speed_ratio": metrics.get(
+                    "core_speed_ratio", float("nan")
+                ),
+                "lift_only_continuity_residual_mean": metrics[
+                    "lift_only_continuity_residual_mean"
+                ],
+                "lift_only_boundary_condition_error": metrics[
+                    "lift_only_boundary_condition_error"
+                ],
+                "lift_only_speed_max": metrics["lift_only_speed_max"],
             }
         metrics["hard_boundary_corner_width"] = (
             float(
@@ -1820,6 +1968,29 @@ class ExperimentTrainer:
         checkpoint_cfg = dict(self.config.get("checkpoint", {}))
         eligible = self._checkpoint_is_final_restore_eligible()
         improved = eligible and score < self.best_score
+        tiebreaker = dict(checkpoint_cfg.get("core_speed_ratio_tiebreaker", {}))
+        ratio = float(metrics.get("core_speed_ratio", float("nan")))
+        if (
+            eligible
+            and bool(tiebreaker.get("enabled", False))
+            and math.isfinite(self.best_score)
+            and score <= self.best_score
+            * (1.0 + max(float(tiebreaker.get("physics_margin", 0.02)), 0.0))
+            and math.isfinite(ratio)
+            and (
+                not math.isfinite(self.best_checkpoint_core_ratio)
+                or ratio
+                > self.best_checkpoint_core_ratio
+                * (
+                    1.0
+                    + max(
+                        float(tiebreaker.get("minimum_ratio_gain", 0.02)),
+                        0.0,
+                    )
+                )
+            )
+        ):
+            improved = True
         if bool(checkpoint_cfg.get("save_latest_every_cycle", True)):
             save_checkpoint(
                 self.checkpoint_dir / "latest.pt",
@@ -1832,6 +2003,7 @@ class ExperimentTrainer:
             )
         if improved:
             self.best_score = score
+            self.best_checkpoint_core_ratio = ratio
             save_checkpoint(self.checkpoint_dir / "best.pt", self.model, self.optimizer, self.config, metrics, self.global_step, cycle)
         self._record_runtime(
             "checkpoint_save",

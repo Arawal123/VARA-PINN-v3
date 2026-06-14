@@ -114,8 +114,9 @@ class CavityUVPVelocityLiftWrapper(nn.Module):
         bounds: tuple[float, float, float, float],
         lid_velocity: float = 1.0,
         corner_width: float = 0.05,
-        lift_scale: float = 16.0,
+        lift_scale: float = 8.0,
         lid_vertical_power: int = 3,
+        lift_mode: str = "divergence_compatible",
     ) -> None:
         super().__init__()
         self.base = base
@@ -124,26 +125,64 @@ class CavityUVPVelocityLiftWrapper(nn.Module):
         self.corner_width = max(float(corner_width), 1e-6)
         self.lift_scale = float(lift_scale)
         self.lid_vertical_power = max(int(lid_vertical_power), 1)
+        self.lift_mode = str(lift_mode).lower()
+        if self.lift_mode not in {
+            "divergence_compatible",
+            "bulk_eta_legacy",
+        }:
+            raise ValueError(
+                "uvp velocity lift mode must be 'divergence_compatible' "
+                "or 'bulk_eta_legacy'."
+            )
         self.physics_formulation = "cavity_uvp_velocity_lift"
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         raw = self.base(coords)
+        lift = self.analytic_lift(coords)
         x0, x1, y0, y1 = self.bounds
         xi = (coords[:, 0:1] - x0) / max(x1 - x0, 1e-12)
         eta = (coords[:, 1:2] - y0) / max(y1 - y0, 1e-12)
-        lid_profile = _smoothstep01(xi / self.corner_width) * _smoothstep01(
-            (1.0 - xi) / self.corner_width
-        )
-        u_lift = (
-            self.lid_velocity
-            * eta.pow(self.lid_vertical_power)
-            * lid_profile
-        )
         distance = xi * (1.0 - xi) * eta * (1.0 - eta)
-        u = u_lift + self.lift_scale * distance * raw[:, 0:1]
-        v = self.lift_scale * distance * raw[:, 1:2]
+        u = lift[:, 0:1] + self.lift_scale * distance * raw[:, 0:1]
+        v = lift[:, 1:2] + self.lift_scale * distance * raw[:, 1:2]
         p = raw[:, 2:3]
         return torch.cat([u, v, p], dim=1)
+
+    def analytic_lift(self, coords: torch.Tensor) -> torch.Tensor:
+        x0, x1, y0, y1 = self.bounds
+        lx = max(x1 - x0, 1e-12)
+        ly = max(y1 - y0, 1e-12)
+        xi = (coords[:, 0:1] - x0) / lx
+        eta = (coords[:, 1:2] - y0) / ly
+        left_arg = xi / self.corner_width
+        right_arg = (1.0 - xi) / self.corner_width
+        left = _smoothstep01(left_arg)
+        right = _smoothstep01(right_arg)
+        lid_profile = left * right
+        if self.lift_mode == "bulk_eta_legacy":
+            u_lift = (
+                self.lid_velocity
+                * eta.pow(self.lid_vertical_power)
+                * lid_profile
+            )
+            v_lift = torch.zeros_like(u_lift)
+        else:
+            lid_derivative = (
+                _smoothstep01_derivative(left_arg) * right
+                - left * _smoothstep01_derivative(right_arg)
+            ) / self.corner_width
+            power = self.lid_vertical_power
+            h = eta.pow(power) * (eta - 1.0)
+            h_prime = eta.pow(power - 1) * ((power + 1) * eta - power)
+            u_lift = self.lid_velocity * lid_profile * h_prime
+            v_lift = (
+                -self.lid_velocity
+                * (ly / lx)
+                * lid_derivative
+                * h
+            )
+        pressure = torch.zeros_like(u_lift)
+        return torch.cat([u_lift, v_lift, pressure], dim=1)
 
 
 class StreamfunctionPressureWrapper(nn.Module):
