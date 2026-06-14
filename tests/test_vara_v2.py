@@ -127,6 +127,40 @@ def test_sparse_cfd_sampler_is_deterministic_and_excludes_boundaries_and_corners
     assert not np.any(near_x & near_y)
 
 
+def test_sparse_cfd_mixed_sampler_is_deterministic_and_preserves_count(tmp_path):
+    path = tmp_path / "cfd.npz"
+    _write_toy_cfd(path)
+    config = {
+        "benchmark_params": {"full_field_reference_path": str(path)},
+        "data_supervision": {
+            "mode": "sparse_cfd_polish",
+            "sample_count": 40,
+            "seed": 21,
+            "cfd": {
+                "sampling": {
+                    "mode": "mixed",
+                    "uniform_fraction": 0.45,
+                    "top_band_fraction": 0.25,
+                    "right_band_fraction": 0.12,
+                    "lower_core_fraction": 0.10,
+                    "left_band_fraction": 0.08,
+                }
+            },
+        },
+    }
+    first = build_cavity_cfd_supervision(
+        config, (0.0, 1.0, 0.0, 1.0), torch.device("cpu")
+    )
+    second = build_cavity_cfd_supervision(
+        config, (0.0, 1.0, 0.0, 1.0), torch.device("cpu")
+    )
+    assert first is not None and second is not None
+    assert first.sample_count == 40
+    assert first.sampling_mode == "mixed"
+    assert torch.equal(first.coords, second.coords)
+    assert first.pool_hash == second.pool_hash
+
+
 def test_sparse_cfd_velocity_loss_is_correct_on_toy_data():
     class ToyModel(torch.nn.Module):
         def forward(self, coords):
@@ -806,6 +840,57 @@ def test_sparse_cfd_pool_is_identical_for_vanilla_and_vara(tmp_path):
     assert vanilla.cfd_supervision.pool_hash == vara.cfd_supervision.pool_hash
 
 
+def test_sparse_cfd_polish_mixed_pool_is_identical_for_vanilla_and_vara(tmp_path):
+    path = tmp_path / "cfd.npz"
+    _write_toy_cfd(path)
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base = _apply_data_supervision_settings(
+        base,
+        mode="sparse_cfd_polish",
+        sample_count=32,
+        cfd_seed=7,
+    )
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "benchmark_params": {
+                "full_field_reference_path": str(path),
+                "profile_only": False,
+            },
+            "data_supervision": {"reference_path": str(path)},
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": 8,
+                "n_boundary": 8,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    vanilla = VARATrainer(
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "pv"), "flat_layout": True}},
+        ),
+        mode="vanilla",
+    )
+    vara = VARAV2Trainer(
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "pa"), "flat_layout": True}},
+        )
+    )
+    assert vanilla.cfd_supervision is not None
+    assert vara.cfd_supervision is not None
+    assert vanilla.cfd_supervision.sampling_mode == "mixed"
+    assert torch.equal(
+        vanilla.cfd_supervision.coords, vara.cfd_supervision.coords
+    )
+    assert vanilla.cfd_supervision.pool_hash == vara.cfd_supervision.pool_hash
+
+
 def test_pure_pinn_creates_no_cfd_supervision_tensors(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     config = deep_update(
@@ -854,6 +939,66 @@ def test_sparse_cfd_cli_config_prefers_soft_uvp_and_labels_oracle():
             "vortex",
             "center",
         )
+    )
+
+
+def test_sparse_cfd_polish_is_opt_in_and_changes_only_polish_settings():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    sparse = _apply_re_aware_cavity_settings(
+        _apply_data_supervision_settings(base, mode="sparse_cfd"),
+        100.0,
+    )
+    polish = _apply_re_aware_cavity_settings(
+        _apply_data_supervision_settings(
+            base, mode="sparse_cfd_polish"
+        ),
+        100.0,
+    )
+    assert sparse["data_supervision"]["mode"] == "sparse_cfd"
+    assert sparse["data_supervision"]["cfd"]["sampling"]["mode"] == "uniform"
+    assert sparse["training"]["weights"]["continuity"] == pytest.approx(6.0)
+    assert sparse["training"]["weights"]["cfd_velocity_mse"] == pytest.approx(3.0)
+    assert sparse["training"]["weights"]["cfd_u_mse"] == pytest.approx(0.0)
+    assert sparse["training"]["weights"]["cfd_v_mse"] == pytest.approx(0.0)
+
+    assert polish["data_supervision"]["mode"] == "sparse_cfd_polish"
+    assert polish["data_supervision"]["cfd"]["sampling"]["mode"] == "mixed"
+    assert polish["training"]["weights"]["momentum_u"] == pytest.approx(
+        sparse["training"]["weights"]["momentum_u"]
+    )
+    assert polish["training"]["weights"]["momentum_v"] == pytest.approx(
+        sparse["training"]["weights"]["momentum_v"]
+    )
+    assert polish["training"]["weights"]["continuity"] == pytest.approx(6.72)
+    assert polish["training"]["weights"]["bc_uvp_balanced"] == pytest.approx(
+        sparse["training"]["weights"]["bc_uvp_balanced"] * 1.12
+    )
+    assert polish["training"]["weights"]["cfd_velocity_mse"] == pytest.approx(0.0)
+    assert polish["training"]["weights"]["cfd_u_mse"] == pytest.approx(3.0)
+    assert polish["training"]["weights"]["cfd_v_mse"] == pytest.approx(3.9)
+    assert (
+        polish["losses"]["uvp_boundary_balance"]["relative_weights"]["bc_top_u"]
+        == pytest.approx(
+            sparse["losses"]["uvp_boundary_balance"]["relative_weights"][
+                "bc_top_u"
+            ]
+            * 1.12
+        )
+    )
+    repair = polish["optimizer"]["final_repair"]
+    assert repair["epochs"] == 4
+    assert repair["pareto_guard"]["metrics"] == [
+        "pde_residual_mean",
+        "momentum_residual_mean",
+        "continuity_residual_mean",
+        "boundary_condition_error",
+        "cfd_velocity_mse_sparse",
+        "speed_pred_max",
+    ]
+    assert not any(
+        token in name
+        for name in polish["checkpoint"]["reference_free_metrics"]
+        for token in ("full", "topology", "vortex", "center", "ghia")
     )
 
 

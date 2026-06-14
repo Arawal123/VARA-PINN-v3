@@ -29,6 +29,14 @@ data_supervision:
   boundary_margin: 1.0e-6
   corner_margin: 0.05
   oracle_label: upper_bound_only
+  cfd:
+    sampling:
+      mode: uniform
+      uniform_fraction: 0.45
+      top_band_fraction: 0.25
+      right_band_fraction: 0.12
+      lower_core_fraction: 0.10
+      left_band_fraction: 0.08
 
 model:
   architecture: mlp

@@ -64,7 +64,12 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument(
         "--data_supervision",
-        choices=["pure_pinn", "sparse_cfd", "full_cfd_oracle"],
+        choices=[
+            "pure_pinn",
+            "sparse_cfd",
+            "sparse_cfd_polish",
+            "full_cfd_oracle",
+        ],
         default="pure_pinn",
     )
     parser.add_argument("--cfd_sample_fraction", type=float, default=0.01)
@@ -423,7 +428,12 @@ def _apply_data_supervision_settings(
     formulation_explicit: bool = False,
 ) -> dict[str, Any]:
     mode = str(mode).lower()
-    if mode not in {"pure_pinn", "sparse_cfd", "full_cfd_oracle"}:
+    if mode not in {
+        "pure_pinn",
+        "sparse_cfd",
+        "sparse_cfd_polish",
+        "full_cfd_oracle",
+    }:
         raise ValueError(f"Unsupported data supervision mode: {mode}")
     resolved = deep_update(
         config,
@@ -448,10 +458,22 @@ def _apply_data_supervision_settings(
                     if mode == "full_cfd_oracle"
                     else ""
                 ),
+                "sparse_cfd_polish_enabled": (
+                    mode == "sparse_cfd_polish"
+                ),
             }
         },
     )
-    if mode == "sparse_cfd" and not formulation_explicit:
+    if mode == "sparse_cfd_polish":
+        resolved = deep_update(
+            resolved,
+            {
+                "data_supervision": {
+                    "cfd": {"sampling": {"mode": "mixed"}}
+                }
+            },
+        )
+    if mode in {"sparse_cfd", "sparse_cfd_polish"} and not formulation_explicit:
         resolved["cavity_base_formulation"] = "uvp_soft_bc"
     return resolved
 
@@ -841,7 +863,11 @@ def _apply_re_aware_cavity_settings(
     )
     supervision = dict(materialized.get("data_supervision", {}))
     supervision_mode = str(supervision.get("mode", "pure_pinn"))
-    if supervision_mode in {"sparse_cfd", "full_cfd_oracle"}:
+    if supervision_mode in {
+        "sparse_cfd",
+        "sparse_cfd_polish",
+        "full_cfd_oracle",
+    }:
         include_pressure = bool(supervision.get("include_pressure", False))
         include_vorticity = bool(
             supervision.get("include_vorticity", False)
@@ -899,6 +925,125 @@ def _apply_re_aware_cavity_settings(
                         "pareto_guard": {
                             "metrics": sparse_metrics,
                         }
+                    }
+                },
+            },
+        )
+    if supervision_mode == "sparse_cfd_polish":
+        polish = dict(supervision.get("polish", {}))
+        boundary_multiplier = float(
+            polish.get("balanced_boundary_multiplier", 1.12)
+        )
+        top_u_multiplier = float(
+            polish.get("top_u_relative_multiplier", 1.12)
+        )
+        continuity_multiplier = float(
+            polish.get("continuity_multiplier", 1.12)
+        )
+        relative_weights = dict(
+            materialized.get("losses", {})
+            .get("uvp_boundary_balance", {})
+            .get("relative_weights", {})
+        )
+        relative_weights["bc_top_u"] = float(
+            relative_weights.get("bc_top_u", 1.0)
+        ) * top_u_multiplier
+        guard_metrics = [
+            "pde_residual_mean",
+            "momentum_residual_mean",
+            "continuity_residual_mean",
+            "boundary_condition_error",
+            "cfd_velocity_mse_sparse",
+            "speed_pred_max",
+        ]
+        materialized = deep_update(
+            materialized,
+            {
+                "training": {
+                    "weights": {
+                        "continuity": float(
+                            materialized["training"]["weights"][
+                                "continuity"
+                            ]
+                        )
+                        * continuity_multiplier,
+                        "bc_uvp_balanced": float(
+                            materialized["training"]["weights"][
+                                "bc_uvp_balanced"
+                            ]
+                        )
+                        * boundary_multiplier,
+                        "cfd_velocity_mse": 0.0,
+                        "cfd_u_mse": float(
+                            polish.get("cfd_u_weight", 3.0)
+                        ),
+                        "cfd_v_mse": float(
+                            polish.get("cfd_v_weight", 3.9)
+                        ),
+                    }
+                },
+                "losses": {
+                    "uvp_boundary_balance": {
+                        "relative_weights": relative_weights,
+                    }
+                },
+                "optimizer": {
+                    "final_repair": {
+                        "enabled": True,
+                        "epochs": int(
+                            polish.get("final_repair_steps", 4)
+                        ),
+                        "weights": {
+                            "pde": 0.0,
+                            "momentum_u": 1.0,
+                            "momentum_v": 1.0,
+                            "continuity": float(
+                                materialized["training"]["weights"][
+                                    "continuity"
+                                ]
+                            )
+                            * continuity_multiplier,
+                            "bc": 0.0,
+                            "bc_uvp_balanced": float(
+                                materialized["training"]["weights"][
+                                    "bc_uvp_balanced"
+                                ]
+                            )
+                            * boundary_multiplier,
+                            "cfd_velocity_mse": 0.0,
+                            "cfd_u_mse": float(
+                                polish.get("cfd_u_weight", 3.0)
+                            ),
+                            "cfd_v_mse": float(
+                                polish.get("cfd_v_weight", 3.9)
+                            ),
+                            "raw_pde_tail": float(
+                                materialized["training"]["weights"].get(
+                                    "raw_pde_tail", 0.04
+                                )
+                            ),
+                            "top_band_pde": 0.0,
+                            "top_band_momentum_u": 0.0,
+                            "top_band_continuity": 0.0,
+                            "upper_core_pde": 0.0,
+                            "right_wall_interior_pde": 0.0,
+                            "lower_core_pde": 0.0,
+                            "speed_cap": 0.0,
+                            "top_reverse_u": 0.0,
+                            "bottom_positive_u": 0.0,
+                            "pressure_gradient_l2": 0.0,
+                            "near_wall_vorticity_l2": 0.0,
+                        },
+                        "pareto_guard": {
+                            "enabled": True,
+                            "relative_tolerance": 0.05,
+                            "metrics": guard_metrics,
+                            "validity_gate_metrics": [
+                                "pde_residual_mean",
+                                "momentum_residual_mean",
+                                "continuity_residual_mean",
+                            ],
+                        },
                     }
                 },
             },

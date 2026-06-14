@@ -23,6 +23,7 @@ class CFDSupervisionPool:
     sample_fraction: float
     pool_hash: str
     oracle: bool
+    sampling_mode: str
 
     @property
     def sample_count(self) -> int:
@@ -38,10 +39,14 @@ def build_cavity_cfd_supervision(
     mode = str(cfg.get("mode", "pure_pinn")).lower()
     if mode == "pure_pinn":
         return None
-    if mode not in {"sparse_cfd", "full_cfd_oracle"}:
+    if mode not in {
+        "sparse_cfd",
+        "sparse_cfd_polish",
+        "full_cfd_oracle",
+    }:
         raise ValueError(
             "data_supervision.mode must be pure_pinn, sparse_cfd, "
-            "or full_cfd_oracle."
+            "sparse_cfd_polish, or full_cfd_oracle."
         )
     path = cfg.get("reference_path") or config.get("benchmark_params", {}).get(
         "full_field_reference_path"
@@ -55,6 +60,10 @@ def build_cavity_cfd_supervision(
     if eligible_indices.size == 0:
         raise ValueError("No eligible interior CFD points remain after filtering.")
     seed = int(cfg.get("seed", config.get("seed", 0)))
+    sampling_cfg = dict(cfg.get("cfd", {}).get("sampling", {}))
+    sampling_mode = str(sampling_cfg.get("mode", "uniform")).lower()
+    if sampling_mode not in {"uniform", "mixed"}:
+        raise ValueError("CFD sampling mode must be uniform or mixed.")
     if mode == "full_cfd_oracle":
         selected = eligible_indices
     else:
@@ -66,7 +75,19 @@ def build_cavity_cfd_supervision(
             count = max(1, int(requested_count))
         count = min(count, eligible_indices.size)
         rng = np.random.default_rng(seed)
-        selected = np.sort(rng.choice(eligible_indices, size=count, replace=False))
+        if sampling_mode == "mixed":
+            selected = _mixed_sample_indices(
+                coords,
+                eligible_indices,
+                count,
+                bounds,
+                sampling_cfg,
+                rng,
+            )
+        else:
+            selected = np.sort(
+                rng.choice(eligible_indices, size=count, replace=False)
+            )
     selected_coords = np.asarray(coords[selected], dtype=np.float32)
     targets: dict[str, torch.Tensor] = {
         "u": torch.tensor(
@@ -104,6 +125,7 @@ def build_cavity_cfd_supervision(
         sample_fraction=float(selected.size / eligible_indices.size),
         pool_hash=digest.hexdigest(),
         oracle=mode == "full_cfd_oracle",
+        sampling_mode=sampling_mode,
     )
 
 
@@ -130,3 +152,62 @@ def _eligible_mask(
         near_y_corner = (eta < corner) | (eta > 1.0 - corner)
         mask &= ~(near_x_corner & near_y_corner)
     return mask
+
+
+def _mixed_sample_indices(
+    coords: np.ndarray,
+    eligible_indices: np.ndarray,
+    count: int,
+    bounds: tuple[float, float, float, float],
+    cfg: dict[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    x0, x1, y0, y1 = bounds
+    xi = (coords[:, 0] - x0) / max(float(x1 - x0), 1e-12)
+    eta = (coords[:, 1] - y0) / max(float(y1 - y0), 1e-12)
+    fractions = {
+        "top_band": float(cfg.get("top_band_fraction", 0.25)),
+        "right_band": float(cfg.get("right_band_fraction", 0.12)),
+        "lower_core": float(cfg.get("lower_core_fraction", 0.10)),
+        "left_band": float(cfg.get("left_band_fraction", 0.08)),
+    }
+    masks = {
+        "top_band": (eta >= 0.70) & (eta <= 0.98),
+        "right_band": (
+            (xi >= 0.78)
+            & (xi <= 0.98)
+            & (eta >= 0.15)
+            & (eta <= 0.85)
+        ),
+        "lower_core": (
+            (xi >= 0.15)
+            & (xi <= 0.85)
+            & (eta >= 0.05)
+            & (eta <= 0.35)
+        ),
+        "left_band": (
+            (xi >= 0.02)
+            & (xi <= 0.22)
+            & (eta >= 0.20)
+            & (eta <= 0.85)
+        ),
+    }
+    available = set(int(index) for index in eligible_indices)
+    selected: list[int] = []
+    for name in ("top_band", "right_band", "lower_core", "left_band"):
+        requested = int(round(count * max(fractions[name], 0.0)))
+        candidates = np.asarray(
+            sorted(index for index in available if masks[name][index]),
+            dtype=int,
+        )
+        take = min(requested, candidates.size)
+        if take > 0:
+            chosen = rng.choice(candidates, size=take, replace=False)
+            selected.extend(int(index) for index in chosen)
+            available.difference_update(int(index) for index in chosen)
+    remaining = count - len(selected)
+    if remaining > 0:
+        candidates = np.asarray(sorted(available), dtype=int)
+        chosen = rng.choice(candidates, size=remaining, replace=False)
+        selected.extend(int(index) for index in chosen)
+    return np.sort(np.asarray(selected, dtype=int))

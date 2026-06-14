@@ -45,7 +45,12 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--data_supervision",
-        choices=["pure_pinn", "sparse_cfd", "full_cfd_oracle"],
+        choices=[
+            "pure_pinn",
+            "sparse_cfd",
+            "sparse_cfd_polish",
+            "full_cfd_oracle",
+        ],
         default="pure_pinn",
     )
     parser.add_argument("--cfd_sample_fraction", type=float, default=0.01)

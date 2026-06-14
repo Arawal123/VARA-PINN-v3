@@ -15,6 +15,21 @@ data_supervision:
   sparse_cfd_velocity_weight: 3.0
   sparse_continuity_weight: 6.0
   sparse_raw_pde_tail_weight: 0.04
+  cfd:
+    sampling:
+      mode: uniform
+      uniform_fraction: 0.45
+      top_band_fraction: 0.25
+      right_band_fraction: 0.12
+      lower_core_fraction: 0.10
+      left_band_fraction: 0.08
+  polish:
+    balanced_boundary_multiplier: 1.12
+    top_u_relative_multiplier: 1.12
+    continuity_multiplier: 1.12
+    cfd_u_weight: 3.0
+    cfd_v_weight: 3.9
+    final_repair_steps: 4
 
 uvp_velocity_lift:
   continuity_weight: 11.0

@@ -1605,8 +1605,31 @@ class ExperimentTrainer:
         metrics["run_type"] = str(self.config.get("run_type", "full"))
         model_cfg = self.config.get("model", {})
         supervision_cfg = dict(self.config.get("data_supervision", {}))
+        training_weights = dict(
+            self.config.get("training", {}).get("weights", {})
+        )
         metrics["cfd_supervision_mode"] = str(
             supervision_cfg.get("mode", "pure_pinn")
+        )
+        metrics["sparse_cfd_polish_enabled"] = bool(
+            metrics["cfd_supervision_mode"] == "sparse_cfd_polish"
+        )
+        metrics["cfd_sampling_mode"] = str(
+            supervision_cfg.get("cfd", {})
+            .get("sampling", {})
+            .get("mode", "uniform")
+        )
+        metrics["cfd_u_weight"] = float(
+            training_weights.get(
+                "cfd_u_mse",
+                training_weights.get("cfd_velocity_mse", 0.0),
+            )
+        )
+        metrics["cfd_v_weight"] = float(
+            training_weights.get(
+                "cfd_v_mse",
+                training_weights.get("cfd_velocity_mse", 0.0),
+            )
         )
         metrics["cfd_supervision_is_oracle"] = bool(
             metrics["cfd_supervision_mode"] == "full_cfd_oracle"
@@ -1618,11 +1641,15 @@ class ExperimentTrainer:
                 supervision_cfg.get("seed", self.seed)
             )
             metrics["cfd_sparse_pool_hash"] = ""
+            metrics["sparse_cfd_pool_hash"] = ""
             metrics["cfd_velocity_mse_sparse"] = float("nan")
             metrics["cfd_u_mse_sparse"] = float("nan")
             metrics["cfd_v_mse_sparse"] = float("nan")
         else:
             metrics.update(self._cfd_sparse_metrics())
+            metrics["sparse_cfd_pool_hash"] = (
+                self.cfd_supervision.pool_hash
+            )
         metrics["cfd_velocity_full_rel_l2_eval_only"] = metrics.get(
             "velocity_full_rel_l2", float("nan")
         )

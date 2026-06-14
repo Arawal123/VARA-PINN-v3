@@ -178,7 +178,8 @@ def compute_pointwise_losses(
         xy_data is not None
         and targets is not None
         and xy_data.shape[0] > 0
-        and supervision_mode in {"sparse_cfd", "full_cfd_oracle"}
+        and supervision_mode
+        in {"sparse_cfd", "sparse_cfd_polish", "full_cfd_oracle"}
     ):
         data_pred = model(xy_data)
         cfd_u = (data_pred[:, 0:1] - targets["u"]).pow(2)
