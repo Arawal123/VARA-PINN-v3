@@ -294,6 +294,7 @@ def evaluate_on_grid(
                 momentum_u=_masked_values(momentum_u_abs, residual_mask),
                 momentum_v=_masked_values(momentum_v_abs, residual_mask),
                 p_grad=_masked_values(p_grad_abs, residual_mask),
+                speed=speed,
             )
         )
     metrics["unweighted_physics_validation_loss"] = _finite_sum(
@@ -396,9 +397,12 @@ def _streamfunction_metrics(
             "streamfunction_consistency_rmse": float("nan"),
             "primary_vortex_center_x": float("nan"),
             "primary_vortex_center_y": float("nan"),
+            "primary_vortex_y": float("nan"),
             "primary_streamfunction_abs": float("nan"),
             "detected_vortex_count": 0,
             "secondary_vortex_count": 0,
+            "weak_secondary_vortex_count": 0,
+            "primary_vortex_wall_distance": float("nan"),
         }
     shape = (len(y_values), len(x_values))
     X, Y = np.meshgrid(x_values, y_values)
@@ -411,6 +415,13 @@ def _streamfunction_metrics(
         == "liddrivencavityqualitative",
     )
     vortices = detect_vortices(X, Y, psi)
+    weak_vortices = detect_vortices(
+        X,
+        Y,
+        psi,
+        minimum_strength_fraction=0.005,
+        minimum_prominence_fraction=0.0005,
+    )
     if vortices:
         primary = vortices[0]
     else:
@@ -424,13 +435,24 @@ def _streamfunction_metrics(
             "y": float(Y[index]),
             "strength": float(abs(psi[index])),
         }
+    x_span = max(float(np.max(X) - np.min(X)), 1e-12)
+    y_span = max(float(np.max(Y) - np.min(Y)), 1e-12)
+    wall_distance = min(
+        (float(primary["x"]) - float(np.min(X))) / x_span,
+        (float(np.max(X)) - float(primary["x"])) / x_span,
+        (float(primary["y"]) - float(np.min(Y))) / y_span,
+        (float(np.max(Y)) - float(primary["y"])) / y_span,
+    )
     return {
         "streamfunction_consistency_rmse": float(consistency),
         "primary_vortex_center_x": float(primary["x"]),
         "primary_vortex_center_y": float(primary["y"]),
+        "primary_vortex_y": float(primary["y"]),
         "primary_streamfunction_abs": float(primary["strength"]),
         "detected_vortex_count": int(len(vortices)),
         "secondary_vortex_count": int(max(0, len(vortices) - 1)),
+        "weak_secondary_vortex_count": int(max(0, len(weak_vortices) - 1)),
+        "primary_vortex_wall_distance": float(wall_distance),
     }
 
 
@@ -465,6 +487,7 @@ def _cavity_residual_geometry_metrics(
     momentum_u: np.ndarray,
     momentum_v: np.ndarray,
     p_grad: np.ndarray,
+    speed: np.ndarray,
 ) -> dict[str, float]:
     x0, x1, y0, y1 = benchmark.bounds
     width = max(float(x1 - x0), 1e-12)
@@ -490,6 +513,16 @@ def _cavity_residual_geometry_metrics(
         & (coords_np[:, 1:2] <= y1 - wall_margin)
     )
     near_wall_mask = ~core_mask
+    top_band_floor = y0 + 0.72 * height
+    top_band_ceiling = y1 - 1e-6 * height
+    top_corner_strip = 0.05 * width
+    top_band_mask = (
+        (coords_np[:, 1:2] >= top_band_floor)
+        & (coords_np[:, 1:2] < top_band_ceiling)
+        & (coords_np[:, 0:1] >= x0 + top_corner_strip)
+        & (coords_np[:, 0:1] <= x1 - top_corner_strip)
+    )
+    upper_core_mask = core_mask & (coords_np[:, 1:2] >= y0 + 0.50 * height)
     side_wall_mask = left | right
     top_wall_mask = top
     boundary_mask = benchmark.boundary_mask_np(coords_np)[:, None] if hasattr(benchmark, "boundary_mask_np") else np.zeros_like(corner_mask)
@@ -505,6 +538,15 @@ def _cavity_residual_geometry_metrics(
         "near_wall_momentum_u_mean": _masked_mean(momentum_u, near_wall_mask),
         "near_wall_momentum_v_mean": _masked_mean(momentum_v, near_wall_mask),
         "near_wall_momentum_v_max": _masked_max(momentum_v, near_wall_mask),
+        "top_band_pde_residual_mean": _masked_mean(pde, top_band_mask),
+        "top_band_momentum_u_mean": _masked_mean(momentum_u, top_band_mask),
+        "top_band_momentum_v_mean": _masked_mean(momentum_v, top_band_mask),
+        "top_band_continuity_residual_mean": _masked_mean(
+            continuity, top_band_mask
+        ),
+        "upper_core_pde_residual_mean": _masked_mean(pde, upper_core_mask),
+        "core_speed_mean": _masked_mean(speed, core_mask),
+        "upper_core_speed_mean": _masked_mean(speed, upper_core_mask),
         "core_p_grad_mean": _masked_mean(p_grad, core_mask),
         "near_wall_p_grad_mean": _masked_mean(p_grad, near_wall_mask),
         "near_wall_p_grad_max": _masked_max(p_grad, near_wall_mask),

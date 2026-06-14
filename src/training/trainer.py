@@ -145,6 +145,7 @@ class ExperimentTrainer:
         self.action_records: list[dict[str, Any]] = []
         self.last_losses: dict[str, float] = {}
         self.last_boundary_sampling_summary: dict[str, float] = {}
+        self.last_interior_sampling_summary: dict[str, float] = {}
         self._print_runtime_environment()
 
         t_bounds = getattr(self.benchmark, "t_bounds", None)
@@ -298,6 +299,44 @@ class ExperimentTrainer:
         fraction = min(max(float(cfg.get("fraction", 0.0)), 0.0), 1.0)
         return min(max(int(round(int(n) * fraction)), 0), int(n))
 
+    def _lid_interior_sample_count(self, n: int) -> int:
+        cfg = dict(
+            self.config.get("sampling", {}).get("cavity_lid_interior_band", {})
+        )
+        formulation = str(
+            self.config.get("model", {}).get("physics_formulation", "")
+        )
+        if (
+            formulation != "cavity_uvp_soft_bc"
+            or not self._is_lid_driven_cavity()
+            or not bool(cfg.get("enabled", False))
+        ):
+            return 0
+        fraction = min(max(float(cfg.get("fraction", 0.0)), 0.0), 1.0)
+        return min(max(int(round(int(n) * fraction)), 0), int(n))
+
+    def _interior_component_counts(self, n: int) -> tuple[int, int, int]:
+        n = max(int(n), 0)
+        n_wall = self._near_wall_sample_count(n)
+        n_lid = self._lid_interior_sample_count(n)
+        cfg = dict(
+            self.config.get("sampling", {}).get("cavity_lid_interior_band", {})
+        )
+        minimum_core = int(
+            math.ceil(
+                n
+                * min(
+                    max(float(cfg.get("minimum_core_fraction", 0.35)), 0.0),
+                    1.0,
+                )
+            )
+        )
+        specialized_limit = max(n - minimum_core, 0)
+        if n_wall + n_lid > specialized_limit:
+            n_lid = max(specialized_limit - n_wall, 0)
+        n_core = n - n_wall - n_lid
+        return n_core, n_wall, n_lid
+
     def _sample_near_wall_numpy(self, n: int) -> np.ndarray:
         if n <= 0:
             return self.uniform_sampler.sample_numpy(0)
@@ -318,13 +357,35 @@ class ExperimentTrainer:
         points[:, 1] = y0 + eta * (y1 - y0)
         return points
 
+    def _sample_lid_interior_numpy(self, n: int) -> np.ndarray:
+        if n <= 0:
+            return self.uniform_sampler.sample_numpy(0)
+        cfg = dict(
+            self.config.get("sampling", {}).get("cavity_lid_interior_band", {})
+        )
+        x0, x1, y0, y1 = self.benchmark.bounds
+        corner_width = min(
+            max(float(cfg.get("corner_width", 0.05)), 0.0),
+            0.49,
+        )
+        y_min = min(max(float(cfg.get("y_min", 0.72)), 0.0), 1.0)
+        y_max = min(max(float(cfg.get("y_max", 0.98)), y_min), 1.0)
+        unit = self.uniform_sampler.sample_numpy(n)
+        xi = (unit[:, 0] - x0) / max(x1 - x0, 1e-12)
+        eta = (unit[:, 1] - y0) / max(y1 - y0, 1e-12)
+        points = unit.copy()
+        points[:, 0] = x0 + (
+            corner_width + (1.0 - 2.0 * corner_width) * xi
+        ) * (x1 - x0)
+        points[:, 1] = y0 + (y_min + (y_max - y_min) * eta) * (y1 - y0)
+        return points
+
     def _sample_interior_numpy(
         self,
         n: int,
         core_points: np.ndarray | None = None,
     ) -> np.ndarray:
-        n_wall = self._near_wall_sample_count(n)
-        n_core = int(n) - n_wall
+        n_core, n_wall, n_lid = self._interior_component_counts(n)
         if core_points is None:
             core_points = self.uniform_sampler.sample_numpy(n_core)
         if int(core_points.shape[0]) != n_core:
@@ -332,7 +393,16 @@ class ExperimentTrainer:
                 f"Expected {n_core} core collocation points, got {core_points.shape[0]}."
             )
         wall_points = self._sample_near_wall_numpy(n_wall)
-        return np.vstack([core_points, wall_points]) if n_wall else core_points
+        lid_points = self._sample_lid_interior_numpy(n_lid)
+        pieces = [points for points in (core_points, wall_points, lid_points) if points.size]
+        result = np.vstack(pieces) if pieces else self.uniform_sampler.sample_numpy(0)
+        total = max(int(n), 1)
+        self.last_interior_sampling_summary = {
+            "interior_core_fraction": float(n_core / total),
+            "interior_near_wall_fraction": float(n_wall / total),
+            "interior_lid_band_fraction": float(n_lid / total),
+        }
+        return result
 
     def _sample_interior(
         self,
@@ -595,6 +665,7 @@ class ExperimentTrainer:
             last_losses["learning_rate"] = learning_rate
             last_losses.update(self.current_cavity_curriculum)
             last_losses.update(self.last_boundary_sampling_summary)
+            last_losses.update(self.last_interior_sampling_summary)
             self.last_losses = dict(last_losses)
             if local_epoch % log_every == 0 or local_epoch == epochs - 1:
                 self.loss_logger.log({"cycle": cycle, "phase": log_prefix or "main", "epoch": self.global_step, **last_losses})
@@ -1326,7 +1397,7 @@ class ExperimentTrainer:
         started = time.perf_counter()
         if adaptive:
             priorities = control_state.sampling_priorities if control_state is not None else {}
-            n_core = n_f - self._near_wall_sample_count(n_f)
+            n_core, _n_wall, _n_lid = self._interior_component_counts(n_f)
             core = self.adaptive_sampler.sample_interior(
                 n_core, maps, coords, weak_regions, priorities
             )

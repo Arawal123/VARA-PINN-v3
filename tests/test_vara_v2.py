@@ -460,20 +460,23 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert config["optimizer"]["scheduler"]["total_steps"] == expected
         assert config["training"]["weights"]["continuity"] == pytest.approx(8.0)
         assert config["training"]["weights"]["bc"] == pytest.approx(0.0)
-        assert config["training"]["weights"]["bc_uvp_balanced"] == pytest.approx(30.0)
+        assert config["training"]["weights"]["bc_uvp_balanced"] == pytest.approx(27.0)
         assert all(
             config["training"]["weights"][name] == pytest.approx(0.0)
             for name in config["uvp_soft_bc"]["boundary_component_relative_weights"]
         )
-        assert config["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.04)
+        assert config["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.07)
         assert config["training"]["n_boundary"] == (384 if preset == "diagnostic" else 512)
         relative = config["losses"]["uvp_boundary_balance"]["relative_weights"]
         assert relative["bc_top_u"] > relative["bc_top_v"]
         assert relative["bc_bottom_u"] > relative["bc_bottom_v"]
         boundary_cfg = config["sampling"]["cavity_boundary"]
         assert boundary_cfg["mode"] == "focused"
-        assert boundary_cfg["lid_fraction"] == pytest.approx(0.25)
-        assert boundary_cfg["corner_fraction"] == pytest.approx(0.08)
+        assert boundary_cfg["lid_fraction"] == pytest.approx(0.31)
+        assert boundary_cfg["corner_fraction"] == pytest.approx(0.10)
+        lid_band = config["sampling"]["cavity_lid_interior_band"]
+        assert lid_band["enabled"]
+        assert lid_band["fraction"] == pytest.approx(0.20)
         assert config["benchmark_params"][
             "lid_corner_regularization_width"
         ] == pytest.approx(0.05)
@@ -492,13 +495,90 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert "continuity_residual_mean" in metrics
         assert "boundary_condition_error" in metrics
         assert "u_boundary_rmse" in metrics
+        assert "top_band_pde_residual_mean" in metrics
+        assert "top_band_momentum_u_mean" in metrics
+        assert "top_band_continuity_residual_mean" in metrics
         assert not any("rel_l2" in name for name in metrics)
+        assert not any(
+            token in name
+            for name in metrics
+            for token in ("topology", "primary_vortex", "center_error")
+        )
         assert not config["checkpoint"]["low_re_vortex_tiebreaker"]["enabled"]
+        pareto_metrics = repair["pareto_guard"]["metrics"]
+        assert "top_band_pde_residual_mean" in pareto_metrics
+        assert "top_band_continuity_residual_mean" in pareto_metrics
         trainer = object.__new__(VARATrainer)
         trainer.config = config
         assert trainer._compute_boundary_training_loss(
             config["training"]["weights"]
         )
+
+
+def test_uvp_lid_band_sampler_preserves_budget_and_is_formulation_specific(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": 100,
+                "n_boundary": 16,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    points = trainer._sample_interior_numpy(100)
+    assert points.shape == (100, 2)
+    assert trainer.last_interior_sampling_summary[
+        "interior_lid_band_fraction"
+    ] == pytest.approx(0.20)
+    assert trainer.last_interior_sampling_summary[
+        "interior_core_fraction"
+    ] >= 0.35
+
+    trainer.config["model"]["physics_formulation"] = "direct"
+    direct_points = trainer._sample_interior_numpy(100)
+    assert direct_points.shape == (100, 2)
+    assert trainer.last_interior_sampling_summary[
+        "interior_lid_band_fraction"
+    ] == pytest.approx(0.0)
+
+
+def test_uvp_top_band_metrics_are_reference_free_and_reported(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "validation": {"nx": 12, "ny": 12},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    _, _, coords = trainer.validation_grid()
+    metrics = trainer.evaluate_metrics(coords)
+    names = (
+        "top_band_pde_residual_mean",
+        "top_band_momentum_u_mean",
+        "top_band_momentum_v_mean",
+        "top_band_continuity_residual_mean",
+        "upper_core_pde_residual_mean",
+        "core_speed_mean",
+        "upper_core_speed_mean",
+        "weak_secondary_vortex_count",
+        "primary_vortex_y",
+        "primary_vortex_wall_distance",
+    )
+    assert all(name in metrics for name in names)
+    assert all(np.isfinite(float(metrics[name])) for name in names)
 
 
 def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
@@ -1446,6 +1526,9 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
         "boundary_condition_error": 0.0,
         "near_wall_pde_residual_mean": 1.0,
         "near_wall_momentum_v_mean": 1.0,
+        "top_band_pde_residual_mean": 1.0,
+        "top_band_momentum_u_mean": 1.0,
+        "top_band_continuity_residual_mean": 1.0,
         "omega_abs_95p": 1.0,
         "speed_pred_max": 1.0,
     }
@@ -1463,6 +1546,15 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
     assert trainer._checkpoint_score(
         {**metrics, "boundary_condition_error": 1.0}
     ) == pytest.approx(below_gate + 0.75)
+    assert trainer._checkpoint_score(
+        {**metrics, "top_band_pde_residual_mean": 2.0}
+    ) == pytest.approx(below_gate + 0.75)
+    assert trainer._checkpoint_score(
+        {**metrics, "top_band_momentum_u_mean": 2.0}
+    ) == pytest.approx(below_gate + 0.5)
+    assert trainer._checkpoint_score(
+        {**metrics, "top_band_continuity_residual_mean": 2.0}
+    ) == pytest.approx(below_gate + 0.5)
     assert trainer._checkpoint_score(
         {**metrics, "u_rel_l2": 1000.0, "velocity_full_rel_l2": 1000.0}
     ) == pytest.approx(below_gate)
