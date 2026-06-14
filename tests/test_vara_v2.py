@@ -692,6 +692,43 @@ def test_lifted_uvp_regional_losses_use_only_pde_residuals():
     assert not any("reference" in name for name in pointwise)
 
 
+def test_sparse_cfd_polish_regional_losses_are_reference_free():
+    class SoftUVPModel:
+        physics_formulation = "cavity_uvp_soft_bc"
+
+    coords = torch.tensor(
+        [[0.5, 0.8], [0.5, 0.65], [0.9, 0.5]],
+        dtype=torch.float64,
+    )
+    residuals = {
+        "coords": coords,
+        "f_u": torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float64),
+        "f_v": torch.tensor([[0.5], [0.5], [0.5]], dtype=torch.float64),
+        "f_c": torch.tensor([[0.2], [0.3], [0.4]], dtype=torch.float64),
+        "u": torch.zeros((3, 1), dtype=torch.float64),
+        "v": torch.zeros((3, 1), dtype=torch.float64),
+    }
+    pointwise = {}
+    _add_reference_free_regularizers(
+        pointwise,
+        SoftUVPModel(),
+        coords,
+        residuals,
+        {
+            "domain_bounds": (0.0, 1.0, 0.0, 1.0),
+            "uvp_regional_residuals": {"enabled": True},
+        },
+    )
+    assert pointwise["top_band_continuity"].item() == pytest.approx(0.04)
+    assert pointwise["top_band_pde"].item() == pytest.approx(1.29)
+    assert pointwise["upper_core_pde"].shape[0] == 2
+    assert not any(
+        token in name
+        for name in pointwise
+        for token in ("cfd", "reference", "topology", "vortex")
+    )
+
+
 def test_uvp_lift_circulation_sampler_preserves_budget_and_is_formulation_specific(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     config = deep_update(
@@ -960,6 +997,8 @@ def test_sparse_cfd_polish_is_opt_in_and_changes_only_polish_settings():
     assert sparse["training"]["weights"]["cfd_velocity_mse"] == pytest.approx(3.0)
     assert sparse["training"]["weights"]["cfd_u_mse"] == pytest.approx(0.0)
     assert sparse["training"]["weights"]["cfd_v_mse"] == pytest.approx(0.0)
+    assert sparse["training"]["weights"]["top_band_continuity"] == pytest.approx(0.0)
+    assert not sparse["losses"]["uvp_regional_residuals"]["enabled"]
 
     assert polish["data_supervision"]["mode"] == "sparse_cfd_polish"
     assert polish["data_supervision"]["cfd"]["sampling"]["mode"] == "mixed"
@@ -976,6 +1015,10 @@ def test_sparse_cfd_polish_is_opt_in_and_changes_only_polish_settings():
     assert polish["training"]["weights"]["cfd_velocity_mse"] == pytest.approx(0.0)
     assert polish["training"]["weights"]["cfd_u_mse"] == pytest.approx(3.0)
     assert polish["training"]["weights"]["cfd_v_mse"] == pytest.approx(3.9)
+    assert polish["training"]["weights"]["top_band_continuity"] == pytest.approx(0.35)
+    assert polish["training"]["weights"]["top_band_pde"] == pytest.approx(0.15)
+    assert polish["training"]["weights"]["upper_core_pde"] == pytest.approx(0.10)
+    assert polish["losses"]["uvp_regional_residuals"]["enabled"]
     assert (
         polish["losses"]["uvp_boundary_balance"]["relative_weights"]["bc_top_u"]
         == pytest.approx(
@@ -986,7 +1029,7 @@ def test_sparse_cfd_polish_is_opt_in_and_changes_only_polish_settings():
         )
     )
     repair = polish["optimizer"]["final_repair"]
-    assert repair["epochs"] == 4
+    assert repair["epochs"] == 6
     assert repair["pareto_guard"]["metrics"] == [
         "pde_residual_mean",
         "momentum_residual_mean",
@@ -995,9 +1038,17 @@ def test_sparse_cfd_polish_is_opt_in_and_changes_only_polish_settings():
         "cfd_velocity_mse_sparse",
         "speed_pred_max",
     ]
+    assert repair["weights"]["top_band_continuity"] == pytest.approx(0.35)
+    assert repair["weights"]["top_band_pde"] == pytest.approx(0.15)
+    assert repair["weights"]["upper_core_pde"] == pytest.approx(0.10)
+    checkpoint_metrics = polish["checkpoint"]["reference_free_metrics"]
+    assert "continuity_residual_mean" in checkpoint_metrics
+    assert "top_band_continuity_residual_mean" in checkpoint_metrics
+    assert "boundary_condition_error" in checkpoint_metrics
+    assert "cfd_velocity_mse_sparse" in checkpoint_metrics
     assert not any(
         token in name
-        for name in polish["checkpoint"]["reference_free_metrics"]
+        for name in checkpoint_metrics
         for token in ("full", "topology", "vortex", "center", "ghia")
     )
 

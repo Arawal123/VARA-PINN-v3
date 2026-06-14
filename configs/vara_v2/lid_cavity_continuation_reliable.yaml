@@ -29,7 +29,10 @@ data_supervision:
     continuity_multiplier: 1.12
     cfd_u_weight: 3.0
     cfd_v_weight: 3.9
-    final_repair_steps: 4
+    top_band_continuity_weight: 0.35
+    top_band_pde_weight: 0.15
+    upper_core_pde_weight: 0.10
+    final_repair_steps: 6
 
 uvp_velocity_lift:
   continuity_weight: 11.0

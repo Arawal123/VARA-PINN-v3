@@ -254,7 +254,7 @@ def _add_reference_free_regularizers(
     regional_cfg = dict(cfg.get("uvp_regional_residuals", {}))
     if (
         getattr(model, "physics_formulation", "")
-        == "cavity_uvp_velocity_lift"
+        in {"cavity_uvp_velocity_lift", "cavity_uvp_soft_bc"}
         and bool(regional_cfg.get("enabled", False))
     ):
         x0, x1, y0, y1 = tuple(

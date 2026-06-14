@@ -956,6 +956,17 @@ def _apply_re_aware_cavity_settings(
             "cfd_velocity_mse_sparse",
             "speed_pred_max",
         ]
+        checkpoint_metrics = [
+            "pde_residual_mean",
+            "momentum_residual_mean",
+            "continuity_residual_mean",
+            "core_pde_residual_mean",
+            "boundary_condition_error",
+            "top_band_continuity_residual_mean",
+            "top_band_pde_residual_mean",
+            "upper_core_pde_residual_mean",
+            "cfd_velocity_mse_sparse",
+        ]
         materialized = deep_update(
             materialized,
             {
@@ -980,12 +991,39 @@ def _apply_re_aware_cavity_settings(
                         "cfd_v_mse": float(
                             polish.get("cfd_v_weight", 3.9)
                         ),
+                        "top_band_continuity": float(
+                            polish.get(
+                                "top_band_continuity_weight", 0.35
+                            )
+                        ),
+                        "top_band_pde": float(
+                            polish.get("top_band_pde_weight", 0.15)
+                        ),
+                        "upper_core_pde": float(
+                            polish.get("upper_core_pde_weight", 0.10)
+                        ),
                     }
                 },
                 "losses": {
                     "uvp_boundary_balance": {
                         "relative_weights": relative_weights,
-                    }
+                    },
+                    "uvp_regional_residuals": {"enabled": True},
+                },
+                "checkpoint": {
+                    "reference_free_metrics": checkpoint_metrics,
+                    "metric_weights": {
+                        "pde_residual_mean": 1.5,
+                        "momentum_residual_mean": 1.5,
+                        "continuity_residual_mean": 2.0,
+                        "core_pde_residual_mean": 1.25,
+                        "boundary_condition_error": 1.0,
+                        "top_band_continuity_residual_mean": 1.25,
+                        "top_band_pde_residual_mean": 0.5,
+                        "upper_core_pde_residual_mean": 0.25,
+                        "cfd_velocity_mse_sparse": 1.0,
+                    },
+                    "low_re_vortex_tiebreaker": {"enabled": False},
                 },
                 "optimizer": {
                     "final_repair": {
@@ -1001,15 +1039,13 @@ def _apply_re_aware_cavity_settings(
                                 materialized["training"]["weights"][
                                     "continuity"
                                 ]
-                            )
-                            * continuity_multiplier,
+                            ),
                             "bc": 0.0,
                             "bc_uvp_balanced": float(
                                 materialized["training"]["weights"][
                                     "bc_uvp_balanced"
                                 ]
-                            )
-                            * boundary_multiplier,
+                            ),
                             "cfd_velocity_mse": 0.0,
                             "cfd_u_mse": float(
                                 polish.get("cfd_u_weight", 3.0)
@@ -1022,10 +1058,18 @@ def _apply_re_aware_cavity_settings(
                                     "raw_pde_tail", 0.04
                                 )
                             ),
-                            "top_band_pde": 0.0,
+                            "top_band_pde": float(
+                                polish.get("top_band_pde_weight", 0.15)
+                            ),
                             "top_band_momentum_u": 0.0,
-                            "top_band_continuity": 0.0,
-                            "upper_core_pde": 0.0,
+                            "top_band_continuity": float(
+                                polish.get(
+                                    "top_band_continuity_weight", 0.35
+                                )
+                            ),
+                            "upper_core_pde": float(
+                                polish.get("upper_core_pde_weight", 0.10)
+                            ),
                             "right_wall_interior_pde": 0.0,
                             "lower_core_pde": 0.0,
                             "speed_cap": 0.0,
