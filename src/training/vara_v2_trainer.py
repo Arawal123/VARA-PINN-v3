@@ -658,11 +658,14 @@ class VARAV2Trainer(ExperimentTrainer):
             xy_f_np = self._sample_interior_numpy(n_f)
         else:
             circulation = self._circulation_band_counts(n_f)
-            n_available = (
-                circulation["uniform"]
-                if circulation is not None
-                else n_f - self._near_wall_sample_count(n_f)
-            )
+            if circulation is not None:
+                n_available = circulation["uniform"]
+                expected_label = "uniform"
+            else:
+                n_available, _n_wall, _n_lid = (
+                    self._interior_component_counts(n_f)
+                )
+                expected_label = "core"
             uniform_mass = float(self.v2_config.min_uniform_mass)
             n_uniform = int(round(n_available * uniform_mass))
             n_adaptive = n_available - n_uniform
@@ -677,6 +680,12 @@ class VARAV2Trainer(ExperimentTrainer):
                     )
                 )
             core_points = np.vstack(pieces)
+            if int(core_points.shape[0]) != n_available:
+                raise ValueError(
+                    "VARA V2 adaptive resampling produced "
+                    f"{core_points.shape[0]} {expected_label} points; "
+                    f"expected {n_available} for n_collocation={n_f}."
+                )
             xy_f_np = self._sample_interior_numpy(n_f, core_points)
             self.adaptive_sampler.rng.shuffle(xy_f_np)
         xy_f = torch.tensor(xy_f_np, dtype=torch.float32, device=self.device)

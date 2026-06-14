@@ -729,6 +729,137 @@ def test_sparse_cfd_polish_regional_losses_are_reference_free():
     )
 
 
+def _small_cavity_trainer_config(
+    tmp_path,
+    *,
+    data_supervision_mode: str = "pure_pinn",
+    n_collocation: int = 100,
+):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    reference_path = tmp_path / f"{data_supervision_mode}_cfd.npz"
+    if data_supervision_mode != "pure_pinn":
+        _write_toy_cfd(reference_path)
+        base = _apply_data_supervision_settings(
+            base,
+            mode=data_supervision_mode,
+            sample_count=20,
+            cfd_seed=7,
+        )
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": n_collocation,
+                "n_boundary": 8,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "validation": {"nx": 8, "ny": 8},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    if data_supervision_mode != "pure_pinn":
+        config = deep_update(
+            config,
+            {
+                "benchmark_params": {
+                    "full_field_reference_path": str(reference_path),
+                    "profile_only": False,
+                },
+                "data_supervision": {"reference_path": str(reference_path)},
+            },
+        )
+    return config
+
+
+def _force_non_neutral_v2_sampling(trainer):
+    count = trainer.patch_grid.num_patches
+    mass = np.full(count, 1.0 / count, dtype=float)
+    mass[0] += 0.05
+    mass[1:] -= 0.05 / (count - 1)
+    trainer.v2_controller.state.sampling_mass = mass
+
+
+def test_vara_v2_resample_sparse_cfd_polish_uses_exact_soft_bc_core_count(
+    tmp_path,
+):
+    config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path,
+            data_supervision_mode="sparse_cfd_polish",
+        ),
+        {"experiments": {"root": str(tmp_path / "vara"), "flat_layout": True}},
+    )
+    trainer = VARAV2Trainer(config)
+    assert trainer.model.physics_formulation == "cavity_uvp_soft_bc"
+    assert trainer._circulation_band_counts(100) is None
+    expected_core, expected_wall, expected_lid = trainer._interior_component_counts(
+        100
+    )
+    assert expected_wall > 0
+    assert expected_lid > 0
+
+    captured = {}
+    sample_interior = trainer._sample_interior_numpy
+
+    def capture_core_points(n, core_points=None):
+        captured["count"] = None if core_points is None else core_points.shape[0]
+        return sample_interior(n, core_points)
+
+    trainer._sample_interior_numpy = capture_core_points
+    _force_non_neutral_v2_sampling(trainer)
+    _, _, coords = trainer.validation_grid()
+    batch = trainer._resample_v2_batch({}, coords)
+
+    assert batch["xy_f"].shape[0] == 100
+    assert captured["count"] == expected_core
+
+
+def test_vara_v2_resample_preserves_velocity_lift_circulation_uniform_count(
+    tmp_path,
+):
+    config = deep_update(
+        _small_cavity_trainer_config(tmp_path),
+        {"experiments": {"root": str(tmp_path / "lift"), "flat_layout": True}},
+    )
+    trainer = VARAV2Trainer(config)
+    circulation = trainer._circulation_band_counts(100)
+    assert trainer.model.physics_formulation == "cavity_uvp_velocity_lift"
+    assert circulation is not None
+
+    captured = {}
+    sample_interior = trainer._sample_interior_numpy
+
+    def capture_core_points(n, core_points=None):
+        captured["count"] = None if core_points is None else core_points.shape[0]
+        return sample_interior(n, core_points)
+
+    trainer._sample_interior_numpy = capture_core_points
+    _force_non_neutral_v2_sampling(trainer)
+    _, _, coords = trainer.validation_grid()
+    batch = trainer._resample_v2_batch({}, coords)
+
+    assert batch["xy_f"].shape[0] == 100
+    assert captured["count"] == circulation["uniform"]
+
+
+def test_vanilla_sparse_cfd_interior_sampling_is_unchanged(tmp_path):
+    config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path,
+            data_supervision_mode="sparse_cfd",
+        ),
+        {"experiments": {"root": str(tmp_path / "vanilla"), "flat_layout": True}},
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    points = trainer._sample_interior_numpy(100)
+
+    assert trainer.model.physics_formulation == "cavity_uvp_soft_bc"
+    assert points.shape == (100, 2)
+
+
 def test_uvp_lift_circulation_sampler_preserves_budget_and_is_formulation_specific(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     config = deep_update(
