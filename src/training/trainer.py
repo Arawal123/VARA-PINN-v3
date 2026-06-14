@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 
 from src.diagnostics import DiagnosticMapBuilder, PatchGrid, PatchScorer, WeakRegionDetector
+from src.data import build_cavity_cfd_supervision
 from src.evaluation.metrics import evaluate_on_grid
 from src.losses.base_losses import compute_global_losses, compute_pointwise_losses, weighted_sum
 from src.losses.local_losses import compute_local_weighted_loss
@@ -168,6 +169,11 @@ class ExperimentTrainer:
             self.seed + 2,
             mixture=sampler_cfg.get("mixture"),
             uniform_engine=uniform_engine,
+        )
+        self.cfd_supervision = build_cavity_cfd_supervision(
+            config,
+            self.benchmark.bounds,
+            self.device,
         )
         self._initialize_continuation_replay()
 
@@ -504,6 +510,8 @@ class ExperimentTrainer:
 
     def _sample_data(self, n: int) -> torch.Tensor:
         """Sample reference data; time-dependent benchmarks use initial data only."""
+        if self.cfd_supervision is not None:
+            return self.cfd_supervision.coords
         points = self.uniform_sampler.sample(n)
         t_bounds = getattr(self.benchmark, "t_bounds", None)
         if t_bounds is not None and n > 0 and points.shape[1] >= 3:
@@ -541,6 +549,13 @@ class ExperimentTrainer:
         }
 
     def make_batch(self, xy_f: torch.Tensor, xy_bc: torch.Tensor, xy_data: torch.Tensor) -> dict[str, Any]:
+        if self.cfd_supervision is not None:
+            return {
+                "xy_f": xy_f,
+                "xy_bc": xy_bc,
+                "xy_data": self.cfd_supervision.coords,
+                "targets_data": self.cfd_supervision.targets,
+            }
         with torch.no_grad():
             targets = self.benchmark.exact_torch(xy_data)
         return {"xy_f": xy_f, "xy_bc": xy_bc, "xy_data": xy_data, "targets_data": targets}
@@ -569,6 +584,8 @@ class ExperimentTrainer:
             residual_interior_only=self.residual_interior_only(),
             runtime_profile=profile,
         )
+        if self.cfd_supervision is not None:
+            metrics.update(self._cfd_sparse_metrics())
         self._record_runtime(
             "evaluation_detail",
             0.0,
@@ -657,6 +674,8 @@ class ExperimentTrainer:
             + metrics["momentum_residual_mean"]
             + metrics["boundary_condition_error"]
         )
+        if self.cfd_supervision is not None:
+            metrics.update(self._cfd_sparse_metrics())
         metrics["controller_reference_metrics_enabled"] = False
         self._record_runtime(
             "validation",
@@ -839,6 +858,11 @@ class ExperimentTrainer:
     def _active_loss_config(self) -> dict[str, Any]:
         cfg = deepcopy(dict(self.config.get("losses", {})))
         cfg["domain_bounds"] = tuple(self.benchmark.bounds)
+        cfg["cfd_supervision_mode"] = str(
+            self.config.get("data_supervision", {}).get(
+                "mode", "pure_pinn"
+            )
+        )
         curriculum = dict(cfg.get("near_wall_momentum", {}))
         stages = list(curriculum.get("stages", []))
         if bool(curriculum.get("enabled", False)) and stages:
@@ -863,6 +887,32 @@ class ExperimentTrainer:
                 }
             )
         return cfg
+
+    def _cfd_sparse_metrics(self) -> dict[str, Any]:
+        assert self.cfd_supervision is not None
+        self.model.eval()
+        coords = self.cfd_supervision.coords
+        targets = self.cfd_supervision.targets
+        with torch.enable_grad():
+            prediction = self.model(coords)
+            u_mse = torch.mean(
+                (prediction[:, 0:1] - targets["u"]).pow(2)
+            )
+            v_mse = torch.mean(
+                (prediction[:, 1:2] - targets["v"]).pow(2)
+            )
+        return {
+            "cfd_sparse_sample_count": self.cfd_supervision.sample_count,
+            "cfd_sparse_sample_fraction": self.cfd_supervision.sample_fraction,
+            "cfd_sparse_seed": self.cfd_supervision.seed,
+            "cfd_sparse_pool_hash": self.cfd_supervision.pool_hash,
+            "cfd_sparse_source_path": self.cfd_supervision.source_path,
+            "cfd_velocity_mse_sparse": float(
+                (u_mse + v_mse).detach().cpu()
+            ),
+            "cfd_u_mse_sparse": float(u_mse.detach().cpu()),
+            "cfd_v_mse_sparse": float(v_mse.detach().cpu()),
+        }
 
     def _compute_boundary_training_loss(self, weights: dict[str, float]) -> bool:
         train_cfg = dict(self.config.get("training", {}))
@@ -1554,6 +1604,37 @@ class ExperimentTrainer:
         metrics["has_reference"] = bool(getattr(self.benchmark, "has_reference", True))
         metrics["run_type"] = str(self.config.get("run_type", "full"))
         model_cfg = self.config.get("model", {})
+        supervision_cfg = dict(self.config.get("data_supervision", {}))
+        metrics["cfd_supervision_mode"] = str(
+            supervision_cfg.get("mode", "pure_pinn")
+        )
+        metrics["cfd_supervision_is_oracle"] = bool(
+            metrics["cfd_supervision_mode"] == "full_cfd_oracle"
+        )
+        if self.cfd_supervision is None:
+            metrics["cfd_sparse_sample_count"] = 0
+            metrics["cfd_sparse_sample_fraction"] = 0.0
+            metrics["cfd_sparse_seed"] = int(
+                supervision_cfg.get("seed", self.seed)
+            )
+            metrics["cfd_sparse_pool_hash"] = ""
+            metrics["cfd_velocity_mse_sparse"] = float("nan")
+            metrics["cfd_u_mse_sparse"] = float("nan")
+            metrics["cfd_v_mse_sparse"] = float("nan")
+        else:
+            metrics.update(self._cfd_sparse_metrics())
+        metrics["cfd_velocity_full_rel_l2_eval_only"] = metrics.get(
+            "velocity_full_rel_l2", float("nan")
+        )
+        metrics["cfd_u_full_rel_l2_eval_only"] = metrics.get(
+            "u_full_rel_l2", float("nan")
+        )
+        metrics["cfd_v_full_rel_l2_eval_only"] = metrics.get(
+            "v_full_rel_l2", float("nan")
+        )
+        metrics["cfd_omega_full_rel_l2_eval_only"] = metrics.get(
+            "omega_full_rel_l2", float("nan")
+        )
         metrics["model_architecture"] = str(model_cfg.get("architecture", "mlp"))
         metrics["physics_formulation"] = str(model_cfg.get("physics_formulation", "direct"))
         if metrics["physics_formulation"] == "cavity_uvp_velocity_lift":

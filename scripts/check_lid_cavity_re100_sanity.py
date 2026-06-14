@@ -43,6 +43,16 @@ def main() -> None:
         help="Optional multi-seed gate. If omitted, --seed is used.",
     )
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--data_supervision",
+        choices=["pure_pinn", "sparse_cfd", "full_cfd_oracle"],
+        default="pure_pinn",
+    )
+    parser.add_argument("--cfd_sample_fraction", type=float, default=0.01)
+    parser.add_argument("--cfd_sample_count", type=int, default=None)
+    parser.add_argument("--cfd_seed", type=int, default=None)
+    parser.add_argument("--cfd_include_pressure", action="store_true")
+    parser.add_argument("--cfd_include_vorticity", action="store_true")
     parser.add_argument("--config", default="configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     parser.add_argument(
         "--preset",
@@ -55,7 +65,7 @@ def main() -> None:
     parser.add_argument("--report_path", default=None)
     parser.add_argument(
         "--full_field_reference_map",
-        default=None,
+        default="data/references/lid_driven_cavity/full_field/reference_map.csv",
         help="Optional CSV/JSON map. Full-field gates are applied only when a Re=100 reference is supplied.",
     )
     args = parser.parse_args()
@@ -114,6 +124,14 @@ def _run_methods(
         preset=args.preset,
         gate_vara_on_vanilla=True,
         overwrite=overwrite or bool(args.overwrite),
+        cavity_base_formulation=None,
+        data_supervision=args.data_supervision,
+        cfd_sample_fraction=args.cfd_sample_fraction,
+        cfd_sample_count=args.cfd_sample_count,
+        cfd_seed=args.cfd_seed,
+        cfd_include_pressure=args.cfd_include_pressure,
+        cfd_include_vorticity=args.cfd_include_vorticity,
+        disable_stabilizers=False,
     )
     run_v2_continuation(run_args)
 

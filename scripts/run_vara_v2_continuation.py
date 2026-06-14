@@ -62,6 +62,16 @@ def main() -> None:
         default="data/references/lid_driven_cavity/full_field/reference_map.csv",
     )
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--data_supervision",
+        choices=["pure_pinn", "sparse_cfd", "full_cfd_oracle"],
+        default="pure_pinn",
+    )
+    parser.add_argument("--cfd_sample_fraction", type=float, default=0.01)
+    parser.add_argument("--cfd_sample_count", type=int, default=None)
+    parser.add_argument("--cfd_seed", type=int, default=None)
+    parser.add_argument("--cfd_include_pressure", action="store_true")
+    parser.add_argument("--cfd_include_vorticity", action="store_true")
     parser.add_argument("--output_dir", default="experiments/vara_v2/re_continuation")
     parser.add_argument("--enhanced_backbone", action="store_true")
     parser.add_argument(
@@ -122,6 +132,20 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     cavity_base_formulation = getattr(args, "cavity_base_formulation", None)
     if cavity_base_formulation:
         base["cavity_base_formulation"] = str(cavity_base_formulation)
+    base = _apply_data_supervision_settings(
+        base,
+        mode=str(getattr(args, "data_supervision", "pure_pinn")),
+        sample_fraction=float(getattr(args, "cfd_sample_fraction", 0.01)),
+        sample_count=getattr(args, "cfd_sample_count", None),
+        cfd_seed=getattr(args, "cfd_seed", None),
+        include_pressure=bool(
+            getattr(args, "cfd_include_pressure", False)
+        ),
+        include_vorticity=bool(
+            getattr(args, "cfd_include_vorticity", False)
+        ),
+        formulation_explicit=bool(cavity_base_formulation),
+    )
     if bool(getattr(args, "disable_stabilizers", False)):
         base = _without_cavity_stabilizers(base)
     if args.enhanced_backbone:
@@ -224,6 +248,12 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     "reference_path": reference.get("reference_path"),
                     "full_field_reference_path": str(full_field) if full_field is not None else None,
                     "profile_only": full_field is None,
+                }
+                config["data_supervision"] = {
+                    **config.get("data_supervision", {}),
+                    "reference_path": (
+                        str(full_field) if full_field is not None else None
+                    ),
                 }
                 config["warm_start_checkpoint"] = str(previous[method]) if previous[method] else None
                 config["warm_start"] = {"load_optimizer": False}
@@ -379,6 +409,51 @@ def _load_base_config(config_path: str | Path) -> dict[str, Any]:
         return config
     default_base = load_config("configs/vara_v2/lid_driven_cavity.yaml")
     return deep_update(default_base, config)
+
+
+def _apply_data_supervision_settings(
+    config: dict[str, Any],
+    *,
+    mode: str,
+    sample_fraction: float = 0.01,
+    sample_count: int | None = None,
+    cfd_seed: int | None = None,
+    include_pressure: bool = False,
+    include_vorticity: bool = False,
+    formulation_explicit: bool = False,
+) -> dict[str, Any]:
+    mode = str(mode).lower()
+    if mode not in {"pure_pinn", "sparse_cfd", "full_cfd_oracle"}:
+        raise ValueError(f"Unsupported data supervision mode: {mode}")
+    resolved = deep_update(
+        config,
+        {
+            "data_supervision": {
+                "mode": mode,
+                "sample_fraction": float(sample_fraction),
+                "sample_count": (
+                    None if sample_count is None else int(sample_count)
+                ),
+                "seed": int(
+                    config.get("seed", 0) if cfd_seed is None else cfd_seed
+                ),
+                "include_pressure": bool(include_pressure),
+                "include_vorticity": bool(include_vorticity),
+                "formulation_explicit_override": bool(
+                    formulation_explicit
+                ),
+                "oracle": mode == "full_cfd_oracle",
+                "oracle_label": (
+                    "upper_bound_only"
+                    if mode == "full_cfd_oracle"
+                    else ""
+                ),
+            }
+        },
+    )
+    if mode == "sparse_cfd" and not formulation_explicit:
+        resolved["cavity_base_formulation"] = "uvp_soft_bc"
+    return resolved
 
 
 def _apply_re_aware_cavity_settings(
@@ -582,7 +657,7 @@ def _apply_re_aware_cavity_settings(
         "stages", []
     ):
         collocation_stages.append({**stage, "n_boundary": boundary_count})
-    return deep_update(
+    materialized = deep_update(
         resolved,
         {
             "model": {
@@ -764,6 +839,71 @@ def _apply_re_aware_cavity_settings(
             "continuation_validity": uvp_validity,
         },
     )
+    supervision = dict(materialized.get("data_supervision", {}))
+    supervision_mode = str(supervision.get("mode", "pure_pinn"))
+    if supervision_mode in {"sparse_cfd", "full_cfd_oracle"}:
+        include_pressure = bool(supervision.get("include_pressure", False))
+        include_vorticity = bool(
+            supervision.get("include_vorticity", False)
+        )
+        sparse_metrics = [
+            "pde_residual_mean",
+            "momentum_residual_mean",
+            "continuity_residual_mean",
+            "core_pde_residual_mean",
+            "boundary_condition_error",
+            "cfd_velocity_mse_sparse",
+        ]
+        materialized = deep_update(
+            materialized,
+            {
+                "training": {
+                    "weights": {
+                        "continuity": float(
+                            supervision.get(
+                                "sparse_continuity_weight", 6.0
+                            )
+                        ),
+                        "cfd_velocity_mse": float(
+                            supervision.get(
+                                "sparse_cfd_velocity_weight", 3.0
+                            )
+                        ),
+                        "cfd_u_mse": 0.0,
+                        "cfd_v_mse": 0.0,
+                        "cfd_p_mse": 1.0 if include_pressure else 0.0,
+                        "cfd_omega_mse": (
+                            1.0 if include_vorticity else 0.0
+                        ),
+                        "raw_pde_tail": float(
+                            supervision.get(
+                                "sparse_raw_pde_tail_weight", 0.04
+                            )
+                        ),
+                    }
+                },
+                "checkpoint": {
+                    "reference_free_metrics": sparse_metrics,
+                    "metric_weights": {
+                        "pde_residual_mean": 1.5,
+                        "momentum_residual_mean": 1.5,
+                        "continuity_residual_mean": 1.5,
+                        "core_pde_residual_mean": 1.5,
+                        "boundary_condition_error": 0.5,
+                        "cfd_velocity_mse_sparse": 1.0,
+                    },
+                    "low_re_vortex_tiebreaker": {"enabled": False},
+                },
+                "optimizer": {
+                    "final_repair": {
+                        "pareto_guard": {
+                            "metrics": sparse_metrics,
+                        }
+                    }
+                },
+            },
+        )
+    return materialized
 
 
 def _validate_reliable_config(

@@ -8,12 +8,14 @@ import pytest
 import torch
 
 from scripts.run_vara_v2_continuation import (
+    _apply_data_supervision_settings,
     _apply_re_aware_cavity_settings,
     _continuation_validity,
     _load_base_config,
     _validate_reliable_config,
     _without_cavity_stabilizers,
 )
+from src.data import build_cavity_cfd_supervision
 from scripts.check_lid_cavity_re100_sanity import build_report
 from src.controllers import V2ControllerConfig, VARAV2Controller
 from src.evaluation.metrics import evaluate_on_grid
@@ -80,6 +82,84 @@ def test_mean_pointwise_reduction_does_not_square_squared_losses_again():
     legacy = compute_global_losses(pointwise, reduction="legacy_mse")
     assert corrected["pde"].item() == pytest.approx(2.5)
     assert legacy["pde"].item() == pytest.approx(8.5)
+
+
+def _write_toy_cfd(path):
+    axis = np.linspace(0.0, 1.0, 11)
+    x, y = np.meshgrid(axis, axis)
+    np.savez(
+        path,
+        x=x.reshape(-1),
+        y=y.reshape(-1),
+        u=(x + y).reshape(-1),
+        v=(x - y).reshape(-1),
+        omega=np.ones(x.size),
+    )
+
+
+def test_sparse_cfd_sampler_is_deterministic_and_excludes_boundaries_and_corners(tmp_path):
+    path = tmp_path / "cfd.npz"
+    _write_toy_cfd(path)
+    config = {
+        "seed": 9,
+        "benchmark_params": {"full_field_reference_path": str(path)},
+        "data_supervision": {
+            "mode": "sparse_cfd",
+            "sample_count": 20,
+            "seed": 17,
+            "exclude_near_corners": True,
+            "corner_margin": 0.15,
+        },
+    }
+    first = build_cavity_cfd_supervision(
+        config, (0.0, 1.0, 0.0, 1.0), torch.device("cpu")
+    )
+    second = build_cavity_cfd_supervision(
+        config, (0.0, 1.0, 0.0, 1.0), torch.device("cpu")
+    )
+    assert first is not None and second is not None
+    assert torch.equal(first.coords, second.coords)
+    assert first.pool_hash == second.pool_hash
+    coords = first.coords.numpy()
+    assert np.all((coords > 0.0) & (coords < 1.0))
+    near_x = (coords[:, 0] < 0.15) | (coords[:, 0] > 0.85)
+    near_y = (coords[:, 1] < 0.15) | (coords[:, 1] > 0.85)
+    assert not np.any(near_x & near_y)
+
+
+def test_sparse_cfd_velocity_loss_is_correct_on_toy_data():
+    class ToyModel(torch.nn.Module):
+        def forward(self, coords):
+            u = coords[:, 0:1] + 1.0 + 0.0 * coords[:, 0:1].pow(3)
+            v = coords[:, 1:2] - 2.0 + 0.0 * coords[:, 1:2].pow(3)
+            p = coords[:, 0:1] * 0.0
+            return torch.cat([u, v, p], dim=1)
+
+    benchmark = LidDrivenCavityQualitative(reynolds=100.0)
+    xy_f = torch.tensor(
+        [[0.25, 0.25], [0.75, 0.75]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    xy_data = torch.tensor([[0.2, 0.3], [0.4, 0.5]])
+    pointwise = compute_pointwise_losses(
+        ToyModel(),
+        {
+            "xy_f": xy_f,
+            "xy_bc": torch.empty((0, 2)),
+            "xy_data": xy_data,
+            "targets_data": {
+                "u": xy_data[:, 0:1],
+                "v": xy_data[:, 1:2],
+            },
+        },
+        benchmark,
+        regularization_config={"cfd_supervision_mode": "sparse_cfd"},
+        compute_boundary_loss=False,
+    )
+    assert pointwise["cfd_u_mse"].mean().item() == pytest.approx(1.0)
+    assert pointwise["cfd_v_mse"].mean().item() == pytest.approx(4.0)
+    assert pointwise["cfd_velocity_mse"].mean().item() == pytest.approx(5.0)
 
 
 def test_loss_normalization_equalizes_selected_terms(tmp_path):
@@ -676,6 +756,107 @@ def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
     ]
 
 
+def test_sparse_cfd_pool_is_identical_for_vanilla_and_vara(tmp_path):
+    path = tmp_path / "cfd.npz"
+    _write_toy_cfd(path)
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base = _apply_data_supervision_settings(
+        base,
+        mode="sparse_cfd",
+        sample_count=24,
+        cfd_seed=33,
+    )
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "benchmark_params": {
+                "full_field_reference_path": str(path),
+                "profile_only": False,
+            },
+            "data_supervision": {"reference_path": str(path)},
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": 8,
+                "n_boundary": 8,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    vanilla = VARATrainer(
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "vanilla"), "flat_layout": True}},
+        ),
+        mode="vanilla",
+    )
+    vara = VARAV2Trainer(
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "vara"), "flat_layout": True}},
+        )
+    )
+    assert vanilla.cfd_supervision is not None
+    assert vara.cfd_supervision is not None
+    assert torch.equal(
+        vanilla.cfd_supervision.coords, vara.cfd_supervision.coords
+    )
+    assert vanilla.cfd_supervision.pool_hash == vara.cfd_supervision.pool_hash
+
+
+def test_pure_pinn_creates_no_cfd_supervision_tensors(tmp_path):
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "model": {"hidden_layers": [8, 8]},
+            "experiments": {"root": str(tmp_path), "flat_layout": True},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    trainer = VARATrainer(config, mode="vanilla")
+    assert trainer.cfd_supervision is None
+    assert config["data_supervision"]["mode"] == "pure_pinn"
+
+
+def test_sparse_cfd_cli_config_prefers_soft_uvp_and_labels_oracle():
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    sparse = _apply_data_supervision_settings(
+        base,
+        mode="sparse_cfd",
+        sample_fraction=0.01,
+        cfd_seed=5,
+    )
+    sparse = _apply_re_aware_cavity_settings(sparse, 100.0)
+    assert sparse["model"]["physics_formulation"] == "cavity_uvp_soft_bc"
+    assert sparse["training"]["weights"]["continuity"] == pytest.approx(6.0)
+    assert sparse["training"]["weights"]["cfd_velocity_mse"] == pytest.approx(3.0)
+    assert sparse["data_supervision"]["oracle"] is False
+    oracle = _apply_data_supervision_settings(
+        base,
+        mode="full_cfd_oracle",
+    )
+    assert base["data_supervision"]["mode"] == "pure_pinn"
+    assert oracle["data_supervision"]["oracle"] is True
+    assert oracle["data_supervision"]["oracle_label"] == "upper_bound_only"
+    checkpoint_metrics = sparse["checkpoint"]["reference_free_metrics"]
+    assert "cfd_velocity_mse_sparse" in checkpoint_metrics
+    assert not any(
+        token in name
+        for name in checkpoint_metrics
+        for token in (
+            "full_rel_l2",
+            "ghia",
+            "topology",
+            "vortex",
+            "center",
+        )
+    )
+
+
 def test_uvp_corner_width_is_decoupled_from_hard_boundary_schedule():
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     for reynolds, uvp_width in ((100.0, 0.05), (400.0, 0.04), (1600.0, 0.03)):
@@ -1260,6 +1441,7 @@ def test_raw_residual_tail_thresholds_both_momentum_terms_and_emphasizes_core():
 
 def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "hard_boundary_streamfunction_pressure"
     for reynolds, fraction, band in [
         (100.0, 0.20, 0.12),
         (400.0, 0.40, 0.06),
@@ -1310,6 +1492,7 @@ def test_reliable_near_wall_sampling_preserves_budget_and_avoids_corners(tmp_pat
 
 def test_vanilla_and_vara_share_near_wall_sampling_budget(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "hard_boundary_streamfunction_pressure"
     config = _apply_re_aware_cavity_settings(base, 400.0)
     common = {
         "device": "cpu",

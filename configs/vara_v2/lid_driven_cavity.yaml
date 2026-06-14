@@ -18,6 +18,18 @@ benchmark_params:
 pde:
   steady: true
 
+data_supervision:
+  mode: pure_pinn
+  sample_fraction: 0.01
+  sample_count: null
+  seed: 0
+  include_pressure: false
+  include_vorticity: false
+  exclude_near_corners: true
+  boundary_margin: 1.0e-6
+  corner_margin: 0.05
+  oracle_label: upper_bound_only
+
 model:
   architecture: mlp
   input_dim: 2
@@ -50,6 +62,11 @@ training:
     p: 0.0
     omega: 0.0
     pressure_gradient: 0.0
+    cfd_u_mse: 0.0
+    cfd_v_mse: 0.0
+    cfd_velocity_mse: 0.0
+    cfd_p_mse: 0.0
+    cfd_omega_mse: 0.0
 
 pressure_gauge:
   weight: 0.001

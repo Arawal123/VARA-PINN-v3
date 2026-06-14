@@ -171,25 +171,37 @@ def compute_pointwise_losses(
     else:
         pointwise["bc"] = xy_bc.new_zeros((xy_bc.shape[0], 1))
 
-    if xy_data is not None and targets is not None and xy_data.shape[0] > 0 and getattr(benchmark, "has_reference", True):
+    supervision_mode = str(
+        (regularization_config or {}).get("cfd_supervision_mode", "pure_pinn")
+    )
+    if (
+        xy_data is not None
+        and targets is not None
+        and xy_data.shape[0] > 0
+        and supervision_mode in {"sparse_cfd", "full_cfd_oracle"}
+    ):
         data_pred = model(xy_data)
-        data_residuals = navier_stokes_residuals(
-            model,
-            xy_data,
-            nu=benchmark.nu,
-            steady=steady,
-            runtime_profile=runtime_profile,
-        )
-        omega_pred = data_residuals["omega"]
-        p_pred_c = center_pressure(data_pred[:, 2:3])
-        p_true_c = center_pressure(targets["p"])
-        pointwise["u"] = (data_pred[:, 0:1] - targets["u"]).pow(2)
-        pointwise["v"] = (data_pred[:, 1:2] - targets["v"]).pow(2)
-        pointwise["p"] = (p_pred_c - p_true_c).pow(2)
-        pointwise["omega"] = (omega_pred - targets["omega"]).pow(2)
-        pointwise["pressure_gradient"] = (
-            data_residuals["p_x"] - targets["p_x"]
-        ).pow(2) + (data_residuals["p_y"] - targets["p_y"]).pow(2)
+        cfd_u = (data_pred[:, 0:1] - targets["u"]).pow(2)
+        cfd_v = (data_pred[:, 1:2] - targets["v"]).pow(2)
+        pointwise["cfd_u_mse"] = cfd_u
+        pointwise["cfd_v_mse"] = cfd_v
+        pointwise["cfd_velocity_mse"] = cfd_u + cfd_v
+        if "p" in targets:
+            pointwise["cfd_p_mse"] = (
+                center_pressure(data_pred[:, 2:3])
+                - center_pressure(targets["p"])
+            ).pow(2)
+        if "omega" in targets:
+            data_residuals = navier_stokes_residuals(
+                model,
+                xy_data,
+                nu=benchmark.nu,
+                steady=steady,
+                runtime_profile=runtime_profile,
+            )
+            pointwise["cfd_omega_mse"] = (
+                data_residuals["omega"] - targets["omega"]
+            ).pow(2)
     if runtime_profile is not None:
         runtime_profile["loss_construction_sec"] = runtime_profile.get(
             "loss_construction_sec", 0.0

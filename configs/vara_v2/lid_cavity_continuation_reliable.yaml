@@ -1,6 +1,21 @@
 # Opt-in physically guarded continuation protocol. Legacy configs are unchanged.
 cavity_base_formulation: uvp_velocity_lift
 
+data_supervision:
+  mode: pure_pinn
+  sample_fraction: 0.01
+  sample_count: null
+  seed: 0
+  include_pressure: false
+  include_vorticity: false
+  exclude_near_corners: true
+  boundary_margin: 1.0e-6
+  corner_margin: 0.05
+  oracle_label: upper_bound_only
+  sparse_cfd_velocity_weight: 3.0
+  sparse_continuity_weight: 6.0
+  sparse_raw_pde_tail_weight: 0.04
+
 uvp_velocity_lift:
   continuity_weight: 11.0
   boundary_weight: 0.0
