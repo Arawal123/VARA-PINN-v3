@@ -288,42 +288,6 @@ def _add_reference_free_regularizers(
         ]
         pointwise["lower_core_pde"] = raw_pde[masks["lower_core"]]
 
-    wall_tail_cfg = dict(cfg.get("uvp_wall_residual_tail", {}))
-    if (
-        getattr(model, "physics_formulation", "")
-        == "cavity_uvp_velocity_lift"
-        and bool(wall_tail_cfg.get("enabled", False))
-    ):
-        bounds = cfg.get("domain_bounds", (0.0, 1.0, 0.0, 1.0))
-        distance = _normalized_wall_distance(residuals["coords"], bounds)
-        x0, x1, y0, y1 = tuple(bounds)
-        xi = (residuals["coords"][:, 0:1] - x0) / max(float(x1 - x0), 1e-12)
-        eta = (residuals["coords"][:, 1:2] - y0) / max(float(y1 - y0), 1e-12)
-        band = max(float(wall_tail_cfg.get("band_width", 0.10)), 0.0)
-        corner_width = max(
-            float(wall_tail_cfg.get("corner_width", 0.12)),
-            0.0,
-        )
-        near_wall = distance < band
-        corner = (
-            ((xi < corner_width) | (xi > 1.0 - corner_width))
-            & ((eta < corner_width) | (eta > 1.0 - corner_width))
-        )
-        selected = near_wall | corner
-        residual_magnitude = torch.sqrt(
-            residuals["f_u"].pow(2)
-            + residuals["f_v"].pow(2)
-            + residuals["f_c"].pow(2)
-            + 1e-18
-        )
-        threshold = max(float(wall_tail_cfg.get("threshold", 0.60)), 0.0)
-        delta = max(float(wall_tail_cfg.get("pseudo_huber_delta", 0.50)), 1e-12)
-        excess_squared = torch.relu(residual_magnitude - threshold).pow(2)
-        pointwise["uvp_wall_residual_tail"] = pseudo_huber_from_squared_residual(
-            excess_squared[selected],
-            delta,
-        )
-
     speed_cfg = dict(cfg.get("speed_cap", {}))
     if bool(speed_cfg.get("enabled", False)):
         cap = float(speed_cfg.get("cap", 2.0))

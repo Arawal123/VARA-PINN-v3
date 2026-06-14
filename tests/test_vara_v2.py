@@ -461,13 +461,10 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert config["model"]["physics_formulation"] == "cavity_uvp_velocity_lift"
         assert config["controller_v2"]["total_steps"] == expected
         assert config["optimizer"]["scheduler"]["total_steps"] == expected
-        assert config["model"]["uvp_velocity_lift_mode"] == "divergence_compatible"
-        assert config["model"]["uvp_velocity_lift_scale"] == pytest.approx(8.0)
-        assert config["training"]["weights"]["continuity"] == pytest.approx(9.0)
+        assert config["training"]["weights"]["continuity"] == pytest.approx(11.0)
         assert config["training"]["weights"]["bc"] == pytest.approx(0.0)
         assert config["training"]["weights"]["bc_uvp_balanced"] == pytest.approx(0.0)
-        assert config["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.05)
-        assert config["training"]["weights"]["uvp_wall_residual_tail"] == pytest.approx(0.06)
+        assert config["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.07)
         assert config["training"]["n_boundary"] == 128
         relative = config["losses"]["uvp_boundary_balance"]["relative_weights"]
         assert not config["losses"]["uvp_boundary_balance"]["enabled"]
@@ -477,7 +474,7 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert boundary_cfg["corner_fraction"] == pytest.approx(0.10)
         circulation = config["sampling"]["cavity_circulation_bands"]
         assert circulation["enabled"]
-        assert circulation["top_band_fraction"] == pytest.approx(0.18)
+        assert circulation["top_band_fraction"] == pytest.approx(0.20)
         assert config["benchmark_params"][
             "lid_corner_regularization_width"
         ] == pytest.approx(0.05)
@@ -488,14 +485,16 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert repair["score_metric"] == "uvp_reference_free_score"
         assert config["continuation_validity"][
             "max_continuity_residual_mean"
-        ] == pytest.approx(0.025 if preset == "diagnostic" else 0.012)
+        ] == pytest.approx(0.018 if preset == "diagnostic" else 0.01)
         assert config["continuation_validity"][
             "max_boundary_condition_error"
         ] == pytest.approx(0.025 if preset == "diagnostic" else 0.015)
         metrics = config["checkpoint"]["reference_free_metrics"]
         assert "continuity_residual_mean" in metrics
-        assert "corner_pde_residual_mean" in metrics
+        assert "boundary_condition_error" in metrics
+        assert "u_boundary_rmse" in metrics
         assert "top_band_pde_residual_mean" in metrics
+        assert "top_band_momentum_u_mean" in metrics
         assert "upper_core_pde_residual_mean" in metrics
         assert not any("rel_l2" in name for name in metrics)
         assert not any(
@@ -506,7 +505,7 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert not config["checkpoint"]["low_re_vortex_tiebreaker"]["enabled"]
         pareto_metrics = repair["pareto_guard"]["metrics"]
         assert "top_band_pde_residual_mean" in pareto_metrics
-        assert "corner_pde_residual_mean" in pareto_metrics
+        assert "top_band_momentum_u_mean" in pareto_metrics
         assert "upper_core_pde_residual_mean" in pareto_metrics
         assert "near_wall_pde_residual_mean" in pareto_metrics
         trainer = object.__new__(VARATrainer)
@@ -543,47 +542,6 @@ def test_cavity_uvp_velocity_lift_enforces_walls_and_keeps_direct_uvp():
     assert output[:, 2].tolist() == pytest.approx([1.0] * 4)
     assert model.physics_formulation == "cavity_uvp_velocity_lift"
     assert not hasattr(model, "streamfunction")
-
-
-def test_divergence_compatible_lift_has_near_zero_analytic_continuity():
-    class ZeroUVP(torch.nn.Module):
-        def forward(self, coords):
-            return torch.zeros((coords.shape[0], 3), dtype=coords.dtype)
-
-    model = CavityUVPVelocityLiftWrapper(
-        ZeroUVP(),
-        (0.0, 2.0, 0.0, 1.0),
-        corner_width=0.08,
-        lift_mode="divergence_compatible",
-    )
-    points = torch.tensor(
-        [[0.4, 0.2], [0.8, 0.5], [1.2, 0.7], [1.6, 0.9]],
-        dtype=torch.float64,
-        requires_grad=True,
-    )
-    residuals = navier_stokes_residuals(
-        model,
-        points,
-        nu=0.01,
-        steady=True,
-    )
-    assert residuals["f_c"].abs().max().item() < 1e-10
-
-
-def test_legacy_bulk_eta_lift_remains_available_but_is_not_low_re_default():
-    class ZeroUVP(torch.nn.Module):
-        def forward(self, coords):
-            return torch.zeros((coords.shape[0], 3), dtype=coords.dtype)
-
-    legacy = CavityUVPVelocityLiftWrapper(
-        ZeroUVP(),
-        (0.0, 1.0, 0.0, 1.0),
-        lift_mode="bulk_eta_legacy",
-    )
-    assert legacy.lift_mode == "bulk_eta_legacy"
-    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
-    config = _apply_re_aware_cavity_settings(base, 100.0)
-    assert config["model"]["uvp_velocity_lift_mode"] == "divergence_compatible"
 
 
 def test_lifted_uvp_regional_losses_use_only_pde_residuals():
@@ -642,13 +600,13 @@ def test_uvp_lift_circulation_sampler_preserves_budget_and_is_formulation_specif
     assert points.shape == (100, 2)
     assert trainer.last_interior_sampling_summary[
         "interior_top_band_fraction"
-    ] == pytest.approx(0.18)
+    ] == pytest.approx(0.20)
     assert trainer.last_interior_sampling_summary[
         "interior_uniform_fraction"
     ] == pytest.approx(0.45)
     assert trainer.last_interior_sampling_summary[
         "interior_right_band_fraction"
-    ] == pytest.approx(0.14)
+    ] == pytest.approx(0.15)
 
     trainer.config["model"]["physics_formulation"] = "direct"
     direct_points = trainer._sample_interior_numpy(100)
@@ -1633,12 +1591,10 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
         "continuity_residual_mean": 1.0,
         "boundary_condition_error": 0.0,
         "near_wall_pde_residual_mean": 1.0,
-        "corner_pde_residual_mean": 1.0,
         "near_wall_momentum_v_mean": 1.0,
         "top_band_pde_residual_mean": 1.0,
         "top_band_momentum_u_mean": 1.0,
         "top_band_continuity_residual_mean": 1.0,
-        "upper_core_pde_residual_mean": 1.0,
         "omega_abs_95p": 1.0,
         "speed_pred_max": 1.0,
     }
@@ -1652,16 +1608,16 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
     ) == pytest.approx(below_gate + 1.5)
     assert trainer._checkpoint_score(
         {**metrics, "continuity_residual_mean": 2.0}
-    ) == pytest.approx(below_gate + 2.0)
+    ) == pytest.approx(below_gate + 1.5)
     assert trainer._checkpoint_score(
         {**metrics, "boundary_condition_error": 1.0}
-    ) == pytest.approx(below_gate)
+    ) == pytest.approx(below_gate + 0.25)
     assert trainer._checkpoint_score(
         {**metrics, "top_band_pde_residual_mean": 2.0}
-    ) == pytest.approx(below_gate + 0.75)
+    ) == pytest.approx(below_gate + 1.0)
     assert trainer._checkpoint_score(
         {**metrics, "top_band_momentum_u_mean": 2.0}
-    ) == pytest.approx(below_gate)
+    ) == pytest.approx(below_gate + 0.75)
     assert trainer._checkpoint_score(
         {**metrics, "top_band_continuity_residual_mean": 2.0}
     ) == pytest.approx(below_gate)

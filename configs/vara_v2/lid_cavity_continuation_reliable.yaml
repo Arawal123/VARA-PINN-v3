@@ -2,20 +2,17 @@
 cavity_base_formulation: uvp_velocity_lift
 
 uvp_velocity_lift:
-  continuity_weight: 9.0
+  continuity_weight: 11.0
   boundary_weight: 0.0
   balanced_boundary_weight: 0.0
-  lift_mode: divergence_compatible
-  lift_scale: 8.0
+  lift_scale: 16.0
   lift_vertical_power: 3
-  top_band_pde_weight: 0.6
-  top_band_momentum_u_weight: 0.4
-  top_band_continuity_weight: 0.4
-  upper_core_pde_weight: 0.45
-  right_wall_interior_pde_weight: 0.30
+  top_band_pde_weight: 0.9
+  top_band_momentum_u_weight: 0.6
+  top_band_continuity_weight: 0.5
+  upper_core_pde_weight: 0.5
+  right_wall_interior_pde_weight: 0.35
   lower_core_pde_weight: 0.25
-  wall_residual_tail_weight: 0.06
-  raw_pde_tail_weight: 0.05
   diagnostic_boundary_samples: 128
   reliable_boundary_samples: 128
   lid_corner_regularization_widths:
@@ -25,20 +22,22 @@ uvp_velocity_lift:
   diagnostic_polish_steps: 6
   reliable_polish_steps: 30
   diagnostic_validity:
-    max_continuity_residual_mean: 0.025
+    max_continuity_residual_mean: 0.018
     max_boundary_condition_error: 0.025
   reliable_validity:
-    max_continuity_residual_mean: 0.012
+    max_continuity_residual_mean: 0.010
     max_boundary_condition_error: 0.015
   checkpoint_metric_weights:
     pde_residual_mean: 1.5
     momentum_residual_mean: 1.5
     core_pde_residual_mean: 1.5
-    continuity_residual_mean: 2.0
-    near_wall_pde_residual_mean: 1.0
-    corner_pde_residual_mean: 0.75
-    top_band_pde_residual_mean: 0.75
-    upper_core_pde_residual_mean: 0.5
+    continuity_residual_mean: 1.5
+    top_band_pde_residual_mean: 1.0
+    top_band_momentum_u_mean: 0.75
+    upper_core_pde_residual_mean: 0.75
+    near_wall_pde_residual_mean: 0.5
+    boundary_condition_error: 0.25
+    u_boundary_rmse: 0.25
 
 uvp_soft_bc:
   # Momentum is already healthy at Re=100; tighten the two observed weak

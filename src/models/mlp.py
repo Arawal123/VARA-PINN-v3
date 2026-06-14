@@ -197,16 +197,10 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
                     )
                 ),
                 lift_scale=float(
-                    model_cfg.get("uvp_velocity_lift_scale", 8.0)
+                    model_cfg.get("uvp_velocity_lift_scale", 16.0)
                 ),
                 lid_vertical_power=int(
                     model_cfg.get("uvp_velocity_lift_vertical_power", 3)
-                ),
-                lift_mode=str(
-                    model_cfg.get(
-                        "uvp_velocity_lift_mode",
-                        "divergence_compatible",
-                    )
                 ),
             )
         model.physics_formulation = formulation

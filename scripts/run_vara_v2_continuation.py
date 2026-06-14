@@ -338,13 +338,6 @@ def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
         "top_reverse_u",
         "bottom_positive_u",
         "raw_pde_tail",
-        "uvp_wall_residual_tail",
-        "top_band_pde",
-        "top_band_momentum_u",
-        "top_band_continuity",
-        "upper_core_pde",
-        "right_wall_interior_pde",
-        "lower_core_pde",
         "pressure_gradient_l2",
         "vorticity_smoothness",
         "near_wall_vorticity_l2",
@@ -363,8 +356,6 @@ def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
                 "correction_bubble": {"enabled": False},
                 "lid_shear_direction": {"enabled": False},
                 "raw_residual_tail": {"enabled": False},
-                "uvp_regional_residuals": {"enabled": False},
-                "uvp_wall_residual_tail": {"enabled": False},
                 "pressure_gradient_l2": {"enabled": False},
                 "vorticity_smoothness": {"enabled": False},
                 "near_wall_vorticity_l2": {"enabled": False},
@@ -603,13 +594,10 @@ def _apply_re_aware_cavity_settings(
                 "output_dim": 3,
                 "uvp_velocity_lift_corner_width": uvp_corner_width,
                 "uvp_velocity_lift_scale": float(
-                    uvp_cfg.get("lift_scale", 8.0)
+                    uvp_cfg.get("lift_scale", 16.0)
                 ),
                 "uvp_velocity_lift_vertical_power": int(
                     uvp_cfg.get("lift_vertical_power", 3)
-                ),
-                "uvp_velocity_lift_mode": str(
-                    uvp_cfg.get("lift_mode", "divergence_compatible")
                 ),
             },
             "training": {
@@ -650,12 +638,7 @@ def _apply_re_aware_cavity_settings(
                     "scaled_correction_abs_max_hinge": 0.0,
                     "top_reverse_u": 0.0,
                     "bottom_positive_u": 0.0,
-                    "raw_pde_tail": float(
-                        uvp_cfg.get("raw_pde_tail_weight", 0.07)
-                    ),
-                    "uvp_wall_residual_tail": float(
-                        uvp_cfg.get("wall_residual_tail_weight", 0.0)
-                    ),
+                    "raw_pde_tail": 0.07,
                     "pressure_gradient_l2": 0.0,
                     "near_wall_vorticity_l2": 0.0,
                     **{name: 0.0 for name in component_relative_weights},
@@ -675,16 +658,9 @@ def _apply_re_aware_cavity_settings(
                     "relative_weights": component_relative_weights,
                 },
                 "uvp_regional_residuals": {"enabled": lifted},
-                "uvp_wall_residual_tail": {
-                    "enabled": lifted,
-                    "band_width": 0.10,
-                    "corner_width": 0.12,
-                    "threshold": 0.60,
-                    "pseudo_huber_delta": 0.50,
-                },
                 "raw_residual_tail": {
                     "enabled": True,
-                    "threshold": 0.55 if lifted else 0.525,
+                    "threshold": 0.525,
                     "core_margin": 0.08,
                     "core_emphasis": 1.5,
                 },
@@ -697,9 +673,11 @@ def _apply_re_aware_cavity_settings(
                     "momentum_residual_mean",
                     "core_pde_residual_mean",
                     "continuity_residual_mean",
+                    "boundary_condition_error",
+                    "u_boundary_rmse",
                     "near_wall_pde_residual_mean",
-                    "corner_pde_residual_mean",
                     "top_band_pde_residual_mean",
+                    "top_band_momentum_u_mean",
                     "upper_core_pde_residual_mean",
                     *(
                         []
@@ -712,11 +690,6 @@ def _apply_re_aware_cavity_settings(
                 ],
                 "metric_weights": checkpoint_weights,
                 "low_re_vortex_tiebreaker": {"enabled": False},
-                "core_speed_ratio_tiebreaker": {
-                    "enabled": lifted,
-                    "physics_margin": 0.02,
-                    "minimum_ratio_gain": 0.02,
-                },
             },
             "optimizer": {
                 "final_repair": {
@@ -738,19 +711,11 @@ def _apply_re_aware_cavity_settings(
                             "core_pde_residual_mean",
                             "continuity_residual_mean",
                             "speed_pred_max",
-                            "corner_pde_residual_mean",
                             "top_band_pde_residual_mean",
+                            "top_band_momentum_u_mean",
                             "upper_core_pde_residual_mean",
                             "near_wall_pde_residual_mean",
-                            "core_speed_mean",
-                            "upper_core_speed_mean",
-                            "core_speed_ratio",
                         ],
-                        "core_speed_ratio_guard": {
-                            "enabled": lifted,
-                            "maximum_relative_drop": 0.20,
-                            "substantial_pde_improvement": 0.10,
-                        },
                         "validity_gate_metrics": [
                             "pde_residual_mean",
                             "momentum_residual_mean",
@@ -780,10 +745,10 @@ def _apply_re_aware_cavity_settings(
                 },
                 "cavity_circulation_bands": {
                     "enabled": bool(lifted and reynolds <= 200.0),
-                    "top_band_fraction": 0.18,
-                    "right_band_fraction": 0.14,
-                    "lower_band_fraction": 0.12,
-                    "left_band_fraction": 0.11,
+                    "top_band_fraction": 0.20,
+                    "right_band_fraction": 0.15,
+                    "lower_band_fraction": 0.10,
+                    "left_band_fraction": 0.10,
                 },
                 "cavity_near_wall": {
                     "enabled": not lifted,
