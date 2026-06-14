@@ -337,6 +337,63 @@ class ExperimentTrainer:
         n_core = n - n_wall - n_lid
         return n_core, n_wall, n_lid
 
+    def _circulation_band_counts(self, n: int) -> dict[str, int] | None:
+        cfg = dict(
+            self.config.get("sampling", {}).get(
+                "cavity_circulation_bands", {}
+            )
+        )
+        formulation = str(
+            self.config.get("model", {}).get("physics_formulation", "")
+        )
+        if (
+            formulation != "cavity_uvp_velocity_lift"
+            or not self._is_lid_driven_cavity()
+            or not bool(cfg.get("enabled", False))
+        ):
+            return None
+        n = max(int(n), 0)
+        counts = {
+            name: int(round(n * float(cfg.get(f"{name}_fraction", default))))
+            for name, default in (
+                ("top_band", 0.20),
+                ("right_band", 0.15),
+                ("lower_band", 0.10),
+                ("left_band", 0.10),
+            )
+        }
+        specialized = sum(counts.values())
+        if specialized > n:
+            overflow = specialized - n
+            for name in ("left_band", "lower_band", "right_band", "top_band"):
+                reduction = min(counts[name], overflow)
+                counts[name] -= reduction
+                overflow -= reduction
+                if overflow == 0:
+                    break
+        counts["uniform"] = n - sum(counts.values())
+        return counts
+
+    def _sample_normalized_box_numpy(
+        self,
+        n: int,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+    ) -> np.ndarray:
+        points = self.uniform_sampler.sample_numpy(n)
+        if n <= 0:
+            return points
+        x0, x1, y0, y1 = self.benchmark.bounds
+        xi = (points[:, 0] - x0) / max(x1 - x0, 1e-12)
+        eta = (points[:, 1] - y0) / max(y1 - y0, 1e-12)
+        points[:, 0] = x0 + (
+            x_range[0] + (x_range[1] - x_range[0]) * xi
+        ) * (x1 - x0)
+        points[:, 1] = y0 + (
+            y_range[0] + (y_range[1] - y_range[0]) * eta
+        ) * (y1 - y0)
+        return points
+
     def _sample_near_wall_numpy(self, n: int) -> np.ndarray:
         if n <= 0:
             return self.uniform_sampler.sample_numpy(0)
@@ -385,6 +442,38 @@ class ExperimentTrainer:
         n: int,
         core_points: np.ndarray | None = None,
     ) -> np.ndarray:
+        circulation = self._circulation_band_counts(n)
+        if circulation is not None:
+            n_uniform = circulation["uniform"]
+            if core_points is None:
+                core_points = self.uniform_sampler.sample_numpy(n_uniform)
+            if int(core_points.shape[0]) != n_uniform:
+                raise ValueError(
+                    f"Expected {n_uniform} uniform collocation points, "
+                    f"got {core_points.shape[0]}."
+                )
+            pieces = [
+                core_points,
+                self._sample_normalized_box_numpy(
+                    circulation["top_band"], (0.05, 0.95), (0.70, 0.98)
+                ),
+                self._sample_normalized_box_numpy(
+                    circulation["right_band"], (0.78, 0.98), (0.15, 0.85)
+                ),
+                self._sample_normalized_box_numpy(
+                    circulation["lower_band"], (0.15, 0.85), (0.05, 0.35)
+                ),
+                self._sample_normalized_box_numpy(
+                    circulation["left_band"], (0.02, 0.22), (0.20, 0.85)
+                ),
+            ]
+            result = np.vstack([points for points in pieces if points.size])
+            total = max(int(n), 1)
+            self.last_interior_sampling_summary = {
+                f"interior_{name}_fraction": float(count / total)
+                for name, count in circulation.items()
+            }
+            return result
         n_core, n_wall, n_lid = self._interior_component_counts(n)
         if core_points is None:
             core_points = self.uniform_sampler.sample_numpy(n_core)
@@ -1198,7 +1287,7 @@ class ExperimentTrainer:
         guard = dict(cfg.get("pareto_guard", {}))
         if (
             str(self.config.get("model", {}).get("physics_formulation", ""))
-            != "cavity_uvp_soft_bc"
+            not in {"cavity_uvp_soft_bc", "cavity_uvp_velocity_lift"}
             or not bool(guard.get("enabled", False))
         ):
             return True, "pareto_guard_disabled"
@@ -1292,7 +1381,7 @@ class ExperimentTrainer:
             and str(
                 self.config.get("model", {}).get("physics_formulation", "")
             )
-            == "cavity_uvp_soft_bc"
+            in {"cavity_uvp_soft_bc", "cavity_uvp_velocity_lift"}
         ):
             return "uvp_reference_free_score", self._checkpoint_score(metrics)
         candidates = [
@@ -1397,7 +1486,12 @@ class ExperimentTrainer:
         started = time.perf_counter()
         if adaptive:
             priorities = control_state.sampling_priorities if control_state is not None else {}
-            n_core, _n_wall, _n_lid = self._interior_component_counts(n_f)
+            circulation = self._circulation_band_counts(n_f)
+            n_core = (
+                circulation["uniform"]
+                if circulation is not None
+                else self._interior_component_counts(n_f)[0]
+            )
             core = self.adaptive_sampler.sample_interior(
                 n_core, maps, coords, weak_regions, priorities
             )
@@ -1462,6 +1556,33 @@ class ExperimentTrainer:
         model_cfg = self.config.get("model", {})
         metrics["model_architecture"] = str(model_cfg.get("architecture", "mlp"))
         metrics["physics_formulation"] = str(model_cfg.get("physics_formulation", "direct"))
+        if metrics["physics_formulation"] == "cavity_uvp_velocity_lift":
+            core_speed = float(metrics.get("core_speed_mean", float("nan")))
+            upper_speed = float(
+                metrics.get("upper_core_speed_mean", float("nan"))
+            )
+            metrics["lifted_uvp_diagnostics"] = {
+                "formulation": metrics["physics_formulation"],
+                "lift_enabled": True,
+                "lid_u_boundary_rmse": metrics.get(
+                    "lid_u_boundary_rmse", float("nan")
+                ),
+                "no_slip_wall_u_rmse": metrics.get(
+                    "no_slip_wall_u_rmse", float("nan")
+                ),
+                "no_slip_wall_v_rmse": metrics.get(
+                    "no_slip_wall_v_rmse", float("nan")
+                ),
+                "top_band_pde_residual_mean": metrics.get(
+                    "top_band_pde_residual_mean", float("nan")
+                ),
+                "upper_core_pde_residual_mean": metrics.get(
+                    "upper_core_pde_residual_mean", float("nan")
+                ),
+                "core_speed_mean": core_speed,
+                "upper_core_speed_mean": upper_speed,
+                "speed_core_ratio": core_speed / max(upper_speed, 1e-12),
+            }
         metrics["hard_boundary_corner_width"] = (
             float(
                 getattr(

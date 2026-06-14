@@ -1,5 +1,43 @@
 # Opt-in physically guarded continuation protocol. Legacy configs are unchanged.
-cavity_base_formulation: uvp_soft_bc
+cavity_base_formulation: uvp_velocity_lift
+
+uvp_velocity_lift:
+  continuity_weight: 11.0
+  boundary_weight: 0.0
+  balanced_boundary_weight: 0.0
+  lift_scale: 16.0
+  lift_vertical_power: 3
+  top_band_pde_weight: 0.9
+  top_band_momentum_u_weight: 0.6
+  top_band_continuity_weight: 0.5
+  upper_core_pde_weight: 0.5
+  right_wall_interior_pde_weight: 0.35
+  lower_core_pde_weight: 0.25
+  diagnostic_boundary_samples: 128
+  reliable_boundary_samples: 128
+  lid_corner_regularization_widths:
+    low_re: 0.05
+    mid_re: 0.04
+    high_re: 0.03
+  diagnostic_polish_steps: 6
+  reliable_polish_steps: 30
+  diagnostic_validity:
+    max_continuity_residual_mean: 0.018
+    max_boundary_condition_error: 0.025
+  reliable_validity:
+    max_continuity_residual_mean: 0.010
+    max_boundary_condition_error: 0.015
+  checkpoint_metric_weights:
+    pde_residual_mean: 1.5
+    momentum_residual_mean: 1.5
+    core_pde_residual_mean: 1.5
+    continuity_residual_mean: 1.5
+    top_band_pde_residual_mean: 1.0
+    top_band_momentum_u_mean: 0.75
+    upper_core_pde_residual_mean: 0.75
+    near_wall_pde_residual_mean: 0.5
+    boundary_condition_error: 0.25
+    u_boundary_rmse: 0.25
 
 uvp_soft_bc:
   # Momentum is already healthy at Re=100; tighten the two observed weak

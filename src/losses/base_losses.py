@@ -135,7 +135,10 @@ def compute_pointwise_losses(
         u_error = (bc_pred[:, 0:1] - bc_ref["u"]).pow(2)
         v_error = (bc_pred[:, 1:2] - bc_ref["v"]).pow(2)
         pointwise["bc"] = u_error + v_error
-        if getattr(model, "physics_formulation", "") == "cavity_uvp_soft_bc":
+        if getattr(model, "physics_formulation", "") in {
+            "cavity_uvp_soft_bc",
+            "cavity_uvp_velocity_lift",
+        }:
             x0, x1, y0, y1 = benchmark.bounds
             x = xy_bc[:, 0]
             y = xy_bc[:, 1]
@@ -235,6 +238,56 @@ def _add_reference_free_regularizers(
     residuals: dict[str, torch.Tensor],
     cfg: dict[str, Any],
 ) -> None:
+    regional_cfg = dict(cfg.get("uvp_regional_residuals", {}))
+    if (
+        getattr(model, "physics_formulation", "")
+        == "cavity_uvp_velocity_lift"
+        and bool(regional_cfg.get("enabled", False))
+    ):
+        x0, x1, y0, y1 = tuple(
+            cfg.get("domain_bounds", (0.0, 1.0, 0.0, 1.0))
+        )
+        xi = (residuals["coords"][:, 0:1] - x0) / max(float(x1 - x0), 1e-12)
+        eta = (residuals["coords"][:, 1:2] - y0) / max(float(y1 - y0), 1e-12)
+        raw_u = residuals["f_u"].pow(2)
+        raw_v = residuals["f_v"].pow(2)
+        raw_c = residuals["f_c"].pow(2)
+        raw_pde = raw_u + raw_v + raw_c
+        masks = {
+            "top_band": (
+                (eta >= 0.70)
+                & (eta <= 0.98)
+                & (xi >= 0.05)
+                & (xi <= 0.95)
+            ),
+            "upper_core": (
+                (eta >= 0.55)
+                & (eta <= 0.90)
+                & (xi >= 0.15)
+                & (xi <= 0.85)
+            ),
+            "right_wall_interior": (
+                (xi >= 0.78)
+                & (xi <= 0.98)
+                & (eta >= 0.15)
+                & (eta <= 0.85)
+            ),
+            "lower_core": (
+                (eta >= 0.05)
+                & (eta <= 0.35)
+                & (xi >= 0.15)
+                & (xi <= 0.85)
+            ),
+        }
+        pointwise["top_band_pde"] = raw_pde[masks["top_band"]]
+        pointwise["top_band_momentum_u"] = raw_u[masks["top_band"]]
+        pointwise["top_band_continuity"] = raw_c[masks["top_band"]]
+        pointwise["upper_core_pde"] = raw_pde[masks["upper_core"]]
+        pointwise["right_wall_interior_pde"] = raw_pde[
+            masks["right_wall_interior"]
+        ]
+        pointwise["lower_core_pde"] = raw_pde[masks["lower_core"]]
+
     speed_cfg = dict(cfg.get("speed_cap", {}))
     if bool(speed_cfg.get("enabled", False)):
         cap = float(speed_cfg.get("cap", 2.0))

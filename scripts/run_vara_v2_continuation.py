@@ -77,7 +77,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--cavity_base_formulation",
-        choices=["uvp_soft_bc", "hard_boundary_streamfunction_pressure"],
+        choices=[
+            "uvp_velocity_lift",
+            "uvp_soft_bc",
+            "hard_boundary_streamfunction_pressure",
+        ],
         default=None,
         help="Override the shared cavity formulation for both Vanilla and VARA.",
     )
@@ -532,9 +536,18 @@ def _apply_re_aware_cavity_settings(
             },
         },
     )
-    if str(resolved.get("cavity_base_formulation", "")).lower() != "uvp_soft_bc":
+    selected_formulation = str(
+        resolved.get("cavity_base_formulation", "")
+    ).lower()
+    if selected_formulation not in {"uvp_soft_bc", "uvp_velocity_lift"}:
         return resolved
-    uvp_cfg = dict(resolved.get("uvp_soft_bc", {}))
+    lifted = selected_formulation == "uvp_velocity_lift"
+    uvp_cfg = dict(
+        resolved.get(
+            "uvp_velocity_lift" if lifted else "uvp_soft_bc",
+            {},
+        )
+    )
     diagnostic_budget = total_steps <= PRESET_STEPS["diagnostic"]
     boundary_key = (
         "diagnostic_boundary_samples"
@@ -573,8 +586,19 @@ def _apply_re_aware_cavity_settings(
         resolved,
         {
             "model": {
-                "physics_formulation": "cavity_uvp_soft_bc",
+                "physics_formulation": (
+                    "cavity_uvp_velocity_lift"
+                    if lifted
+                    else "cavity_uvp_soft_bc"
+                ),
                 "output_dim": 3,
+                "uvp_velocity_lift_corner_width": uvp_corner_width,
+                "uvp_velocity_lift_scale": float(
+                    uvp_cfg.get("lift_scale", 16.0)
+                ),
+                "uvp_velocity_lift_vertical_power": int(
+                    uvp_cfg.get("lift_vertical_power", 3)
+                ),
             },
             "training": {
                 "n_boundary": boundary_count,
@@ -588,6 +612,24 @@ def _apply_re_aware_cavity_settings(
                     "bc": float(uvp_cfg.get("boundary_weight", 25.0)),
                     "bc_uvp_balanced": float(
                         uvp_cfg.get("balanced_boundary_weight", 30.0)
+                    ),
+                    "top_band_pde": float(
+                        uvp_cfg.get("top_band_pde_weight", 0.0)
+                    ),
+                    "top_band_momentum_u": float(
+                        uvp_cfg.get("top_band_momentum_u_weight", 0.0)
+                    ),
+                    "top_band_continuity": float(
+                        uvp_cfg.get("top_band_continuity_weight", 0.0)
+                    ),
+                    "upper_core_pde": float(
+                        uvp_cfg.get("upper_core_pde_weight", 0.0)
+                    ),
+                    "right_wall_interior_pde": float(
+                        uvp_cfg.get("right_wall_interior_pde_weight", 0.0)
+                    ),
+                    "lower_core_pde": float(
+                        uvp_cfg.get("lower_core_pde_weight", 0.0)
                     ),
                     "speed_cap": 0.0,
                     "raw_psi_l2": 0.0,
@@ -612,9 +654,10 @@ def _apply_re_aware_cavity_settings(
                 "near_wall_momentum": {"enabled": False},
                 "near_wall_vorticity_l2": {"enabled": False},
                 "uvp_boundary_balance": {
-                    "enabled": True,
+                    "enabled": not lifted,
                     "relative_weights": component_relative_weights,
                 },
+                "uvp_regional_residuals": {"enabled": lifted},
                 "raw_residual_tail": {
                     "enabled": True,
                     "threshold": 0.525,
@@ -633,10 +676,17 @@ def _apply_re_aware_cavity_settings(
                     "boundary_condition_error",
                     "u_boundary_rmse",
                     "near_wall_pde_residual_mean",
-                    "near_wall_momentum_v_mean",
                     "top_band_pde_residual_mean",
                     "top_band_momentum_u_mean",
-                    "top_band_continuity_residual_mean",
+                    "upper_core_pde_residual_mean",
+                    *(
+                        []
+                        if lifted
+                        else [
+                            "near_wall_momentum_v_mean",
+                            "top_band_continuity_residual_mean",
+                        ]
+                    ),
                 ],
                 "metric_weights": checkpoint_weights,
                 "low_re_vortex_tiebreaker": {"enabled": False},
@@ -660,11 +710,11 @@ def _apply_re_aware_cavity_settings(
                             "momentum_residual_mean",
                             "core_pde_residual_mean",
                             "continuity_residual_mean",
-                            "boundary_condition_error",
-                            "u_boundary_rmse",
                             "speed_pred_max",
                             "top_band_pde_residual_mean",
-                            "top_band_continuity_residual_mean",
+                            "top_band_momentum_u_mean",
+                            "upper_core_pde_residual_mean",
+                            "near_wall_pde_residual_mean",
                         ],
                         "validity_gate_metrics": [
                             "pde_residual_mean",
@@ -686,12 +736,28 @@ def _apply_re_aware_cavity_settings(
                     "corner_width": uvp_corner_width,
                 },
                 "cavity_lid_interior_band": {
-                    "enabled": bool(reynolds <= 200.0),
+                    "enabled": bool(not lifted and reynolds <= 200.0),
                     "fraction": 0.20 if reynolds <= 200.0 else 0.0,
                     "y_min": 0.72,
                     "y_max": 0.98,
                     "corner_width": uvp_corner_width,
                     "minimum_core_fraction": 0.35,
+                },
+                "cavity_circulation_bands": {
+                    "enabled": bool(lifted and reynolds <= 200.0),
+                    "top_band_fraction": 0.20,
+                    "right_band_fraction": 0.15,
+                    "lower_band_fraction": 0.10,
+                    "left_band_fraction": 0.10,
+                },
+                "cavity_near_wall": {
+                    "enabled": not lifted,
+                    "fraction": (
+                        0.0
+                        if lifted
+                        else float(regime["near_wall_fraction"])
+                    ),
+                    "band_width": band,
                 },
             },
             "evaluation": {"controller_streamfunction_metrics": False},
@@ -714,12 +780,14 @@ def _validate_reliable_config(
     failures = []
     formulation = str(model_cfg.get("physics_formulation", ""))
     allowed_formulations = {
+        "cavity_uvp_velocity_lift",
         "cavity_uvp_soft_bc",
         "hard_boundary_streamfunction_pressure",
     }
     if formulation not in allowed_formulations:
         failures.append(
-            "physics_formulation must be cavity_uvp_soft_bc or "
+            "physics_formulation must be cavity_uvp_velocity_lift, "
+            "cavity_uvp_soft_bc, or "
             "hard_boundary_streamfunction_pressure"
         )
     if int(train_cfg.get("n_data", -1)) != 0:
@@ -741,6 +809,11 @@ def _validate_reliable_config(
             failures.append("cavity_uvp_soft_bc requires a positive boundary objective")
         if float(config.get("pressure_gauge", {}).get("weight", 0.0)) <= 0.0:
             failures.append("cavity_uvp_soft_bc requires a positive pressure gauge")
+    if formulation == "cavity_uvp_velocity_lift":
+        if int(model_cfg.get("output_dim", -1)) != 3:
+            failures.append("cavity_uvp_velocity_lift requires model.output_dim = 3")
+        if float(config.get("pressure_gauge", {}).get("weight", 0.0)) <= 0.0:
+            failures.append("cavity_uvp_velocity_lift requires a positive pressure gauge")
     if int(controller_cfg.get("total_steps", -1)) != expected_steps:
         failures.append(f"controller_v2.total_steps must be {expected_steps}")
     if int(scheduler_cfg.get("total_steps", -1)) != expected_steps:
@@ -754,7 +827,7 @@ def _validate_reliable_config(
     if not bool(schedule.get("enabled", False)) or not schedule.get("regimes"):
         failures.append("re_aware_cavity schedule must be enabled")
     near_wall = dict(config.get("sampling", {}).get("cavity_near_wall", {}))
-    if require_materialized and (
+    if require_materialized and formulation != "cavity_uvp_velocity_lift" and (
         not bool(near_wall.get("enabled", False))
         or float(near_wall.get("fraction", 0.0)) <= 0.0
         or float(near_wall.get("band_width", 0.0)) <= 0.0
@@ -870,7 +943,7 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
             cfg.get("max_core_pde_residual_mean", np.inf)
         ),
     }
-    if formulation != "cavity_uvp_soft_bc":
+    if formulation not in {"cavity_uvp_soft_bc", "cavity_uvp_velocity_lift"}:
         checks["streamfunction_consistency_rmse"] = float(
             cfg.get("max_streamfunction_consistency_rmse", np.inf)
         )

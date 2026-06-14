@@ -4,6 +4,7 @@ from .mlp import MLP, build_mlp_from_config
 from .residual_fourier_mlp import ResidualFourierMLP, parameter_matched_width
 from .physics_wrappers import (
     CavityHardBoundaryWrapper,
+    CavityUVPVelocityLiftWrapper,
     HardBoundaryStreamfunctionPressureWrapper,
     StreamfunctionPressureWrapper,
 )
@@ -12,6 +13,7 @@ __all__ = [
     "MLP",
     "ResidualFourierMLP",
     "CavityHardBoundaryWrapper",
+    "CavityUVPVelocityLiftWrapper",
     "HardBoundaryStreamfunctionPressureWrapper",
     "StreamfunctionPressureWrapper",
     "parameter_matched_width",

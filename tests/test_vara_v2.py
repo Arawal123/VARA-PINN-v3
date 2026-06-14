@@ -30,6 +30,7 @@ from src.losses.base_losses import (
 from src.losses.local_losses import compute_budgeted_patch_losses
 from src.models import (
     CavityHardBoundaryWrapper,
+    CavityUVPVelocityLiftWrapper,
     HardBoundaryStreamfunctionPressureWrapper,
     StreamfunctionPressureWrapper,
     build_mlp_from_config,
@@ -301,6 +302,7 @@ def test_continuation_overlay_inherits_lid_cavity_base_config():
 
 def test_uvp_soft_bc_formulation_returns_raw_fields_and_residuals():
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "uvp_soft_bc"
     config = _apply_re_aware_cavity_settings(base, 100.0)
     model = build_mlp_from_config(config, (0.0, 1.0, 0.0, 1.0))
     points = torch.tensor(
@@ -317,6 +319,7 @@ def test_uvp_soft_bc_formulation_returns_raw_fields_and_residuals():
 
 def test_uvp_soft_boundary_loss_covers_all_walls_and_pressure_gauge(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base["cavity_base_formulation"] = "uvp_soft_bc"
     config = deep_update(
         _apply_re_aware_cavity_settings(base, 100.0),
         {
@@ -455,28 +458,23 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         )
         config = _apply_re_aware_cavity_settings(config, 100.0)
         _validate_reliable_config(config, preset, require_materialized=True)
-        assert config["model"]["physics_formulation"] == "cavity_uvp_soft_bc"
+        assert config["model"]["physics_formulation"] == "cavity_uvp_velocity_lift"
         assert config["controller_v2"]["total_steps"] == expected
         assert config["optimizer"]["scheduler"]["total_steps"] == expected
-        assert config["training"]["weights"]["continuity"] == pytest.approx(8.0)
+        assert config["training"]["weights"]["continuity"] == pytest.approx(11.0)
         assert config["training"]["weights"]["bc"] == pytest.approx(0.0)
-        assert config["training"]["weights"]["bc_uvp_balanced"] == pytest.approx(27.0)
-        assert all(
-            config["training"]["weights"][name] == pytest.approx(0.0)
-            for name in config["uvp_soft_bc"]["boundary_component_relative_weights"]
-        )
+        assert config["training"]["weights"]["bc_uvp_balanced"] == pytest.approx(0.0)
         assert config["training"]["weights"]["raw_pde_tail"] == pytest.approx(0.07)
-        assert config["training"]["n_boundary"] == (384 if preset == "diagnostic" else 512)
+        assert config["training"]["n_boundary"] == 128
         relative = config["losses"]["uvp_boundary_balance"]["relative_weights"]
-        assert relative["bc_top_u"] > relative["bc_top_v"]
-        assert relative["bc_bottom_u"] > relative["bc_bottom_v"]
+        assert not config["losses"]["uvp_boundary_balance"]["enabled"]
         boundary_cfg = config["sampling"]["cavity_boundary"]
         assert boundary_cfg["mode"] == "focused"
         assert boundary_cfg["lid_fraction"] == pytest.approx(0.31)
         assert boundary_cfg["corner_fraction"] == pytest.approx(0.10)
-        lid_band = config["sampling"]["cavity_lid_interior_band"]
-        assert lid_band["enabled"]
-        assert lid_band["fraction"] == pytest.approx(0.20)
+        circulation = config["sampling"]["cavity_circulation_bands"]
+        assert circulation["enabled"]
+        assert circulation["top_band_fraction"] == pytest.approx(0.20)
         assert config["benchmark_params"][
             "lid_corner_regularization_width"
         ] == pytest.approx(0.05)
@@ -487,17 +485,17 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert repair["score_metric"] == "uvp_reference_free_score"
         assert config["continuation_validity"][
             "max_continuity_residual_mean"
-        ] == pytest.approx(0.02 if preset == "diagnostic" else 0.01)
+        ] == pytest.approx(0.018 if preset == "diagnostic" else 0.01)
         assert config["continuation_validity"][
             "max_boundary_condition_error"
-        ] == pytest.approx(0.06 if preset == "diagnostic" else 0.03)
+        ] == pytest.approx(0.025 if preset == "diagnostic" else 0.015)
         metrics = config["checkpoint"]["reference_free_metrics"]
         assert "continuity_residual_mean" in metrics
         assert "boundary_condition_error" in metrics
         assert "u_boundary_rmse" in metrics
         assert "top_band_pde_residual_mean" in metrics
         assert "top_band_momentum_u_mean" in metrics
-        assert "top_band_continuity_residual_mean" in metrics
+        assert "upper_core_pde_residual_mean" in metrics
         assert not any("rel_l2" in name for name in metrics)
         assert not any(
             token in name
@@ -507,15 +505,80 @@ def test_reliable_uvp_defaults_preserve_budgets_and_reference_free_checkpointing
         assert not config["checkpoint"]["low_re_vortex_tiebreaker"]["enabled"]
         pareto_metrics = repair["pareto_guard"]["metrics"]
         assert "top_band_pde_residual_mean" in pareto_metrics
-        assert "top_band_continuity_residual_mean" in pareto_metrics
+        assert "top_band_momentum_u_mean" in pareto_metrics
+        assert "upper_core_pde_residual_mean" in pareto_metrics
+        assert "near_wall_pde_residual_mean" in pareto_metrics
         trainer = object.__new__(VARATrainer)
         trainer.config = config
-        assert trainer._compute_boundary_training_loss(
+        assert not trainer._compute_boundary_training_loss(
             config["training"]["weights"]
         )
 
 
-def test_uvp_lid_band_sampler_preserves_budget_and_is_formulation_specific(tmp_path):
+def test_cavity_uvp_velocity_lift_enforces_walls_and_keeps_direct_uvp():
+    class RawUVP(torch.nn.Module):
+        def forward(self, coords):
+            return torch.ones((coords.shape[0], 3), dtype=coords.dtype)
+
+    model = CavityUVPVelocityLiftWrapper(
+        RawUVP(),
+        (0.0, 1.0, 0.0, 1.0),
+        corner_width=0.05,
+    )
+    walls = torch.tensor(
+        [
+            [0.5, 1.0],
+            [0.5, 0.0],
+            [0.0, 0.5],
+            [1.0, 0.5],
+        ],
+        dtype=torch.float64,
+    )
+    output = model(walls)
+    assert output.shape == (4, 3)
+    assert output[:, 1].abs().max().item() < 1e-12
+    assert output[0, 0].item() == pytest.approx(1.0)
+    assert output[1:, 0].abs().max().item() < 1e-12
+    assert output[:, 2].tolist() == pytest.approx([1.0] * 4)
+    assert model.physics_formulation == "cavity_uvp_velocity_lift"
+    assert not hasattr(model, "streamfunction")
+
+
+def test_lifted_uvp_regional_losses_use_only_pde_residuals():
+    class LiftedModel:
+        physics_formulation = "cavity_uvp_velocity_lift"
+
+    model = LiftedModel()
+    coords = torch.tensor(
+        [[0.5, 0.8], [0.82, 0.5], [0.5, 0.2]],
+        dtype=torch.float64,
+    )
+    residuals = {
+        "coords": coords,
+        "f_u": torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float64),
+        "f_v": torch.tensor([[0.5], [0.5], [0.5]], dtype=torch.float64),
+        "f_c": torch.tensor([[0.2], [0.2], [0.2]], dtype=torch.float64),
+        "u": torch.zeros((3, 1), dtype=torch.float64),
+        "v": torch.zeros((3, 1), dtype=torch.float64),
+    }
+    pointwise = {}
+    _add_reference_free_regularizers(
+        pointwise,
+        model,
+        coords,
+        residuals,
+        {
+            "domain_bounds": (0.0, 1.0, 0.0, 1.0),
+            "uvp_regional_residuals": {"enabled": True},
+        },
+    )
+    assert pointwise["top_band_momentum_u"].item() == pytest.approx(1.0)
+    assert pointwise["right_wall_interior_pde"].item() == pytest.approx(4.29)
+    assert pointwise["lower_core_pde"].item() == pytest.approx(9.29)
+    assert not any("reference" in name for name in pointwise)
+
+
+def test_uvp_lift_circulation_sampler_preserves_budget_and_is_formulation_specific(tmp_path):
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     config = deep_update(
         _apply_re_aware_cavity_settings(base, 100.0),
@@ -536,11 +599,14 @@ def test_uvp_lid_band_sampler_preserves_budget_and_is_formulation_specific(tmp_p
     points = trainer._sample_interior_numpy(100)
     assert points.shape == (100, 2)
     assert trainer.last_interior_sampling_summary[
-        "interior_lid_band_fraction"
+        "interior_top_band_fraction"
     ] == pytest.approx(0.20)
     assert trainer.last_interior_sampling_summary[
-        "interior_core_fraction"
-    ] >= 0.35
+        "interior_uniform_fraction"
+    ] == pytest.approx(0.45)
+    assert trainer.last_interior_sampling_summary[
+        "interior_right_band_fraction"
+    ] == pytest.approx(0.15)
 
     trainer.config["model"]["physics_formulation"] = "direct"
     direct_points = trainer._sample_interior_numpy(100)
@@ -600,7 +666,7 @@ def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
     )
     vanilla = VARATrainer(config, mode="vanilla")
     vara = VARAV2Trainer(config)
-    assert vanilla.model.physics_formulation == "cavity_uvp_soft_bc"
+    assert vanilla.model.physics_formulation == "cavity_uvp_velocity_lift"
     assert vara.model.physics_formulation == vanilla.model.physics_formulation
     assert vara.config["training"]["weights"] == vanilla.config["training"]["weights"]
     assert vara.config["continuation_validity"] == vanilla.config["continuation_validity"]
@@ -668,7 +734,7 @@ def test_uvp_repair_pareto_guard_rejects_boundary_only_improvement(tmp_path):
         "momentum_residual_mean": 0.20,
         "core_pde_residual_mean": 0.20,
         "continuity_residual_mean": 0.01,
-        "boundary_condition_error": 0.05,
+        "boundary_condition_error": 0.02,
         "u_boundary_rmse": 0.08,
         "speed_pred_max": 1.0,
     }
@@ -699,7 +765,7 @@ def test_uvp_validity_is_soft_bc_aware_but_keeps_physics_gates():
         "pde_residual_mean": 0.20,
         "continuity_residual_mean": 0.015,
         "momentum_residual_mean": 0.20,
-        "boundary_condition_error": 0.05,
+        "boundary_condition_error": 0.02,
         "speed_pred_max": 1.2,
         "streamfunction_consistency_rmse": 99.0,
         "lid_cavity_primary_center_error": 0.05,
@@ -1542,19 +1608,19 @@ def test_checkpoint_speed_score_is_hinged_and_core_weighted(tmp_path):
     ) == pytest.approx(below_gate + 1.5)
     assert trainer._checkpoint_score(
         {**metrics, "continuity_residual_mean": 2.0}
-    ) == pytest.approx(below_gate + 1.25)
+    ) == pytest.approx(below_gate + 1.5)
     assert trainer._checkpoint_score(
         {**metrics, "boundary_condition_error": 1.0}
-    ) == pytest.approx(below_gate + 0.75)
+    ) == pytest.approx(below_gate + 0.25)
     assert trainer._checkpoint_score(
         {**metrics, "top_band_pde_residual_mean": 2.0}
-    ) == pytest.approx(below_gate + 0.75)
+    ) == pytest.approx(below_gate + 1.0)
     assert trainer._checkpoint_score(
         {**metrics, "top_band_momentum_u_mean": 2.0}
-    ) == pytest.approx(below_gate + 0.5)
+    ) == pytest.approx(below_gate + 0.75)
     assert trainer._checkpoint_score(
         {**metrics, "top_band_continuity_residual_mean": 2.0}
-    ) == pytest.approx(below_gate + 0.5)
+    ) == pytest.approx(below_gate)
     assert trainer._checkpoint_score(
         {**metrics, "u_rel_l2": 1000.0, "velocity_full_rel_l2": 1000.0}
     ) == pytest.approx(below_gate)

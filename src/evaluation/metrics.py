@@ -680,6 +680,9 @@ def _boundary_metrics(
         "v_boundary_rmse": float("nan"),
         "boundary_speed_rmse": float("nan"),
         "unweighted_bc_loss": float("nan"),
+        "lid_u_boundary_rmse": float("nan"),
+        "no_slip_wall_u_rmse": float("nan"),
+        "no_slip_wall_v_rmse": float("nan"),
     }
     if not hasattr(benchmark, "boundary_mask_np"):
         return empty
@@ -693,9 +696,29 @@ def _boundary_metrics(
         u_err2 = (pred[:, 0:1] - ref["u"]).pow(2)
         v_err2 = (pred[:, 1:2] - ref["v"]).pow(2)
         err2 = u_err2 + v_err2
+    boundary_np = coords_np[mask]
+    y0, y1 = benchmark.bounds[2], benchmark.bounds[3]
+    tolerance = 1e-6 * max(float(y1 - y0), 1.0)
+    lid_mask = np.isclose(boundary_np[:, 1], y1, atol=tolerance, rtol=0.0)
+    no_slip_mask = ~lid_mask
+
+    def selected_rmse(values: torch.Tensor, selected: np.ndarray) -> float:
+        if not np.any(selected):
+            return float("nan")
+        chosen = values[
+            torch.as_tensor(selected, dtype=torch.bool, device=values.device)
+        ]
+        return float(torch.sqrt(torch.mean(chosen)).detach().cpu())
+
     return {
         "u_boundary_rmse": float(torch.sqrt(torch.mean(u_err2)).detach().cpu()),
         "v_boundary_rmse": float(torch.sqrt(torch.mean(v_err2)).detach().cpu()),
         "boundary_speed_rmse": float(torch.sqrt(torch.mean(err2)).detach().cpu()),
         "unweighted_bc_loss": float(torch.mean(err2).detach().cpu()),
+        "lid_u_boundary_rmse": selected_rmse(u_err2, lid_mask),
+        "no_slip_wall_u_rmse": selected_rmse(u_err2, no_slip_mask),
+        "no_slip_wall_v_rmse": selected_rmse(
+            v_err2,
+            np.ones_like(lid_mask, dtype=bool),
+        ),
     }

@@ -207,7 +207,7 @@ def _method_report(
         failures.append(f"continuation_stage_valid=false ({row.get('continuation_invalid_reasons', '')})")
     for metric in VANILLA_REQUIRED:
         _check_max(metrics, metric, thresholds, failures)
-    if formulation != "cavity_uvp_soft_bc":
+    if formulation not in {"cavity_uvp_soft_bc", "cavity_uvp_velocity_lift"}:
         _check_max(metrics, "streamfunction_consistency_rmse", thresholds, failures)
     _check_min(metrics, "speed_pred_mean", float(thresholds.get("min_speed_pred_mean", 0.05)), failures)
     _check_min(metrics, "primary_streamfunction_abs", float(thresholds.get("min_primary_streamfunction_abs", 0.015)), failures)

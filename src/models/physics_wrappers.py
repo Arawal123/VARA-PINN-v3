@@ -105,6 +105,47 @@ class CavityHardBoundaryWrapper(nn.Module):
         return torch.cat([u, v, p], dim=1)
 
 
+class CavityUVPVelocityLiftWrapper(nn.Module):
+    """Direct ``u,v,p`` cavity ansatz with analytically lifted velocity walls."""
+
+    def __init__(
+        self,
+        base: nn.Module,
+        bounds: tuple[float, float, float, float],
+        lid_velocity: float = 1.0,
+        corner_width: float = 0.05,
+        lift_scale: float = 16.0,
+        lid_vertical_power: int = 3,
+    ) -> None:
+        super().__init__()
+        self.base = base
+        self.bounds = tuple(float(value) for value in bounds)
+        self.lid_velocity = float(lid_velocity)
+        self.corner_width = max(float(corner_width), 1e-6)
+        self.lift_scale = float(lift_scale)
+        self.lid_vertical_power = max(int(lid_vertical_power), 1)
+        self.physics_formulation = "cavity_uvp_velocity_lift"
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        raw = self.base(coords)
+        x0, x1, y0, y1 = self.bounds
+        xi = (coords[:, 0:1] - x0) / max(x1 - x0, 1e-12)
+        eta = (coords[:, 1:2] - y0) / max(y1 - y0, 1e-12)
+        lid_profile = _smoothstep01(xi / self.corner_width) * _smoothstep01(
+            (1.0 - xi) / self.corner_width
+        )
+        u_lift = (
+            self.lid_velocity
+            * eta.pow(self.lid_vertical_power)
+            * lid_profile
+        )
+        distance = xi * (1.0 - xi) * eta * (1.0 - eta)
+        u = u_lift + self.lift_scale * distance * raw[:, 0:1]
+        v = self.lift_scale * distance * raw[:, 1:2]
+        p = raw[:, 2:3]
+        return torch.cat([u, v, p], dim=1)
+
+
 class StreamfunctionPressureWrapper(nn.Module):
     """Convert a two-output ``(psi, p)`` network into divergence-free ``u,v,p``."""
 

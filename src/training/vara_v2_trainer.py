@@ -657,8 +657,12 @@ class VARAV2Trainer(ExperimentTrainer):
             # committed: same sampler, same seed, and same point count.
             xy_f_np = self._sample_interior_numpy(n_f)
         else:
-            n_wall = self._near_wall_sample_count(n_f)
-            n_available = n_f - n_wall
+            circulation = self._circulation_band_counts(n_f)
+            n_available = (
+                circulation["uniform"]
+                if circulation is not None
+                else n_f - self._near_wall_sample_count(n_f)
+            )
             uniform_mass = float(self.v2_config.min_uniform_mass)
             n_uniform = int(round(n_available * uniform_mass))
             n_adaptive = n_available - n_uniform

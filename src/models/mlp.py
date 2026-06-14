@@ -165,7 +165,7 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
                 model_cfg.get("hard_boundary_lid_vertical_power", 6)
             ),
         )
-    if formulation == "cavity_uvp_soft_bc":
+    if formulation in {"cavity_uvp_soft_bc", "cavity_uvp_velocity_lift"}:
         cavity_names = {
             "lid_driven_cavity",
             "lid-driven-cavity",
@@ -175,10 +175,34 @@ def build_mlp_from_config(config: dict, bounds: tuple[float, float, float, float
         }
         if str(config.get("benchmark", "")).lower() not in cavity_names:
             raise ValueError(
-                "cavity_uvp_soft_bc is only valid for the lid-driven cavity benchmark."
+                f"{formulation} is only valid for the lid-driven cavity benchmark."
             )
         if requested_out_dim != 3:
-            raise ValueError("cavity_uvp_soft_bc requires model.output_dim = 3.")
+            raise ValueError(f"{formulation} requires model.output_dim = 3.")
+        if formulation == "cavity_uvp_velocity_lift":
+            from .physics_wrappers import CavityUVPVelocityLiftWrapper
+
+            benchmark_cfg = config.get("benchmark_params", {})
+            return CavityUVPVelocityLiftWrapper(
+                model,
+                bounds,
+                lid_velocity=float(benchmark_cfg.get("lid_velocity", 1.0)),
+                corner_width=float(
+                    model_cfg.get(
+                        "uvp_velocity_lift_corner_width",
+                        benchmark_cfg.get(
+                            "lid_corner_regularization_width",
+                            0.05,
+                        ),
+                    )
+                ),
+                lift_scale=float(
+                    model_cfg.get("uvp_velocity_lift_scale", 16.0)
+                ),
+                lid_vertical_power=int(
+                    model_cfg.get("uvp_velocity_lift_vertical_power", 3)
+                ),
+            )
         model.physics_formulation = formulation
         return model
     if formulation != "direct":
