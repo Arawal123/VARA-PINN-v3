@@ -29,6 +29,8 @@ from scripts.run_lid_cavity_re_continuation import (
     _wide_improvement,
 )
 from scripts.run_modern_baselines import METHODS as BASELINE_METHODS
+from src.physics.cavity_cfd_generator import generate_cavity_cfd_reference
+from src.physics.cavity_reference import load_full_field_reference
 from src.training.vara_trainer import VARATrainer
 from src.training.vara_v2_trainer import VARAV2Trainer
 from src.utils.config import deep_update, load_config, save_config
@@ -77,6 +79,20 @@ def main() -> None:
     parser.add_argument("--cfd_seed", type=int, default=None)
     parser.add_argument("--cfd_include_pressure", action="store_true")
     parser.add_argument("--cfd_include_vorticity", action="store_true")
+    parser.add_argument(
+        "--cfd_reference_dir",
+        default="data/cavity_cfd",
+        help="Deterministic cache root for generated per-Re CFD references.",
+    )
+    parser.add_argument(
+        "--generate_missing_cfd_reference",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Generate missing deterministic CFD references. Defaults on for "
+            "sparse_cfd_polish and off for other supervision modes."
+        ),
+    )
     parser.add_argument("--output_dir", default="experiments/vara_v2/re_continuation")
     parser.add_argument("--enhanced_backbone", action="store_true")
     parser.add_argument(
@@ -197,6 +213,22 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     if args.device:
         base["device"] = args.device
     reference_map = _load_full_field_reference_map(args.full_field_reference_map)
+    supervision_mode = str(
+        base.get("data_supervision", {}).get("mode", "pure_pinn")
+    )
+    generate_missing = getattr(args, "generate_missing_cfd_reference", None)
+    if generate_missing is None:
+        generate_missing = supervision_mode == "sparse_cfd_polish"
+    resolved_references = {
+        float(reynolds): _resolve_cfd_reference_for_re(
+            float(reynolds),
+            mode=supervision_mode,
+            reference_map=reference_map,
+            reference_dir=getattr(args, "cfd_reference_dir", "data/cavity_cfd"),
+            generate_missing=bool(generate_missing),
+        )
+        for reynolds in args.reynolds
+    }
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
         if not bool(getattr(args, "overwrite", False)):
@@ -216,6 +248,7 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
             per_method: dict[str, dict[str, Any]] = {}
             re_name = f"re_{int(round(reynolds)):04d}"
             re_base = _apply_re_aware_cavity_settings(base, float(reynolds))
+            cfd_reference = resolved_references[float(reynolds)]
             for method in args.methods:
                 if method in failed_methods:
                     continue
@@ -245,7 +278,7 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     "flat_layout": True,
                 }
                 reference = _reference_for_re(float(reynolds), "ghia", None)
-                full_field = _full_field_reference_for_re(float(reynolds), reference_map)
+                full_field = cfd_reference["path"]
                 config["benchmark_params"] = {
                     **config.get("benchmark_params", {}),
                     "reynolds": float(reynolds),
@@ -259,6 +292,9 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     "reference_path": (
                         str(full_field) if full_field is not None else None
                     ),
+                    "reference_reynolds": float(reynolds),
+                    "reference_generated": bool(cfd_reference["generated"]),
+                    "reference_resolution": cfd_reference["resolution"],
                 }
                 config["warm_start_checkpoint"] = str(previous[method]) if previous[method] else None
                 config["warm_start"] = {"load_optimizer": False}
@@ -1332,6 +1368,89 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
         "continuation_stage_valid": not reasons,
         "continuation_invalid_reasons": ";".join(reasons),
     }
+
+
+def _resolve_cfd_reference_for_re(
+    reynolds: float,
+    *,
+    mode: str,
+    reference_map: dict[float, Path],
+    reference_dir: str | Path,
+    generate_missing: bool,
+) -> dict[str, Any]:
+    mapped = _full_field_reference_for_re(float(reynolds), reference_map)
+    if mapped is not None:
+        return _cfd_reference_info(mapped, reynolds, generated=False)
+
+    requires_reference = mode in {
+        "sparse_cfd",
+        "sparse_cfd_polish",
+        "full_cfd_oracle",
+    }
+    if not requires_reference:
+        return {
+            "path": None,
+            "reynolds": float(reynolds),
+            "generated": False,
+            "resolution": None,
+        }
+
+    cache_path = _generated_cfd_reference_path(reference_dir, reynolds)
+    if cache_path.exists():
+        return _cfd_reference_info(cache_path, reynolds, generated=False)
+
+    if not generate_missing:
+        raise ValueError(_missing_cfd_reference_message(reynolds, cache_path))
+    try:
+        generated = generate_cavity_cfd_reference(reynolds, cache_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{_missing_cfd_reference_message(reynolds, cache_path)} "
+            f"Automatic generation failed: {exc}"
+        ) from exc
+    return _cfd_reference_info(generated, reynolds, generated=True)
+
+
+def _generated_cfd_reference_path(
+    reference_dir: str | Path,
+    reynolds: float,
+) -> Path:
+    root = Path(reference_dir)
+    if not root.is_absolute():
+        root = ROOT / root
+    label = int(round(float(reynolds)))
+    return root / f"re_{label:04d}" / "cavity_reference.npz"
+
+
+def _cfd_reference_info(
+    path: str | Path,
+    reynolds: float,
+    *,
+    generated: bool,
+) -> dict[str, Any]:
+    resolved = Path(path).resolve()
+    reference = load_full_field_reference(resolved)
+    nx = int(np.unique(reference["x"]).size)
+    ny = int(np.unique(reference["y"]).size)
+    return {
+        "path": resolved,
+        "reynolds": float(reynolds),
+        "generated": bool(generated),
+        "resolution": f"{nx}x{ny}",
+    }
+
+
+def _missing_cfd_reference_message(
+    reynolds: float,
+    expected_path: Path,
+) -> str:
+    return (
+        f"No full-field CFD reference is available for requested Re={reynolds:g}. "
+        f"Expected reference path: {expected_path}. Generate it with: "
+        f"python -m src.physics.cavity_cfd_generator --reynolds {reynolds:g} "
+        f"--output \"{expected_path}\"; or rerun continuation with "
+        "--generate_missing_cfd_reference."
+    )
 
 
 def _trainer_for(method: str, config: dict[str, Any]) -> Any:

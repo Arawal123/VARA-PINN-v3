@@ -1634,6 +1634,19 @@ class ExperimentTrainer:
         metrics["cfd_supervision_is_oracle"] = bool(
             metrics["cfd_supervision_mode"] == "full_cfd_oracle"
         )
+        metrics["cfd_reference_reynolds"] = supervision_cfg.get(
+            "reference_reynolds",
+            self.config.get("benchmark_params", {}).get("reynolds"),
+        )
+        metrics["cfd_reference_path"] = str(
+            supervision_cfg.get("reference_path") or ""
+        )
+        metrics["cfd_reference_generated"] = bool(
+            supervision_cfg.get("reference_generated", False)
+        )
+        metrics["cfd_reference_resolution"] = supervision_cfg.get(
+            "reference_resolution"
+        )
         if self.cfd_supervision is None:
             metrics["cfd_sparse_sample_count"] = 0
             metrics["cfd_sparse_sample_fraction"] = 0.0
