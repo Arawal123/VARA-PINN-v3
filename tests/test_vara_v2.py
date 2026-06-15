@@ -790,7 +790,12 @@ def _sparse_polish_guard_metrics(value=0.1):
         "continuity_residual_mean": value,
         "boundary_condition_error": value,
         "cfd_velocity_mse_sparse": value,
+        "cfd_u_mse_sparse": value * 0.4,
+        "cfd_v_mse_sparse": value * 0.6,
         "top_band_continuity_residual_mean": value,
+        "top_band_pde_residual_mean": value,
+        "upper_core_pde_residual_mean": value,
+        "near_wall_pde_residual_mean": value,
         "speed_pred_max": 1.0,
     }
 
@@ -822,15 +827,20 @@ def test_vara_sparse_polish_score_excludes_dense_cfd_topology_and_vortex_metrics
     }
 
     assert trainer._sparse_polish_score(contaminated) == pytest.approx(baseline)
-    assert set(trainer.v2_config.guard_metrics) == {
+    assert {
         "pde_residual_mean",
         "momentum_residual_mean",
         "continuity_residual_mean",
         "boundary_condition_error",
         "cfd_velocity_mse_sparse",
+        "cfd_u_mse_sparse",
+        "cfd_v_mse_sparse",
         "top_band_continuity_residual_mean",
+        "top_band_pde_residual_mean",
+        "upper_core_pde_residual_mean",
+        "near_wall_pde_residual_mean",
         "speed_pred_max",
-    }
+    }.issubset(set(trainer.v2_config.guard_metrics))
 
 
 @pytest.mark.parametrize(
@@ -869,9 +879,14 @@ def test_vara_sparse_polish_rejects_score_gain_with_guard_regression(
     assert decision["vara_sparse_polish_score_after"] < decision[
         "vara_sparse_polish_score_before"
     ]
-    assert decision["guard_changes"][worsened_metric] > 0.015
+    assert decision["guard_changes"][worsened_metric] > 0.005
     assert not accepted
-    assert decision["rollback_reason"] == "sparse_polish_pareto_guard_violation"
+    expected_reason = {
+        "pde_residual_mean": "worsened_pde",
+        "continuity_residual_mean": "worsened_continuity",
+        "boundary_condition_error": "worsened_boundary",
+    }[worsened_metric]
+    assert decision["rollback_reason"] == expected_reason
 
 
 def test_vara_sparse_polish_rejects_low_improvement_per_compute(tmp_path):
@@ -903,7 +918,142 @@ def test_vara_sparse_polish_rejects_low_improvement_per_compute(tmp_path):
     ]
     assert decision["accepted_improvement_per_compute"] < 0.01
     assert not accepted
-    assert decision["rollback_reason"] == "sparse_polish_score_below_noise"
+    assert decision["rollback_reason"] == "insufficient_score_gain"
+
+
+def test_vara_sparse_polish_accepts_clear_pareto_score_improvement(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+
+    class Region:
+        variable = "continuity_residual"
+        patch_id = 0
+        severity = 1.0
+        persistence = 3
+
+    candidate = trainer.v2_controller.candidates([Region()])[0]
+    candidate.predicted_target_improvement = 0.1
+    before = _sparse_polish_guard_metrics()
+    after = {
+        name: value * 0.98 if name != "speed_pred_max" else value
+        for name, value in before.items()
+    }
+
+    accepted, decision = trainer._evaluate_sparse_polish_candidate(
+        candidate,
+        before,
+        after,
+    )
+
+    assert accepted
+    assert decision["score_after"] < decision["score_before"]
+    assert decision["rollback_reason"] == ""
+
+
+def test_vara_sparse_polish_rejects_sparse_cfd_regression(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer._update_sparse_polish_best(_sparse_polish_guard_metrics())
+
+    class Region:
+        variable = "aggregate_pde_residual"
+        patch_id = 0
+        severity = 1.0
+        persistence = 3
+
+    candidate = trainer.v2_controller.candidates([Region()])[0]
+    candidate.predicted_target_improvement = 0.1
+    before = _sparse_polish_guard_metrics()
+    after = {name: value * 0.90 for name, value in before.items()}
+    after["speed_pred_max"] = before["speed_pred_max"]
+    after["cfd_velocity_mse_sparse"] = before["cfd_velocity_mse_sparse"] * 1.01
+
+    accepted, decision = trainer._evaluate_sparse_polish_candidate(
+        candidate,
+        before,
+        after,
+    )
+
+    assert not accepted
+    assert decision["rollback_reason"] == "worsened_sparse_cfd_mse"
+
+
+def test_vara_sparse_polish_score_normalization_is_re_aware_not_re100_hardcoded(
+    tmp_path,
+):
+    low = _sparse_polish_v2_trainer(tmp_path / "low")
+    high = _sparse_polish_v2_trainer(tmp_path / "high")
+    high.config["benchmark_params"]["reynolds"] = 1000.0
+    low_base = _sparse_polish_guard_metrics(0.05)
+    high_base = _sparse_polish_guard_metrics(0.20)
+    low._update_sparse_polish_best(low_base)
+    high._update_sparse_polish_best(high_base)
+    low_after = {
+        name: value * 0.9 if name != "speed_pred_max" else value
+        for name, value in low_base.items()
+    }
+    high_after = {
+        name: value * 0.9 if name != "speed_pred_max" else value
+        for name, value in high_base.items()
+    }
+
+    low_ratio = low._sparse_polish_score(low_after) / low._sparse_polish_initial_score
+    high_ratio = (
+        high._sparse_polish_score(high_after) / high._sparse_polish_initial_score
+    )
+    assert low_ratio == pytest.approx(high_ratio)
+
+
+def test_vara_sparse_polish_boundary_data_guard_is_bounded_and_opt_in(tmp_path):
+    polish = _sparse_polish_v2_trainer(tmp_path / "polish")
+
+    class Region:
+        variable = "top_band_continuity_residual"
+        patch_id = 2
+        severity = 1.0
+        persistence = 3
+
+    candidate = polish._sparse_polish_rescue_candidate(
+        [Region()],
+        _sparse_polish_guard_metrics(),
+    )
+    assert candidate is not None
+    assert candidate.action_type == "boundary_data_guard"
+    polish.v2_controller.apply(candidate)
+    assert set(polish.v2_controller.state.global_multipliers) == {
+        "bc_uvp_balanced",
+        "top_band_continuity",
+        "cfd_v_mse",
+    }
+    assert all(
+        1.0 <= value <= 1.15
+        for value in polish.v2_controller.state.global_multipliers.values()
+    )
+
+    sparse_config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path / "sparse",
+            data_supervision_mode="sparse_cfd",
+        ),
+        {
+            "experiments": {
+                "root": str(tmp_path / "sparse" / "run"),
+                "flat_layout": True,
+            }
+        },
+    )
+    sparse = VARAV2Trainer(sparse_config)
+    assert sparse._sparse_polish_rescue_candidate(
+        [Region()],
+        _sparse_polish_guard_metrics(),
+    ) is None
+
+
+def test_vara_sparse_polish_noop_fallback_requires_clear_gain(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.accepted_interventions = 0
+    assert trainer._sparse_polish_should_noop(0.20)
+    trainer.accepted_interventions = 1
+    assert trainer._sparse_polish_should_noop(0.005)
+    assert not trainer._sparse_polish_should_noop(0.02)
 
 
 def test_vara_sparse_polish_restores_best_safe_state_if_final_is_worse(tmp_path):

@@ -32,17 +32,24 @@ SPARSE_POLISH_GUARD_METRICS = (
     "continuity_residual_mean",
     "boundary_condition_error",
     "cfd_velocity_mse_sparse",
+    "cfd_u_mse_sparse",
+    "cfd_v_mse_sparse",
     "top_band_continuity_residual_mean",
     "speed_pred_max",
 )
 
 SPARSE_POLISH_SCORE_WEIGHTS = {
-    "continuity_residual_mean": 3.0,
-    "boundary_condition_error": 2.5,
-    "pde_residual_mean": 1.0,
-    "momentum_residual_mean": 1.0,
-    "cfd_velocity_mse_sparse": 2.0,
-    "top_band_continuity_residual_mean": 1.5,
+    "pde_residual_mean": 1.4,
+    "momentum_residual_mean": 1.4,
+    "continuity_residual_mean": 2.2,
+    "boundary_condition_error": 2.0,
+    "cfd_velocity_mse_sparse": 1.8,
+    "cfd_u_mse_sparse": 0.3,
+    "cfd_v_mse_sparse": 0.5,
+    "top_band_continuity_residual_mean": 0.8,
+    "top_band_pde_residual_mean": 0.3,
+    "upper_core_pde_residual_mean": 0.2,
+    "near_wall_pde_residual_mean": 0.5,
 }
 
 
@@ -64,7 +71,11 @@ class VARAV2Trainer(ExperimentTrainer):
             == "sparse_cfd_polish"
         )
         if self.sparse_cfd_polish_v2:
-            cfg["guard_metrics"] = list(SPARSE_POLISH_GUARD_METRICS)
+            cfg["guard_metrics"] = list(
+                dict.fromkeys(
+                    (*SPARSE_POLISH_GUARD_METRICS, *SPARSE_POLISH_SCORE_WEIGHTS)
+                )
+            )
             cfg["trust_radius_initial"] = min(
                 float(cfg.get("trust_radius_initial", 0.10)), 0.05
             )
@@ -89,6 +100,10 @@ class VARAV2Trainer(ExperimentTrainer):
         self._sparse_polish_score_before = float("nan")
         self._sparse_polish_score_after = float("nan")
         self._sparse_polish_restored_best = False
+        self._sparse_polish_score_scales: dict[str, float] = {}
+        self._sparse_polish_initial_score = float("nan")
+        self._sparse_polish_final_score = float("nan")
+        self._sparse_polish_noop_fallback = False
         sampling_snapshot = self.sampling_state_snapshot()
         self._probe_batch = self._make_probe_batch()
         # The fixed controller probe must not advance the optimization
@@ -142,6 +157,12 @@ class VARAV2Trainer(ExperimentTrainer):
             metrics_before = self._guard_metrics(coords)
             self.v2_controller.update_history(names, raw_before, metrics_before)
             candidates = self.v2_controller.candidates(weak_regions)
+            if self.sparse_cfd_polish_v2:
+                rescue = self._sparse_polish_rescue_candidate(
+                    weak_regions, metrics_before
+                )
+                if rescue is not None:
+                    candidates.append(rescue)
             influence = self._candidate_influence(candidates)
             ranked = self.v2_controller.rank(candidates, influence)
             active_candidates = [item for item in ranked if not item.prefiltered]
@@ -161,6 +182,8 @@ class VARAV2Trainer(ExperimentTrainer):
                     rejected,
                     update_trust=not active_candidates and index == 0,
                 )
+                if self.sparse_cfd_polish_v2:
+                    decision["rollback_reason"] = "gradient_conflict"
                 self._log_decision(block, rejected, decision)
 
             if not active_candidates:
@@ -417,9 +440,39 @@ class VARAV2Trainer(ExperimentTrainer):
 
         if self.sparse_cfd_polish_v2:
             _, _, final_guard_coords = self.validation_grid()
-            self._restore_sparse_polish_best_if_needed(
-                self._guard_metrics(final_guard_coords)
+            pre_restore_metrics = self._guard_metrics(final_guard_coords)
+            self._sparse_polish_final_score = self._sparse_polish_score(
+                pre_restore_metrics
             )
+            minimum_gain = float(
+                self.config.get("controller_v2", {}).get(
+                    "sparse_polish_noop_min_score_gain", 0.01
+                )
+            )
+            best_score = (
+                float(self._sparse_polish_best["score"])
+                if self._sparse_polish_best is not None
+                else math.inf
+            )
+            score_gain = (
+                (self._sparse_polish_initial_score - best_score)
+                / max(abs(self._sparse_polish_initial_score), 1e-12)
+                if math.isfinite(self._sparse_polish_initial_score)
+                and math.isfinite(best_score)
+                else 0.0
+            )
+            self._sparse_polish_noop_fallback = self._sparse_polish_should_noop(
+                score_gain,
+                minimum_gain=minimum_gain,
+            )
+            self._restore_sparse_polish_best_if_needed(
+                pre_restore_metrics,
+                force=self._sparse_polish_noop_fallback,
+            )
+            if self._sparse_polish_restored_best:
+                self._sparse_polish_final_score = self._sparse_polish_score(
+                    self._guard_metrics(final_guard_coords)
+                )
             checkpoint_cfg = self.config.setdefault("checkpoint", {})
             restore_best = checkpoint_cfg.get("restore_best_before_final", False)
             checkpoint_cfg["restore_best_before_final"] = False
@@ -441,6 +494,8 @@ class VARAV2Trainer(ExperimentTrainer):
                 "accepted_improvement_per_compute": accepted_improvement,
                 "vara_sparse_polish_score_before": self._sparse_polish_score_before,
                 "vara_sparse_polish_score_after": self._sparse_polish_score_after,
+                "vara_sparse_polish_score_initial": self._sparse_polish_initial_score,
+                "vara_sparse_polish_score_final": self._sparse_polish_final_score,
                 "vara_sparse_polish_best_score": (
                     float(self._sparse_polish_best["score"])
                     if self._sparse_polish_best is not None
@@ -448,6 +503,22 @@ class VARAV2Trainer(ExperimentTrainer):
                 ),
                 "vara_sparse_polish_restored_best_checkpoint": (
                     self._sparse_polish_restored_best
+                ),
+                "vara_sparse_polish_score_improvement": (
+                    self._sparse_polish_initial_score
+                    - (
+                        float(self._sparse_polish_best["score"])
+                        if self._sparse_polish_best is not None
+                        else self._sparse_polish_final_score
+                    )
+                ),
+                "vara_sparse_polish_acceptance_margin": float(
+                    self.config.get("controller_v2", {}).get(
+                        "sparse_polish_score_margin", 0.0075
+                    )
+                ),
+                "vara_sparse_polish_noop_fallback": (
+                    self._sparse_polish_noop_fallback
                 ),
             }
         )
@@ -477,6 +548,13 @@ class VARAV2Trainer(ExperimentTrainer):
     ) -> None:
         train_cfg = self.config.get("training", {})
         scalar_weights = dict(train_cfg.get("weights", {}))
+        if self.sparse_cfd_polish_v2:
+            for name, multiplier in (
+                self.v2_controller.state.global_multipliers.items()
+            ):
+                scalar_weights[name] = float(
+                    scalar_weights.get(name, 0.0)
+                ) * float(multiplier)
         log_every = max(1, int(train_cfg.get("log_every", 25)))
         self.model.train()
         started = time.perf_counter()
@@ -623,7 +701,12 @@ class VARAV2Trainer(ExperimentTrainer):
                 {
                     name: float(value)
                     for name, value in self._cfd_sparse_metrics().items()
-                    if name == "cfd_velocity_mse_sparse"
+                    if name
+                    in {
+                        "cfd_velocity_mse_sparse",
+                        "cfd_u_mse_sparse",
+                        "cfd_v_mse_sparse",
+                    }
                 }
             )
         self.v2_controller.assert_reference_free(selected)
@@ -637,7 +720,11 @@ class VARAV2Trainer(ExperimentTrainer):
             value = float(metrics.get(name, float("nan")))
             if not math.isfinite(value):
                 return math.inf
-            score += weight * max(value, 0.0)
+            scale = max(
+                float(self._sparse_polish_score_scales.get(name, value)),
+                1e-12,
+            )
+            score += weight * max(value, 0.0) / scale
         speed = float(metrics.get("speed_pred_max", float("nan")))
         speed_gate = float(
             self.config.get("continuation_validity", {}).get(
@@ -645,7 +732,9 @@ class VARAV2Trainer(ExperimentTrainer):
             )
         )
         if math.isfinite(speed) and math.isfinite(speed_gate):
-            score += max(speed - speed_gate, 0.0) ** 2
+            score += 0.4 * (
+                max(speed - speed_gate, 0.0) / max(speed_gate, 1e-12)
+            ) ** 2
         return float(score)
 
     def _evaluate_sparse_polish_candidate(
@@ -657,6 +746,16 @@ class VARAV2Trainer(ExperimentTrainer):
         self.v2_controller.assert_reference_free(
             set(before_metrics) | set(after_metrics)
         )
+        if not self._sparse_polish_score_scales:
+            self._sparse_polish_score_scales = {
+                name: max(float(before_metrics[name]), 1e-12)
+                for name in SPARSE_POLISH_SCORE_WEIGHTS
+                if name in before_metrics
+                and math.isfinite(float(before_metrics[name]))
+            }
+            self._sparse_polish_initial_score = self._sparse_polish_score(
+                before_metrics
+            )
         before_score = self._sparse_polish_score(before_metrics)
         after_score = self._sparse_polish_score(after_metrics)
         eps = 1e-12
@@ -665,15 +764,11 @@ class VARAV2Trainer(ExperimentTrainer):
             self.v2_config.noise_floor,
             float(
                 self.config.get("controller_v2", {}).get(
-                    "sparse_polish_score_margin", 0.01
+                    "sparse_polish_score_margin", 0.0075
                 )
             ),
         )
-        guard_tolerance = float(
-            self.config.get("controller_v2", {}).get(
-                "sparse_polish_guard_tolerance", 0.015
-            )
-        )
+        tolerances = self._sparse_polish_guard_tolerances()
         probe_steps = max(
             1,
             int(self.config.get("controller_v2", {}).get("probe_steps", 1)),
@@ -685,6 +780,7 @@ class VARAV2Trainer(ExperimentTrainer):
             )
         )
         guard_changes: dict[str, float] = {}
+        speed_cap_violation = False
         for name in SPARSE_POLISH_GUARD_METRICS:
             if name not in before_metrics or name not in after_metrics:
                 continue
@@ -696,10 +792,14 @@ class VARAV2Trainer(ExperimentTrainer):
                         "max_speed_pred", math.inf
                     )
                 )
+                speed_cap_violation = math.isfinite(speed_gate) and after > speed_gate
                 before = max(before - speed_gate, 0.0)
                 after = max(after - speed_gate, 0.0)
             guard_changes[name] = (after - before) / (abs(before) + eps)
-        guard_ok = all(change <= guard_tolerance for change in guard_changes.values())
+        guard_ok = all(
+            change <= tolerances.get(name, 0.005)
+            for name, change in guard_changes.items()
+        ) and not speed_cap_violation
         accepted = (
             math.isfinite(before_score)
             and math.isfinite(after_score)
@@ -713,6 +813,16 @@ class VARAV2Trainer(ExperimentTrainer):
         reward_ratio = observed / predicted
         self._sparse_polish_score_before = before_score
         self._sparse_polish_score_after = after_score
+        reject_reason = self._sparse_polish_reject_reason(
+            observed,
+            score_margin,
+            improvement_per_compute,
+            minimum_improvement_per_compute,
+            guard_changes,
+            tolerances,
+            speed_cap_violation,
+            candidate,
+        )
         return accepted, {
             "accepted": bool(accepted),
             "target_noise": score_margin,
@@ -724,22 +834,12 @@ class VARAV2Trainer(ExperimentTrainer):
             "comparison_mode": "sparse_polish_counterfactual",
             "guard_changes": guard_changes,
             "guard_noise": {
-                name: guard_tolerance for name in guard_changes
+                name: tolerances.get(name, 0.005) for name in guard_changes
             },
             "trust_radius_before": self.v2_controller.trust_radius,
-            "rollback_reason": (
-                ""
-                if accepted
-                else (
-                    "sparse_polish_score_below_noise"
-                    if (
-                        observed <= score_margin
-                        or improvement_per_compute
-                        <= minimum_improvement_per_compute
-                    )
-                    else "sparse_polish_pareto_guard_violation"
-                )
-            ),
+            "rollback_reason": "" if accepted else reject_reason,
+            "score_before": before_score,
+            "score_after": after_score,
             "vara_sparse_polish_score_before": before_score,
             "vara_sparse_polish_score_after": after_score,
         }
@@ -752,6 +852,9 @@ class VARAV2Trainer(ExperimentTrainer):
             if candidate.action_type == "sampling":
                 conservative.append(candidate)
                 continue
+            if candidate.action_type == "boundary_data_guard":
+                conservative.append(candidate)
+                continue
             history = self.v2_controller.score_history.get(
                 (candidate.variable, candidate.patch_id), []
             )
@@ -761,10 +864,21 @@ class VARAV2Trainer(ExperimentTrainer):
                 and candidate.gradient_compatibility >= 0.80
             ):
                 conservative.append(candidate)
+        repeated_failure = any(
+            candidate.persistence >= 3
+            for candidate in conservative
+            if candidate.action_type == "boundary_data_guard"
+        )
+        priority = {
+            "boundary_data_guard": 0 if repeated_failure else 1,
+            "sampling": 1 if repeated_failure else 0,
+            "local_loss": 2,
+            "joint": 3,
+        }
         return sorted(
             conservative,
             key=lambda item: (
-                item.action_type != "sampling",
+                priority.get(item.action_type, 4),
                 -item.rank_score,
             ),
         )
@@ -779,6 +893,14 @@ class VARAV2Trainer(ExperimentTrainer):
             self._sparse_polish_best is None
             or score < float(self._sparse_polish_best["score"])
         ):
+            if not self._sparse_polish_score_scales:
+                self._sparse_polish_score_scales = {
+                    name: max(float(metrics[name]), 1e-12)
+                    for name in SPARSE_POLISH_SCORE_WEIGHTS
+                    if name in metrics and math.isfinite(float(metrics[name]))
+                }
+                score = self._sparse_polish_score(metrics)
+                self._sparse_polish_initial_score = score
             self._sparse_polish_best = {
                 "score": score,
                 "model": self._model_snapshot(),
@@ -789,7 +911,10 @@ class VARAV2Trainer(ExperimentTrainer):
             }
 
     def _restore_sparse_polish_best_if_needed(
-        self, current_metrics: dict[str, float]
+        self,
+        current_metrics: dict[str, float],
+        *,
+        force: bool = False,
     ) -> bool:
         if not self.sparse_cfd_polish_v2 or self._sparse_polish_best is None:
             return False
@@ -800,7 +925,7 @@ class VARAV2Trainer(ExperimentTrainer):
                 "sparse_polish_final_restore_tolerance", 0.002
             )
         )
-        if math.isfinite(current_score) and current_score <= best_score * (
+        if not force and math.isfinite(current_score) and current_score <= best_score * (
             1.0 + tolerance
         ):
             return False
@@ -814,6 +939,101 @@ class VARAV2Trainer(ExperimentTrainer):
         self._sync_benchmark_corner_to_model()
         self._sparse_polish_restored_best = True
         return True
+
+    def _sparse_polish_guard_tolerances(self) -> dict[str, float]:
+        cfg = dict(self.config.get("controller_v2", {}))
+        protected = float(cfg.get("sparse_polish_protected_tolerance", 0.005))
+        physics = float(cfg.get("sparse_polish_physics_tolerance", 0.01))
+        return {
+            "pde_residual_mean": physics,
+            "momentum_residual_mean": physics,
+            "continuity_residual_mean": protected,
+            "boundary_condition_error": protected,
+            "cfd_velocity_mse_sparse": protected,
+            "cfd_u_mse_sparse": protected,
+            "cfd_v_mse_sparse": protected,
+            "top_band_continuity_residual_mean": protected,
+            "speed_pred_max": 0.0,
+        }
+
+    def _sparse_polish_should_noop(
+        self,
+        score_gain: float,
+        *,
+        minimum_gain: float | None = None,
+    ) -> bool:
+        threshold = (
+            float(minimum_gain)
+            if minimum_gain is not None
+            else float(
+                self.config.get("controller_v2", {}).get(
+                    "sparse_polish_noop_min_score_gain", 0.01
+                )
+            )
+        )
+        return self.accepted_interventions == 0 or float(score_gain) < threshold
+
+    def _sparse_polish_reject_reason(
+        self,
+        observed: float,
+        score_margin: float,
+        improvement_per_compute: float,
+        minimum_improvement_per_compute: float,
+        guard_changes: dict[str, float],
+        tolerances: dict[str, float],
+        speed_cap_violation: bool,
+        candidate: V2Candidate,
+    ) -> str:
+        if speed_cap_violation:
+            return "speed_cap_violation"
+        for name, reason in (
+            ("continuity_residual_mean", "worsened_continuity"),
+            ("top_band_continuity_residual_mean", "worsened_continuity"),
+            ("boundary_condition_error", "worsened_boundary"),
+            ("cfd_velocity_mse_sparse", "worsened_sparse_cfd_mse"),
+            ("cfd_u_mse_sparse", "worsened_sparse_cfd_mse"),
+            ("cfd_v_mse_sparse", "worsened_sparse_cfd_mse"),
+            ("pde_residual_mean", "worsened_pde"),
+            ("momentum_residual_mean", "worsened_pde"),
+        ):
+            if guard_changes.get(name, -math.inf) > tolerances.get(name, 0.005):
+                return reason
+        if candidate.gradient_compatibility < 0.0:
+            return "gradient_conflict"
+        if (
+            observed <= score_margin
+            or improvement_per_compute <= minimum_improvement_per_compute
+        ):
+            return "insufficient_score_gain"
+        return "pareto_guard_violation"
+
+    def _sparse_polish_rescue_candidate(
+        self,
+        weak_regions: list[Any],
+        metrics: dict[str, float],
+    ) -> V2Candidate | None:
+        if not self.sparse_cfd_polish_v2 or not weak_regions:
+            return None
+        primary = weak_regions[0]
+        variable = str(primary.variable)
+        if not any(
+            token in variable.lower()
+            for token in ("continuity", "boundary", "near_wall", "top_band")
+        ):
+            return None
+        return V2Candidate(
+            variable=variable,
+            patch_id=int(primary.patch_id),
+            action_type="boundary_data_guard",
+            loss_names=[
+                "bc_uvp_balanced",
+                "top_band_continuity",
+                "cfd_v_mse",
+            ],
+            severity=float(primary.severity),
+            persistence=int(getattr(primary, "persistence", 1)),
+            trend=0.0,
+        )
 
     def _make_probe_batch(self) -> dict[str, Any]:
         cfg = dict(self.config.get("controller_v2", {}))
@@ -876,6 +1096,14 @@ class VARAV2Trainer(ExperimentTrainer):
         candidate: V2Candidate,
         pointwise: dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        if candidate.action_type == "boundary_data_guard":
+            rescue_terms = [
+                pointwise[name].mean()
+                for name in candidate.loss_names
+                if name in pointwise
+            ]
+            if rescue_terms:
+                return sum(rescue_terms)
         terms: list[torch.Tensor] = []
         for name in candidate.loss_names:
             if name not in pointwise:

@@ -37,7 +37,12 @@ ALLOWED_GUARD_METRICS = (
 SAFE_REFERENCE_FREE_METRICS = {
     *ALLOWED_GUARD_METRICS,
     "cfd_velocity_mse_sparse",
+    "cfd_u_mse_sparse",
+    "cfd_v_mse_sparse",
     "top_band_continuity_residual_mean",
+    "top_band_pde_residual_mean",
+    "upper_core_pde_residual_mean",
+    "near_wall_pde_residual_mean",
     "speed_pred_max",
     "streamfunction_consistency_rmse",
     "centerline_pde_residual_mean",
@@ -117,6 +122,7 @@ class V2AllocationState:
     num_patches: int
     sampling_mass: np.ndarray = field(init=False)
     loss_multipliers: dict[str, np.ndarray] = field(default_factory=dict)
+    global_multipliers: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.sampling_mass = np.full(self.num_patches, 1.0 / self.num_patches, dtype=float)
@@ -125,6 +131,7 @@ class V2AllocationState:
         return {
             "sampling_mass": self.sampling_mass.copy(),
             "loss_multipliers": {name: values.copy() for name, values in self.loss_multipliers.items()},
+            "global_multipliers": dict(self.global_multipliers),
         }
 
     def restore(self, snapshot: dict[str, Any]) -> None:
@@ -132,6 +139,10 @@ class V2AllocationState:
         self.loss_multipliers = {
             str(name): np.asarray(values, dtype=float).copy()
             for name, values in dict(snapshot["loss_multipliers"]).items()
+        }
+        self.global_multipliers = {
+            str(name): float(value)
+            for name, value in dict(snapshot.get("global_multipliers", {})).items()
         }
 
     def multiplier(self, loss_name: str) -> np.ndarray:
@@ -145,6 +156,7 @@ class V2AllocationState:
             "loss_multipliers": {
                 name: values.tolist() for name, values in self.loss_multipliers.items()
             },
+            "global_multipliers": dict(self.global_multipliers),
         }
 
 
@@ -292,6 +304,21 @@ class VARAV2Controller:
 
     def apply(self, candidate: V2Candidate) -> None:
         radius = float(self.trust_radius)
+        if candidate.action_type == "boundary_data_guard":
+            bounded = min(1.15, 1.0 + max(radius, 0.0))
+            for loss_name in (
+                "bc_uvp_balanced",
+                "top_band_continuity",
+                "cfd_v_mse",
+            ):
+                self.state.global_multipliers[loss_name] = min(
+                    1.15,
+                    max(
+                        1.0,
+                        self.state.global_multipliers.get(loss_name, 1.0),
+                        bounded,
+                    ),
+                )
         if candidate.action_type in {"sampling", "joint"}:
             sampling_radius = radius if candidate.action_type == "sampling" else 0.5 * radius
             self.state.sampling_mass = _redistribute_probability_mass(
@@ -472,6 +499,11 @@ class VARAV2Controller:
                 raise RuntimeError("VARA V2 local multiplier is below its lower bound.")
             if np.any(values > self.config.multiplier_max + 1e-10):
                 raise RuntimeError("VARA V2 local multiplier exceeds its upper bound.")
+        for value in self.state.global_multipliers.values():
+            if value < 1.0 - 1e-10 or value > 1.15 + 1e-10:
+                raise RuntimeError(
+                    "VARA V2 guarded global multiplier exceeds its bounds."
+                )
 
 
 def _losses_for_diagnostic(name: str) -> list[str]:
