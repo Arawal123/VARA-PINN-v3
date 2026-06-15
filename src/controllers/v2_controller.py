@@ -36,6 +36,9 @@ ALLOWED_GUARD_METRICS = (
 
 SAFE_REFERENCE_FREE_METRICS = {
     *ALLOWED_GUARD_METRICS,
+    "cfd_velocity_mse_sparse",
+    "top_band_continuity_residual_mean",
+    "speed_pred_max",
     "streamfunction_consistency_rmse",
     "centerline_pde_residual_mean",
     "centerline_continuity_residual_mean",

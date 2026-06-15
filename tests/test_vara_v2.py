@@ -735,6 +735,7 @@ def _small_cavity_trainer_config(
     data_supervision_mode: str = "pure_pinn",
     n_collocation: int = 100,
 ):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
     reference_path = tmp_path / f"{data_supervision_mode}_cfd.npz"
     if data_supervision_mode != "pure_pinn":
@@ -780,6 +781,184 @@ def _force_non_neutral_v2_sampling(trainer):
     mass[0] += 0.05
     mass[1:] -= 0.05 / (count - 1)
     trainer.v2_controller.state.sampling_mass = mass
+
+
+def _sparse_polish_guard_metrics(value=0.1):
+    return {
+        "pde_residual_mean": value,
+        "momentum_residual_mean": value,
+        "continuity_residual_mean": value,
+        "boundary_condition_error": value,
+        "cfd_velocity_mse_sparse": value,
+        "top_band_continuity_residual_mean": value,
+        "speed_pred_max": 1.0,
+    }
+
+
+def _sparse_polish_v2_trainer(tmp_path):
+    config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path,
+            data_supervision_mode="sparse_cfd_polish",
+        ),
+        {"experiments": {"root": str(tmp_path / "polish"), "flat_layout": True}},
+    )
+    return VARAV2Trainer(config)
+
+
+def test_vara_sparse_polish_score_excludes_dense_cfd_topology_and_vortex_metrics(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    metrics = _sparse_polish_guard_metrics()
+    baseline = trainer._sparse_polish_score(metrics)
+    contaminated = {
+        **metrics,
+        "cfd_velocity_full_rel_l2_eval_only": 999.0,
+        "ghia_profile_score": 999.0,
+        "topology_aligned": False,
+        "detected_vortex_count": 99,
+        "primary_vortex_center_error": 999.0,
+    }
+
+    assert trainer._sparse_polish_score(contaminated) == pytest.approx(baseline)
+    assert set(trainer.v2_config.guard_metrics) == {
+        "pde_residual_mean",
+        "momentum_residual_mean",
+        "continuity_residual_mean",
+        "boundary_condition_error",
+        "cfd_velocity_mse_sparse",
+        "top_band_continuity_residual_mean",
+        "speed_pred_max",
+    }
+
+
+@pytest.mark.parametrize(
+    "worsened_metric",
+    [
+        "pde_residual_mean",
+        "continuity_residual_mean",
+        "boundary_condition_error",
+    ],
+)
+def test_vara_sparse_polish_rejects_score_gain_with_guard_regression(
+    tmp_path,
+    worsened_metric,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+
+    class Region:
+        variable = "continuity_residual"
+        patch_id = 0
+        severity = 1.0
+        persistence = 3
+
+    candidate = trainer.v2_controller.candidates([Region()])[0]
+    candidate.predicted_target_improvement = 0.1
+    before = _sparse_polish_guard_metrics()
+    after = dict(before)
+    after["cfd_velocity_mse_sparse"] = 0.01
+    after[worsened_metric] = before[worsened_metric] * 1.03
+
+    accepted, decision = trainer._evaluate_sparse_polish_candidate(
+        candidate,
+        before,
+        after,
+    )
+
+    assert decision["vara_sparse_polish_score_after"] < decision[
+        "vara_sparse_polish_score_before"
+    ]
+    assert decision["guard_changes"][worsened_metric] > 0.015
+    assert not accepted
+    assert decision["rollback_reason"] == "sparse_polish_pareto_guard_violation"
+
+
+def test_vara_sparse_polish_rejects_low_improvement_per_compute(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.config["controller_v2"][
+        "sparse_polish_min_probe_improvement_per_compute"
+    ] = 0.01
+
+    class Region:
+        variable = "continuity_residual"
+        patch_id = 0
+        severity = 1.0
+        persistence = 3
+
+    candidate = trainer.v2_controller.candidates([Region()])[0]
+    candidate.predicted_target_improvement = 0.1
+    before = _sparse_polish_guard_metrics()
+    after = {name: value * 0.95 for name, value in before.items()}
+    after["speed_pred_max"] = before["speed_pred_max"]
+
+    accepted, decision = trainer._evaluate_sparse_polish_candidate(
+        candidate,
+        before,
+        after,
+    )
+
+    assert decision["vara_sparse_polish_score_after"] < decision[
+        "vara_sparse_polish_score_before"
+    ]
+    assert decision["accepted_improvement_per_compute"] < 0.01
+    assert not accepted
+    assert decision["rollback_reason"] == "sparse_polish_score_below_noise"
+
+
+def test_vara_sparse_polish_restores_best_safe_state_if_final_is_worse(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    best_metrics = _sparse_polish_guard_metrics(0.05)
+    trainer._update_sparse_polish_best(best_metrics)
+    expected = {
+        name: value.clone()
+        for name, value in trainer.model.state_dict().items()
+    }
+    with torch.no_grad():
+        next(trainer.model.parameters()).add_(1.0)
+
+    restored = trainer._restore_sparse_polish_best_if_needed(
+        _sparse_polish_guard_metrics(0.20)
+    )
+
+    assert restored
+    assert trainer._sparse_polish_restored_best
+    for name, value in trainer.model.state_dict().items():
+        assert torch.equal(value.cpu(), expected[name].cpu())
+
+
+def test_vara_sparse_polish_controller_overrides_are_mode_scoped(tmp_path):
+    polish = _sparse_polish_v2_trainer(tmp_path / "polish")
+    sparse_config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path / "sparse",
+            data_supervision_mode="sparse_cfd",
+        ),
+        {
+            "experiments": {
+                "root": str(tmp_path / "sparse" / "run"),
+                "flat_layout": True,
+            }
+        },
+    )
+    pure_config = deep_update(
+        _small_cavity_trainer_config(tmp_path / "pure"),
+        {
+            "experiments": {
+                "root": str(tmp_path / "pure" / "run"),
+                "flat_layout": True,
+            }
+        },
+    )
+    sparse = VARAV2Trainer(sparse_config)
+    pure = VARAV2Trainer(pure_config)
+
+    assert polish.v2_controller.trust_radius == pytest.approx(0.05)
+    assert polish.v2_config.counterfactual_probe_enabled
+    assert sparse.v2_controller.trust_radius == pytest.approx(0.10)
+    assert not sparse.v2_config.counterfactual_probe_enabled
+    assert pure.v2_controller.trust_radius == pytest.approx(0.10)
+    assert not pure.v2_config.counterfactual_probe_enabled
 
 
 def test_vara_v2_resample_sparse_cfd_polish_uses_exact_soft_bc_core_count(
