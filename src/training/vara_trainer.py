@@ -23,6 +23,7 @@ from src.losses.modern_baselines import (
     ReLoBRaLoWeights,
     ResidualAttentionState,
     causal_temporal_objective,
+    gradient_enhanced_pointwise_losses,
     loss_gradient_norm,
     self_adaptive_objective,
 )
@@ -99,7 +100,7 @@ class VARATrainer(ExperimentTrainer):
         if self.mode == "gradient_balanced_pinn":
             return self._run_uniform_baseline(self._train_gradient_balanced_epochs)
         if self.mode == "gradient_enhanced_pinn":
-            return self._run_uniform_baseline(self.train_epochs)
+            return self._run_uniform_baseline(self._train_gradient_enhanced_epochs)
         if self.mode == "relobralo_pinn":
             return self._run_uniform_baseline(self._train_relobralo_epochs)
         if self.mode == "residual_attention_pinn":
@@ -194,6 +195,39 @@ class VARATrainer(ExperimentTrainer):
         save_json(metrics, self.run_dir / "summary.json")
         return metrics
 
+    def _build_active_pointwise_losses_for_baseline(
+        self,
+        batch: dict[str, Any],
+        weights: dict[str, float],
+        *,
+        runtime_profile: dict[str, float] | None = None,
+        include_gradient_enhanced: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Construct configured pointwise losses for custom adaptive baselines."""
+        residual_mode, residual_delta = self._residual_loss_settings()
+        loss_kwargs = {
+            "residual_loss_mode": residual_mode,
+            "pseudo_huber_delta": residual_delta,
+            "regularization_config": self._active_loss_config(),
+            "compute_boundary_loss": self._compute_boundary_training_loss(weights),
+            "runtime_profile": runtime_profile,
+        }
+        if include_gradient_enhanced:
+            return gradient_enhanced_pointwise_losses(
+                self.model,
+                batch,
+                self.benchmark,
+                self.steady,
+                **loss_kwargs,
+            )
+        return compute_pointwise_losses(
+            self.model,
+            batch,
+            self.benchmark,
+            self.steady,
+            **loss_kwargs,
+        )
+
     def _train_self_adaptive_epochs(
         self,
         batch: dict[str, Any],
@@ -233,6 +267,10 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.zero_grad(set_to_none=True)
             attention_optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
+            pointwise = self._build_active_pointwise_losses_for_baseline(
+                batch,
+                scalar_weights,
+            )
             total, losses, attention_logs = self_adaptive_objective(
                 self.model,
                 batch,
@@ -242,6 +280,7 @@ class VARATrainer(ExperimentTrainer):
                 interior_logits,
                 boundary_logits,
                 maximum_attention=float(cfg.get("maximum_attention", 20.0)),
+                pointwise=pointwise,
             )
             anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
             replay_loss, replay_weight = self.continuation_replay_loss()
@@ -312,7 +351,10 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            pointwise = self._build_active_pointwise_losses_for_baseline(
+                batch,
+                adaptive_weights,
+            )
             losses = compute_global_losses(
                 pointwise,
                 reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
@@ -358,6 +400,88 @@ class VARATrainer(ExperimentTrainer):
         self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
         return last_losses
 
+    def _train_gradient_enhanced_epochs(
+        self,
+        batch: dict[str, Any],
+        _control_state: Any | None = None,
+        cycle: int = 0,
+        epochs_override: int | None = None,
+        log_prefix: str = "",
+    ) -> dict[str, float]:
+        """Train gradient-enhanced PINN with the active configured losses."""
+        train_cfg = self.config.get("training", {})
+        epochs = int(epochs_override if epochs_override is not None else train_cfg.get("epochs_per_cycle", 100))
+        log_every = max(1, int(train_cfg.get("log_every", 25)))
+        weights = dict(train_cfg.get("weights", {}))
+        last_losses: dict[str, float] = {}
+        self.model.train()
+        self.compute_tracker.start()
+        phase_start = time.perf_counter()
+        for local_epoch in range(epochs):
+            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+                break
+            self._apply_cavity_curriculum()
+            self.optimizer.zero_grad(set_to_none=True)
+            profile = self._step_runtime_profile()
+            objective_start = time.perf_counter()
+            self.compute_tracker.record_objective(batch)
+            pointwise = self._build_active_pointwise_losses_for_baseline(
+                batch,
+                weights,
+                runtime_profile=profile,
+                include_gradient_enhanced=True,
+            )
+            losses = compute_global_losses(
+                pointwise,
+                reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
+            )
+            losses, normalization_logs = self.normalize_training_losses(losses)
+            total = weighted_sum(losses, weights)
+            anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
+            replay_loss, replay_weight = self.continuation_replay_loss()
+            gauge_loss = self.pressure_gauge_loss()
+            total = total + anchor_loss + replay_loss + gauge_loss
+            self._record_runtime(
+                "loss_objective_total",
+                time.perf_counter() - objective_start,
+                cycle=cycle,
+                phase=log_prefix or self.mode,
+                profile=profile,
+            )
+            optimizer_start = time.perf_counter()
+            total.backward()
+            grad_norm = self._grad_norm()
+            learning_rate = self.prepare_optimizer_step()
+            self.optimizer.step()
+            self.compute_tracker.record_optimizer_step()
+            self._record_runtime(
+                "backward_optimizer",
+                time.perf_counter() - optimizer_start,
+                cycle=cycle,
+                phase=log_prefix or self.mode,
+            )
+            last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
+            last_losses.update(normalization_logs)
+            last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
+            last_losses["continuation_anchor_weight"] = float(anchor_weight)
+            last_losses["continuation_replay"] = float(replay_loss.detach().cpu())
+            last_losses["continuation_replay_weight"] = float(replay_weight)
+            last_losses["pressure_gauge"] = float(gauge_loss.detach().cpu())
+            last_losses["total"] = float(total.detach().cpu())
+            last_losses["grad_norm"] = grad_norm
+            last_losses["learning_rate"] = learning_rate
+            last_losses.update(self.current_cavity_curriculum)
+            last_losses.update(self.last_boundary_sampling_summary)
+            last_losses.update(self.last_interior_sampling_summary)
+            self.last_losses = dict(last_losses)
+            if local_epoch % log_every == 0 or local_epoch == epochs - 1:
+                self.loss_logger.log(
+                    {"cycle": cycle, "phase": log_prefix or self.mode, "epoch": self.global_step, **last_losses}
+                )
+            self.global_step += 1
+        self.compute_tracker.add_phase_time("optimization", time.perf_counter() - phase_start)
+        return last_losses
+
     def _train_relobralo_epochs(
         self,
         batch: dict[str, Any],
@@ -392,7 +516,10 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            pointwise = self._build_active_pointwise_losses_for_baseline(
+                batch,
+                dict(train_cfg.get("weights", {})),
+            )
             losses = compute_global_losses(
                 pointwise,
                 reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
@@ -466,7 +593,10 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+            pointwise = self._build_active_pointwise_losses_for_baseline(
+                batch,
+                weights,
+            )
             attention = self._residual_attention_state.update(torch.sqrt(pointwise["pde"] + 1e-18))
             losses: dict[str, torch.Tensor] = {}
             for name, values in pointwise.items():

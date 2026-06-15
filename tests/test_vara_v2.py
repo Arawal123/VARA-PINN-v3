@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,8 @@ from scripts.run_vara_v2_continuation import (
     _validate_reliable_config,
     _without_cavity_stabilizers,
 )
+from scripts.run_modern_baselines import DEFAULT_METHODS as STEADY_BASELINE_METHODS
+from scripts.run_publication_suite_v2 import DEFAULT_METHODS as PUBLICATION_METHODS
 from src.data import build_cavity_cfd_supervision
 from scripts.check_lid_cavity_re100_sanity import build_report
 from src.controllers import V2ControllerConfig, VARAV2Controller
@@ -46,6 +50,7 @@ from src.training.checkpointing import save_checkpoint
 from src.training.checkpointing import load_checkpoint
 from src.training.vara_trainer import VARATrainer
 from src.training.vara_v2_trainer import VARAV2Trainer
+from src.training.trainer import ExperimentTrainer
 from src.utils.config import deep_update, load_config
 from src.utils.logging import CSVLogger
 from src.visualization.streamlines import (
@@ -773,6 +778,100 @@ def _small_cavity_trainer_config(
             },
         )
     return config
+
+
+@pytest.mark.parametrize(
+    ("mode", "include_gradient_enhanced"),
+    [
+        ("gradient_balanced_pinn", False),
+        ("gradient_enhanced_pinn", True),
+        ("relobralo_pinn", False),
+        ("residual_attention_pinn", False),
+        ("self_adaptive_attention_pinn", False),
+    ],
+)
+def test_adaptive_baselines_construct_active_sparse_polish_losses(
+    tmp_path,
+    mode,
+    include_gradient_enhanced,
+):
+    config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path / mode,
+            data_supervision_mode="sparse_cfd_polish",
+            n_collocation=8,
+        ),
+        {
+            "experiments": {
+                "root": str(tmp_path / mode / "run"),
+                "flat_layout": True,
+            }
+        },
+    )
+    trainer = VARATrainer(config, mode=mode)
+    pointwise = trainer._build_active_pointwise_losses_for_baseline(
+        trainer.initial_batch(),
+        dict(config["training"]["weights"]),
+        include_gradient_enhanced=include_gradient_enhanced,
+    )
+
+    assert {
+        "bc_uvp_balanced",
+        "cfd_u_mse",
+        "cfd_v_mse",
+        "cfd_velocity_mse",
+        "continuity",
+        "momentum_u",
+        "momentum_v",
+        "pde",
+    }.issubset(pointwise)
+
+
+def test_active_baseline_loss_helper_is_scoped_to_affected_custom_loops():
+    affected = (
+        "_train_gradient_balanced_epochs",
+        "_train_gradient_enhanced_epochs",
+        "_train_relobralo_epochs",
+        "_train_residual_attention_epochs",
+        "_train_self_adaptive_epochs",
+    )
+    for name in affected:
+        source = inspect.getsource(getattr(VARATrainer, name))
+        assert "_build_active_pointwise_losses_for_baseline" in source
+
+    assert "_build_active_pointwise_losses_for_baseline" not in inspect.getsource(
+        VARATrainer._run_rar
+    )
+    assert "_build_active_pointwise_losses_for_baseline" not in inspect.getsource(
+        ExperimentTrainer.train_epochs
+    )
+    assert "_build_active_pointwise_losses_for_baseline" not in inspect.getsource(
+        ExperimentTrainer._training_objective
+    )
+
+
+def test_steady_cavity_templates_exclude_causal_and_reference_generation():
+    assert "causal" not in STEADY_BASELINE_METHODS
+    assert "causal" not in PUBLICATION_METHODS
+
+    root = Path(__file__).resolve().parents[1]
+    continuation_source = (
+        root / "scripts" / "run_vara_v2_continuation.py"
+    ).read_text(encoding="utf-8")
+    assert "generate_missing_cfd_reference" not in continuation_source
+    assert not (root / "src" / "physics" / "cavity_cfd_generator.py").exists()
+
+
+def test_re100_cached_reference_path_remains_paddlescience():
+    reference_map = pd.read_csv(
+        "data/references/lid_driven_cavity/full_field/reference_map.csv"
+    )
+    row = reference_map[np.isclose(reference_map["re"].astype(float), 100.0)]
+    assert len(row) == 1
+    assert row.iloc[0]["full_field_reference_path"] == (
+        "data/references/lid_driven_cavity/full_field/"
+        "re_0100_paddlescience.npz"
+    )
 
 
 def _force_non_neutral_v2_sampling(trainer):
@@ -1551,7 +1650,7 @@ def test_uvp_formulation_is_identical_for_vanilla_and_vara(tmp_path):
     ]
 
 
-def test_sparse_cfd_pool_is_identical_for_vanilla_and_vara(tmp_path):
+def test_sparse_cfd_pool_is_identical_for_vanilla_vara_and_rar(tmp_path):
     path = tmp_path / "cfd.npz"
     _write_toy_cfd(path)
     base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
@@ -1593,12 +1692,28 @@ def test_sparse_cfd_pool_is_identical_for_vanilla_and_vara(tmp_path):
             {"experiments": {"root": str(tmp_path / "vara"), "flat_layout": True}},
         )
     )
+    rar = VARATrainer(
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "rar"), "flat_layout": True}},
+        ),
+        mode="rar_pinn",
+    )
     assert vanilla.cfd_supervision is not None
     assert vara.cfd_supervision is not None
+    assert rar.cfd_supervision is not None
     assert torch.equal(
         vanilla.cfd_supervision.coords, vara.cfd_supervision.coords
     )
+    assert torch.equal(
+        vanilla.cfd_supervision.coords, rar.cfd_supervision.coords
+    )
     assert vanilla.cfd_supervision.pool_hash == vara.cfd_supervision.pool_hash
+    assert vanilla.cfd_supervision.pool_hash == rar.cfd_supervision.pool_hash
+    assert vanilla.cfd_supervision.sample_count == vara.cfd_supervision.sample_count
+    assert vanilla.cfd_supervision.sample_count == rar.cfd_supervision.sample_count
+    assert vanilla.cfd_supervision.sample_fraction == vara.cfd_supervision.sample_fraction
+    assert vanilla.cfd_supervision.sample_fraction == rar.cfd_supervision.sample_fraction
 
 
 def test_sparse_cfd_polish_mixed_pool_is_identical_for_vanilla_and_vara(tmp_path):
