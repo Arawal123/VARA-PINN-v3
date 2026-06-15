@@ -1344,6 +1344,17 @@ def _trainer_for(method: str, config: dict[str, Any]) -> Any:
             f"Unknown continuation method {method!r}; choose vara_v1, vara_v2, "
             f"or one of {sorted(BASELINE_METHODS)}."
         )
+    if method == "causal" and str(config.get("benchmark", "")).lower() in {
+        "lid_driven_cavity",
+        "lid_cavity",
+        "lid-driven-cavity",
+        "lid-cavity",
+        "cavity",
+    }:
+        raise ValueError(
+            "causal is excluded from steady lid-driven cavity continuation "
+            "because it requires a time coordinate."
+        )
     mode, overlay = BASELINE_METHODS[method]
     resolved = deep_update(config, load_config(overlay)) if overlay else config
     return VARATrainer(resolved, mode=mode)

@@ -49,7 +49,8 @@ METHODS = {
     "vara": ("local_constrained_vara", None),
 }
 
-DEFAULT_METHODS = [name for name in METHODS if name != "causal"]
+STEADY_METHODS = tuple(name for name in METHODS if name != "causal")
+DEFAULT_METHODS = list(STEADY_METHODS)
 
 
 def main() -> None:
@@ -66,8 +67,21 @@ def main() -> None:
     unknown = sorted(set(args.methods).difference(METHODS))
     if unknown:
         raise SystemExit(f"Unknown methods: {unknown}. Available: {sorted(METHODS)}")
-
     base = load_config(args.config)
+    benchmark = str(base.get("benchmark", "")).lower()
+    steady_cavity = benchmark in {
+        "lid_driven_cavity",
+        "lid_cavity",
+        "lid-driven-cavity",
+        "lid-cavity",
+        "cavity",
+    } and bool(base.get("pde", {}).get("steady", True))
+    if "causal" in args.methods and steady_cavity:
+        raise SystemExit(
+            "causal is excluded from steady lid-driven cavity baselines "
+            "because it requires a time coordinate."
+        )
+
     output = Path(args.output_dir)
     rows: list[dict[str, Any]] = []
     for seed in args.seeds:
