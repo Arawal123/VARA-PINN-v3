@@ -384,14 +384,6 @@ controller_v2:
     - speed_pred_max
     - omega_abs_95p
     - near_wall_p_grad_mean
-  sparse_polish_rescue:
-    enabled: true
-    max_candidates: 5
-    candidate_steps: 200
-    lr_scale: 0.35
-    final_lbfgs_steps: 5
-    max_extra_optimizer_steps: 1200
-    require_pareto_safe: true
 
 continuation_anchor:
   enabled: false
