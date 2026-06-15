@@ -369,6 +369,16 @@ controller_v2:
   counterfactual_probe_enabled: false
   counterfactual_target_margin: 0.005
   counterfactual_guard_margin: 0.02
+  sparse_polish_rescue:
+    enabled: false
+  sparse_polish_curriculum:
+    enabled: true
+    update_every_steps: 250
+    ema_decay: 0.8
+    min_multiplier: 0.75
+    max_multiplier: 1.35
+    max_change_per_update: 0.10
+    disable_generic_interventions: true
   guard_metrics:
     - pde_residual_mean
     - continuity_residual_mean

@@ -52,6 +52,42 @@ SPARSE_POLISH_SCORE_WEIGHTS = {
     "near_wall_pde_residual_mean": 0.5,
 }
 
+SPARSE_CURRICULUM_ALLOWED_METRICS = (
+    "pde_residual_mean",
+    "momentum_residual_mean",
+    "continuity_residual_mean",
+    "boundary_condition_error",
+    "cfd_velocity_mse_sparse",
+    "cfd_u_mse_sparse",
+    "cfd_v_mse_sparse",
+    "top_band_continuity_residual_mean",
+    "top_band_pde_residual_mean",
+    "near_wall_pde_residual_mean",
+    "speed_pred_max",
+)
+
+SPARSE_CURRICULUM_SCORE_WEIGHTS = {
+    "continuity_residual_mean": 2.4,
+    "boundary_condition_error": 2.2,
+    "cfd_velocity_mse_sparse": 1.8,
+    "cfd_v_mse_sparse": 0.8,
+    "pde_residual_mean": 1.3,
+    "momentum_residual_mean": 1.3,
+    "top_band_continuity_residual_mean": 0.8,
+    "near_wall_pde_residual_mean": 0.5,
+}
+
+SPARSE_CURRICULUM_CHANNELS = (
+    "continuity",
+    "boundary",
+    "cfd_velocity",
+    "cfd_v",
+    "pde",
+    "near_wall_pde",
+    "top_band_continuity",
+    "top_u_boundary",
+)
+
 
 class VARAV2Trainer(ExperimentTrainer):
     """Fixed-step, trust-region VARA trainer.
@@ -104,6 +140,49 @@ class VARAV2Trainer(ExperimentTrainer):
         self._sparse_polish_initial_score = float("nan")
         self._sparse_polish_final_score = float("nan")
         self._sparse_polish_noop_fallback = False
+        curriculum_cfg = dict(cfg.get("sparse_polish_curriculum", {}))
+        self.sparse_polish_curriculum_enabled = bool(
+            self.sparse_cfd_polish_v2
+            and curriculum_cfg.get("enabled", True)
+        )
+        self.sparse_polish_generic_interventions_disabled = bool(
+            self.sparse_polish_curriculum_enabled
+            and curriculum_cfg.get("disable_generic_interventions", True)
+        )
+        self.sparse_curriculum_cfg = curriculum_cfg
+        self.sparse_curriculum_multipliers = {
+            name: 1.0 for name in SPARSE_CURRICULUM_CHANNELS
+        }
+        self.sparse_curriculum_ema: dict[str, float] = {}
+        self.sparse_curriculum_scales: dict[str, float] = {}
+        self.sparse_curriculum_previous_metrics: dict[str, float] | None = None
+        self.sparse_curriculum_previous_multipliers = dict(
+            self.sparse_curriculum_multipliers
+        )
+        self.sparse_curriculum_last_changed: set[str] = set()
+        self.sparse_curriculum_regression_windows = 0
+        self.sparse_curriculum_scheduler_reverts = 0
+        self.sparse_curriculum_frozen_channels: set[str] = set()
+        self.sparse_curriculum_updates = 0
+        self.sparse_curriculum_phase = "disabled"
+        self.sparse_curriculum_next_update = max(
+            1, int(curriculum_cfg.get("update_every_steps", 250))
+        )
+        self.sparse_curriculum_dynamic_max_change = float(
+            curriculum_cfg.get("max_change_per_update", 0.10)
+        )
+        self._sparse_curriculum_best: dict[str, Any] | None = None
+        self._sparse_curriculum_restored_best = False
+        self._sparse_curriculum_final_score = float("nan")
+        self.sparse_curriculum_history_path = (
+            self.run_dir / "vara_sparse_curriculum_history.json"
+        )
+        self.sparse_curriculum_history_logger = JSONListLogger(
+            self.sparse_curriculum_history_path
+        )
+        self.sparse_curriculum_csv_logger = CSVLogger(
+            self.run_dir / "vara_sparse_curriculum_history.csv"
+        )
         sampling_snapshot = self.sampling_state_snapshot()
         self._probe_batch = self._make_probe_batch()
         # The fixed controller probe must not advance the optimization
@@ -123,6 +202,7 @@ class VARAV2Trainer(ExperimentTrainer):
         if probe_steps <= 0 or probe_steps >= block_steps:
             raise ValueError("controller_v2.probe_steps must be between zero and block_steps.")
 
+        self._initialize_sparse_polish_curriculum()
         batch = self.initial_batch()
         # Use the same neutral resampling cadence as the comparison trainer.
         # A long V2 warm-up on one fixed batch is not equivalent to Vanilla
@@ -157,7 +237,11 @@ class VARAV2Trainer(ExperimentTrainer):
             metrics_before = self._guard_metrics(coords)
             self.v2_controller.update_history(names, raw_before, metrics_before)
             candidates = self.v2_controller.candidates(weak_regions)
-            if self.sparse_cfd_polish_v2:
+            if self.sparse_polish_generic_interventions_disabled:
+                candidates = []
+            elif self.sparse_cfd_polish_v2 and bool(
+                cfg.get("sparse_polish_rescue", {}).get("enabled", False)
+            ):
                 rescue = self._sparse_polish_rescue_candidate(
                     weak_regions, metrics_before
                 )
@@ -444,35 +528,46 @@ class VARAV2Trainer(ExperimentTrainer):
             self._sparse_polish_final_score = self._sparse_polish_score(
                 pre_restore_metrics
             )
-            minimum_gain = float(
-                self.config.get("controller_v2", {}).get(
-                    "sparse_polish_noop_min_score_gain", 0.01
+            if self.sparse_polish_curriculum_enabled:
+                self._restore_best_sparse_curriculum_if_needed(
+                    pre_restore_metrics
                 )
-            )
-            best_score = (
-                float(self._sparse_polish_best["score"])
-                if self._sparse_polish_best is not None
-                else math.inf
-            )
-            score_gain = (
-                (self._sparse_polish_initial_score - best_score)
-                / max(abs(self._sparse_polish_initial_score), 1e-12)
-                if math.isfinite(self._sparse_polish_initial_score)
-                and math.isfinite(best_score)
-                else 0.0
-            )
-            self._sparse_polish_noop_fallback = self._sparse_polish_should_noop(
-                score_gain,
-                minimum_gain=minimum_gain,
-            )
-            self._restore_sparse_polish_best_if_needed(
-                pre_restore_metrics,
-                force=self._sparse_polish_noop_fallback,
-            )
-            if self._sparse_polish_restored_best:
-                self._sparse_polish_final_score = self._sparse_polish_score(
-                    self._guard_metrics(final_guard_coords)
+                pre_restore_metrics = self._guard_metrics(final_guard_coords)
+                self._sparse_curriculum_final_score = (
+                    self._sparse_curriculum_score(pre_restore_metrics)
                 )
+            else:
+                minimum_gain = float(
+                    self.config.get("controller_v2", {}).get(
+                        "sparse_polish_noop_min_score_gain", 0.01
+                    )
+                )
+                best_score = (
+                    float(self._sparse_polish_best["score"])
+                    if self._sparse_polish_best is not None
+                    else math.inf
+                )
+                score_gain = (
+                    (self._sparse_polish_initial_score - best_score)
+                    / max(abs(self._sparse_polish_initial_score), 1e-12)
+                    if math.isfinite(self._sparse_polish_initial_score)
+                    and math.isfinite(best_score)
+                    else 0.0
+                )
+                self._sparse_polish_noop_fallback = (
+                    self._sparse_polish_should_noop(
+                        score_gain,
+                        minimum_gain=minimum_gain,
+                    )
+                )
+                self._restore_sparse_polish_best_if_needed(
+                    pre_restore_metrics,
+                    force=self._sparse_polish_noop_fallback,
+                )
+                if self._sparse_polish_restored_best:
+                    self._sparse_polish_final_score = self._sparse_polish_score(
+                        self._guard_metrics(final_guard_coords)
+                    )
             checkpoint_cfg = self.config.setdefault("checkpoint", {})
             restore_best = checkpoint_cfg.get("restore_best_before_final", False)
             checkpoint_cfg["restore_best_before_final"] = False
@@ -520,6 +615,7 @@ class VARAV2Trainer(ExperimentTrainer):
                 "vara_sparse_polish_noop_fallback": (
                     self._sparse_polish_noop_fallback
                 ),
+                **self._sparse_curriculum_summary(),
             }
         )
         metrics["rollback_count"] = self.rejected_interventions if self.rollback_enabled else 0
@@ -555,6 +651,10 @@ class VARAV2Trainer(ExperimentTrainer):
                 scalar_weights[name] = float(
                     scalar_weights.get(name, 0.0)
                 ) * float(multiplier)
+        if self.sparse_polish_curriculum_enabled:
+            scalar_weights = self._apply_sparse_curriculum_weights(
+                scalar_weights
+            )
         log_every = max(1, int(train_cfg.get("log_every", 25)))
         self.model.train()
         started = time.perf_counter()
@@ -640,6 +740,7 @@ class VARAV2Trainer(ExperimentTrainer):
                     }
                 )
             self.global_step += 1
+            self._maybe_update_sparse_polish_curriculum()
         self.compute_tracker.add_phase_time("optimization", time.perf_counter() - started)
 
     def _diagnose_reference_free(
@@ -1034,6 +1135,459 @@ class VARAV2Trainer(ExperimentTrainer):
             persistence=int(getattr(primary, "persistence", 1)),
             trend=0.0,
         )
+
+    def _initialize_sparse_polish_curriculum(self) -> None:
+        if not self.sparse_polish_curriculum_enabled:
+            return
+        self.sparse_curriculum_phase = self._sparse_curriculum_phase(0)
+        self.sparse_curriculum_multipliers.update(
+            self._sparse_curriculum_phase_targets(0)
+        )
+
+    def _sparse_curriculum_phase(self, step: int) -> str:
+        total_steps = max(
+            1,
+            int(
+                self.config.get("controller_v2", {}).get(
+                    "total_steps", 1
+                )
+            ),
+        )
+        progress = min(max(int(step) / total_steps, 0.0), 1.0)
+        if progress < 0.25:
+            return "data_topology_anchoring"
+        if progress < 0.70:
+            return "boundary_continuity_locking"
+        return "physics_polish"
+
+    def _sparse_curriculum_phase_targets(
+        self,
+        step: int,
+    ) -> dict[str, float]:
+        phase = self._sparse_curriculum_phase(step)
+        if phase == "data_topology_anchoring":
+            return {
+                "continuity": 0.95,
+                "boundary": 1.0,
+                "cfd_velocity": 1.20,
+                "cfd_v": 1.30,
+                "pde": 1.0,
+                "near_wall_pde": 1.0,
+                "top_band_continuity": 1.0,
+                "top_u_boundary": 1.0,
+            }
+        if phase == "boundary_continuity_locking":
+            return {
+                "continuity": 1.22,
+                "boundary": 1.20,
+                "cfd_velocity": 1.0,
+                "cfd_v": 1.15,
+                "pde": 1.0,
+                "near_wall_pde": 1.05,
+                "top_band_continuity": 1.27,
+                "top_u_boundary": 1.15,
+            }
+        return {
+            "continuity": 1.05,
+            "boundary": 1.05,
+            "cfd_velocity": 0.90,
+            "cfd_v": 1.05,
+            "pde": 1.12,
+            "near_wall_pde": 1.18,
+            "top_band_continuity": 1.05,
+            "top_u_boundary": 1.05,
+        }
+
+    def _apply_sparse_curriculum_weights(
+        self,
+        scalar_weights: dict[str, float],
+    ) -> dict[str, float]:
+        weights = dict(scalar_weights)
+        multipliers = self.sparse_curriculum_multipliers
+        weights["continuity"] = float(weights.get("continuity", 0.0)) * multipliers[
+            "continuity"
+        ]
+        weights["bc_uvp_balanced"] = float(
+            weights.get("bc_uvp_balanced", 0.0)
+        ) * multipliers["boundary"]
+        weights["cfd_u_mse"] = float(weights.get("cfd_u_mse", 0.0)) * multipliers[
+            "cfd_velocity"
+        ]
+        weights["cfd_v_mse"] = (
+            float(weights.get("cfd_v_mse", 0.0))
+            * multipliers["cfd_velocity"]
+            * multipliers["cfd_v"]
+        )
+        weights["momentum_u"] = float(weights.get("momentum_u", 0.0)) * multipliers[
+            "pde"
+        ]
+        weights["momentum_v"] = float(weights.get("momentum_v", 0.0)) * multipliers[
+            "pde"
+        ]
+        weights["top_band_pde"] = float(
+            weights.get("top_band_pde", 0.0)
+        ) * multipliers["near_wall_pde"]
+        weights["upper_core_pde"] = float(
+            weights.get("upper_core_pde", 0.0)
+        ) * multipliers["near_wall_pde"]
+        weights["top_band_continuity"] = float(
+            weights.get("top_band_continuity", 0.0)
+        ) * multipliers["top_band_continuity"]
+        balanced = float(weights.get("bc_uvp_balanced", 0.0))
+        weights["bc_top_u"] = float(weights.get("bc_top_u", 0.0)) + balanced * max(
+            multipliers["top_u_boundary"] - 1.0,
+            0.0,
+        )
+        return weights
+
+    def _sparse_curriculum_metrics(
+        self,
+        metrics: dict[str, Any],
+    ) -> dict[str, float]:
+        selected = {
+            name: float(metrics[name])
+            for name in SPARSE_CURRICULUM_ALLOWED_METRICS
+            if name in metrics and math.isfinite(float(metrics[name]))
+        }
+        self.v2_controller.assert_reference_free(selected)
+        return selected
+
+    def _sparse_curriculum_targets(self) -> dict[str, float]:
+        validity = dict(self.config.get("continuation_validity", {}))
+        return {
+            "pde_residual_mean": float(
+                validity.get("max_pde_residual_mean", math.inf)
+            ),
+            "momentum_residual_mean": float(
+                validity.get("max_momentum_residual_mean", math.inf)
+            ),
+            "continuity_residual_mean": float(
+                validity.get("max_continuity_residual_mean", math.inf)
+            ),
+            "boundary_condition_error": float(
+                validity.get("max_boundary_condition_error", math.inf)
+            ),
+            "speed_pred_max": float(
+                validity.get("max_speed_pred", math.inf)
+            ),
+        }
+
+    def _sparse_curriculum_deficit(
+        self,
+        name: str,
+        value: float,
+    ) -> float:
+        target = self._sparse_curriculum_targets().get(name)
+        if target is None or not math.isfinite(target) or target <= 0.0:
+            target = self.sparse_curriculum_scales.get(name, value)
+        return max(float(value) / max(float(target), 1e-12) - 1.0, 0.0)
+
+    def _sparse_curriculum_adaptive_targets(
+        self,
+        metrics: dict[str, float],
+    ) -> dict[str, float]:
+        targets = self._sparse_curriculum_phase_targets(self.global_step)
+        continuity_gap = self._sparse_curriculum_deficit(
+            "continuity_residual_mean",
+            metrics.get("continuity_residual_mean", 0.0),
+        )
+        boundary_gap = self._sparse_curriculum_deficit(
+            "boundary_condition_error",
+            metrics.get("boundary_condition_error", 0.0),
+        )
+        cfd_v_gap = self._sparse_curriculum_deficit(
+            "cfd_v_mse_sparse",
+            metrics.get("cfd_v_mse_sparse", 0.0),
+        )
+        pde_gap = self._sparse_curriculum_deficit(
+            "pde_residual_mean",
+            metrics.get("pde_residual_mean", 0.0),
+        )
+        momentum_gap = self._sparse_curriculum_deficit(
+            "momentum_residual_mean",
+            metrics.get("momentum_residual_mean", 0.0),
+        )
+        targets["continuity"] += min(0.13, 0.08 * continuity_gap)
+        targets["top_band_continuity"] += min(0.13, 0.09 * continuity_gap)
+        targets["boundary"] += min(0.12, 0.08 * boundary_gap)
+        targets["top_u_boundary"] += min(0.10, 0.07 * boundary_gap)
+        targets["cfd_v"] += min(0.15, 0.10 * cfd_v_gap)
+        if continuity_gap <= 0.10 and boundary_gap <= 0.10:
+            physics_gap = max(pde_gap, momentum_gap)
+            targets["pde"] += min(0.08, 0.05 * physics_gap)
+            targets["near_wall_pde"] += min(0.07, 0.05 * physics_gap)
+        speed = float(metrics.get("speed_pred_max", 0.0))
+        speed_cap = self._sparse_curriculum_targets()["speed_pred_max"]
+        if math.isfinite(speed_cap) and speed > 0.95 * speed_cap:
+            targets["cfd_velocity"] -= 0.08
+            targets["cfd_v"] -= 0.08
+            targets["boundary"] -= 0.05
+            targets["pde"] += 0.08
+        return targets
+
+    def _bounded_sparse_curriculum_update(
+        self,
+        targets: dict[str, float],
+    ) -> tuple[dict[str, float], set[str]]:
+        minimum = float(self.sparse_curriculum_cfg.get("min_multiplier", 0.75))
+        maximum = float(self.sparse_curriculum_cfg.get("max_multiplier", 1.35))
+        max_change = max(float(self.sparse_curriculum_dynamic_max_change), 0.0)
+        updated = dict(self.sparse_curriculum_multipliers)
+        changed: set[str] = set()
+        for name in SPARSE_CURRICULUM_CHANNELS:
+            if name in self.sparse_curriculum_frozen_channels:
+                continue
+            current = float(updated[name])
+            target = min(max(float(targets.get(name, current)), minimum), maximum)
+            value = min(max(target, current - max_change), current + max_change)
+            value = min(max(value, minimum), maximum)
+            if not math.isclose(value, current, rel_tol=0.0, abs_tol=1e-12):
+                updated[name] = value
+                changed.add(name)
+        return updated, changed
+
+    @staticmethod
+    def _sparse_curriculum_protected_regression(
+        previous: dict[str, float],
+        current: dict[str, float],
+        tolerance: float = 0.005,
+    ) -> bool:
+        protected = (
+            "continuity_residual_mean",
+            "boundary_condition_error",
+            "cfd_velocity_mse_sparse",
+            "pde_residual_mean",
+            "momentum_residual_mean",
+            "speed_pred_max",
+        )
+        regressions = 0
+        for name in protected:
+            if name not in previous or name not in current:
+                continue
+            relative = (current[name] - previous[name]) / max(
+                abs(previous[name]), 1e-12
+            )
+            regressions += int(relative > tolerance)
+        return regressions > 0
+
+    def _maybe_update_sparse_polish_curriculum(self) -> None:
+        if (
+            not self.sparse_polish_curriculum_enabled
+            or self.global_step < self.sparse_curriculum_next_update
+        ):
+            return
+        _, _, coords = self.validation_grid()
+        metrics = self._sparse_curriculum_metrics(self._guard_metrics(coords))
+        decay = min(
+            max(float(self.sparse_curriculum_cfg.get("ema_decay", 0.8)), 0.0),
+            1.0,
+        )
+        if not self.sparse_curriculum_scales:
+            self.sparse_curriculum_scales = {
+                name: max(value, 1e-12) for name, value in metrics.items()
+            }
+        for name, value in metrics.items():
+            previous = self.sparse_curriculum_ema.get(name, value)
+            self.sparse_curriculum_ema[name] = decay * previous + (1.0 - decay) * value
+
+        self._update_sparse_curriculum_best(metrics)
+        action = "update"
+        reason = "phase_and_diagnostic_adaptation"
+        regression = (
+            self.sparse_curriculum_previous_metrics is not None
+            and self._sparse_curriculum_protected_regression(
+                self.sparse_curriculum_previous_metrics,
+                metrics,
+            )
+        )
+        if regression and self.sparse_curriculum_last_changed:
+            self.sparse_curriculum_regression_windows += 1
+        else:
+            self.sparse_curriculum_regression_windows = 0
+
+        if self.sparse_curriculum_regression_windows >= 2:
+            self.sparse_curriculum_multipliers = dict(
+                self.sparse_curriculum_previous_multipliers
+            )
+            self.sparse_curriculum_frozen_channels.update(
+                self.sparse_curriculum_last_changed
+            )
+            self.sparse_curriculum_scheduler_reverts += 1
+            self.sparse_curriculum_dynamic_max_change *= 0.5
+            self.sparse_curriculum_regression_windows = 0
+            action = "revert"
+            reason = "protected_metrics_regressed_two_windows"
+        elif regression:
+            action = "hold"
+            reason = "monitoring_first_regression_window"
+        else:
+            targets = self._sparse_curriculum_adaptive_targets(
+                self.sparse_curriculum_ema
+            )
+            before = dict(self.sparse_curriculum_multipliers)
+            updated, changed = self._bounded_sparse_curriculum_update(targets)
+            self.sparse_curriculum_previous_multipliers = before
+            self.sparse_curriculum_multipliers = updated
+            self.sparse_curriculum_last_changed = changed
+
+        self.sparse_curriculum_previous_metrics = dict(metrics)
+        self.sparse_curriculum_phase = self._sparse_curriculum_phase(
+            self.global_step
+        )
+        self.sparse_curriculum_updates += 1
+        score = self._sparse_curriculum_score(metrics)
+        record = {
+            "step": int(self.global_step),
+            "phase": self.sparse_curriculum_phase,
+            "multipliers": dict(self.sparse_curriculum_multipliers),
+            "diagnostics": dict(metrics),
+            "score": score,
+            "action": action,
+            "reason": reason,
+            "frozen_channels": sorted(self.sparse_curriculum_frozen_channels),
+            "max_change_per_update": self.sparse_curriculum_dynamic_max_change,
+        }
+        self.sparse_curriculum_history_logger.log(record)
+        self.sparse_curriculum_csv_logger.log(
+            {
+                "step": record["step"],
+                "phase": record["phase"],
+                "score": score,
+                "action": action,
+                "reason": reason,
+                **{
+                    f"multiplier_{name}": value
+                    for name, value in self.sparse_curriculum_multipliers.items()
+                },
+                **metrics,
+            }
+        )
+        interval = max(
+            1,
+            int(self.sparse_curriculum_cfg.get("update_every_steps", 250)),
+        )
+        self.sparse_curriculum_next_update += interval
+        self.model.train()
+
+    def _sparse_curriculum_score(
+        self,
+        metrics: dict[str, float],
+    ) -> float:
+        if not self.sparse_polish_curriculum_enabled:
+            return float("nan")
+        score = 0.0
+        for name, weight in SPARSE_CURRICULUM_SCORE_WEIGHTS.items():
+            value = float(metrics.get(name, float("nan")))
+            if not math.isfinite(value):
+                return math.inf
+            scale = max(
+                float(self.sparse_curriculum_scales.get(name, value)),
+                1e-12,
+            )
+            score += weight * max(value, 0.0) / scale
+        speed = float(metrics.get("speed_pred_max", float("nan")))
+        speed_cap = self._sparse_curriculum_targets()["speed_pred_max"]
+        if math.isfinite(speed) and math.isfinite(speed_cap):
+            score += 0.5 * (
+                max(speed - speed_cap, 0.0) / max(speed_cap, 1e-12)
+            ) ** 2
+        return float(score)
+
+    def _update_sparse_curriculum_best(
+        self,
+        metrics: dict[str, float],
+    ) -> None:
+        if not self.sparse_polish_curriculum_enabled:
+            return
+        if not self.sparse_curriculum_scales:
+            self.sparse_curriculum_scales = {
+                name: max(float(value), 1e-12)
+                for name, value in metrics.items()
+                if math.isfinite(float(value))
+            }
+        score = self._sparse_curriculum_score(metrics)
+        if not math.isfinite(score):
+            return
+        if (
+            self._sparse_curriculum_best is None
+            or score < float(self._sparse_curriculum_best["score"])
+        ):
+            self._sparse_curriculum_best = {
+                "score": score,
+                "model": self._model_snapshot(),
+                "optimizer": deepcopy(self.optimizer.state_dict()),
+                "loss_normalization": deepcopy(self.loss_normalization_state),
+                "controller": self.v2_controller.state.snapshot(),
+                "sampling": self.sampling_state_snapshot(),
+                "multipliers": dict(self.sparse_curriculum_multipliers),
+            }
+
+    def _restore_best_sparse_curriculum_if_needed(
+        self,
+        current_metrics: dict[str, float],
+    ) -> bool:
+        if (
+            not self.sparse_polish_curriculum_enabled
+            or self._sparse_curriculum_best is None
+        ):
+            return False
+        current_score = self._sparse_curriculum_score(current_metrics)
+        best_score = float(self._sparse_curriculum_best["score"])
+        if math.isfinite(current_score) and current_score <= best_score * 1.002:
+            return False
+        self._restore_model_snapshot(self._sparse_curriculum_best["model"])
+        self.optimizer.load_state_dict(self._sparse_curriculum_best["optimizer"])
+        self.loss_normalization_state = deepcopy(
+            self._sparse_curriculum_best["loss_normalization"]
+        )
+        self.v2_controller.state.restore(
+            self._sparse_curriculum_best["controller"]
+        )
+        self.restore_sampling_state(self._sparse_curriculum_best["sampling"])
+        self.sparse_curriculum_multipliers = dict(
+            self._sparse_curriculum_best["multipliers"]
+        )
+        self._sync_benchmark_corner_to_model()
+        self._sparse_curriculum_restored_best = True
+        return True
+
+    def _sparse_curriculum_summary(self) -> dict[str, Any]:
+        multipliers = self.sparse_curriculum_multipliers
+        return {
+            "vara_sparse_curriculum_enabled": (
+                self.sparse_polish_curriculum_enabled
+            ),
+            "vara_sparse_curriculum_phase": self.sparse_curriculum_phase,
+            "vara_sparse_curriculum_updates": self.sparse_curriculum_updates,
+            "vara_sparse_curriculum_multiplier_history_path": str(
+                self.sparse_curriculum_history_path
+            ),
+            "final_multiplier_continuity": multipliers["continuity"],
+            "final_multiplier_boundary": multipliers["boundary"],
+            "final_multiplier_cfd_velocity": multipliers["cfd_velocity"],
+            "final_multiplier_cfd_v": multipliers["cfd_v"],
+            "final_multiplier_pde": multipliers["pde"],
+            "final_multiplier_near_wall_pde": multipliers["near_wall_pde"],
+            "final_multiplier_top_band_continuity": multipliers[
+                "top_band_continuity"
+            ],
+            "scheduler_reverts": self.sparse_curriculum_scheduler_reverts,
+            "frozen_channels": sorted(
+                self.sparse_curriculum_frozen_channels
+            ),
+            "best_curriculum_score": (
+                float(self._sparse_curriculum_best["score"])
+                if self._sparse_curriculum_best is not None
+                else float("nan")
+            ),
+            "final_curriculum_score": self._sparse_curriculum_final_score,
+            "restored_best_curriculum_checkpoint": (
+                self._sparse_curriculum_restored_best
+            ),
+            "generic_interventions_disabled_for_sparse_polish": (
+                self.sparse_polish_generic_interventions_disabled
+            ),
+        }
 
     def _make_probe_batch(self) -> dict[str, Any]:
         cfg = dict(self.config.get("controller_v2", {}))

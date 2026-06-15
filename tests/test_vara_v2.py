@@ -811,6 +811,270 @@ def _sparse_polish_v2_trainer(tmp_path):
     return VARAV2Trainer(config)
 
 
+def test_vara_sparse_polish_curriculum_is_mode_scoped(tmp_path):
+    polish_config = _small_cavity_trainer_config(
+        tmp_path / "polish",
+        data_supervision_mode="sparse_cfd_polish",
+    )
+    vanilla_config = deepcopy(polish_config)
+    vanilla = VARATrainer(
+        deep_update(
+            vanilla_config,
+            {
+                "experiments": {
+                    "root": str(tmp_path / "vanilla"),
+                    "flat_layout": True,
+                }
+            },
+        ),
+        mode="vanilla",
+    )
+    vara = VARAV2Trainer(
+        deep_update(
+            polish_config,
+            {
+                "experiments": {
+                    "root": str(tmp_path / "vara"),
+                    "flat_layout": True,
+                }
+            },
+        )
+    )
+    sparse = VARAV2Trainer(
+        deep_update(
+            _small_cavity_trainer_config(
+                tmp_path / "sparse",
+                data_supervision_mode="sparse_cfd",
+            ),
+            {
+                "experiments": {
+                    "root": str(tmp_path / "sparse_run"),
+                    "flat_layout": True,
+                }
+            },
+        )
+    )
+    pure = VARAV2Trainer(
+        deep_update(
+            _small_cavity_trainer_config(tmp_path / "pure"),
+            {
+                "experiments": {
+                    "root": str(tmp_path / "pure_run"),
+                    "flat_layout": True,
+                }
+            },
+        )
+    )
+
+    assert not hasattr(vanilla, "sparse_polish_curriculum_enabled")
+    assert vara.sparse_polish_curriculum_enabled
+    assert vara.sparse_polish_generic_interventions_disabled
+    assert not sparse.sparse_polish_curriculum_enabled
+    assert not pure.sparse_polish_curriculum_enabled
+    assert vanilla.config["training"]["weights"] == polish_config["training"]["weights"]
+
+
+def test_vara_sparse_curriculum_uses_only_allowed_metrics(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    metrics = {
+        **_sparse_polish_guard_metrics(),
+        "cfd_velocity_full_rel_l2_eval_only": 999.0,
+        "ghia_profile_score": 999.0,
+        "topology_aligned": False,
+        "detected_vortex_count": 99,
+        "primary_vortex_center_error": 999.0,
+        "streamline_metric": 999.0,
+    }
+    selected = trainer._sparse_curriculum_metrics(metrics)
+
+    assert "cfd_velocity_mse_sparse" in selected
+    assert not any(
+        token in name
+        for name in selected
+        for token in (
+            "full_rel_l2",
+            "ghia",
+            "topology",
+            "vortex",
+            "streamline",
+        )
+    )
+
+
+def test_vara_sparse_curriculum_updates_are_bounded(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer._initialize_sparse_polish_curriculum()
+    before = dict(trainer.sparse_curriculum_multipliers)
+    targets = {name: 10.0 for name in before}
+    updated, changed = trainer._bounded_sparse_curriculum_update(targets)
+
+    assert changed
+    assert all(0.75 <= value <= 1.35 for value in updated.values())
+    assert all(abs(updated[name] - before[name]) <= 0.10 + 1e-12 for name in changed)
+
+
+def test_vara_sparse_curriculum_continuity_gap_increases_continuity_channels(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.global_step = 1600
+    trainer.sparse_curriculum_scales = {
+        name: value for name, value in _sparse_polish_guard_metrics().items()
+    }
+    metrics = _sparse_polish_guard_metrics()
+    metrics["continuity_residual_mean"] = 0.03
+    targets = trainer._sparse_curriculum_adaptive_targets(metrics)
+
+    phase = trainer._sparse_curriculum_phase_targets(trainer.global_step)
+    assert targets["continuity"] > phase["continuity"]
+    assert targets["top_band_continuity"] > phase["top_band_continuity"]
+
+
+def test_vara_sparse_curriculum_boundary_gap_increases_boundary_channels(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.global_step = 1600
+    metrics = _sparse_polish_guard_metrics()
+    metrics["boundary_condition_error"] = 0.09
+    targets = trainer._sparse_curriculum_adaptive_targets(metrics)
+
+    phase = trainer._sparse_curriculum_phase_targets(trainer.global_step)
+    assert targets["boundary"] > phase["boundary"]
+    assert targets["top_u_boundary"] > phase["top_u_boundary"]
+
+
+def test_vara_sparse_curriculum_high_cfd_v_error_increases_vertical_data_weight(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.global_step = 200
+    trainer.sparse_curriculum_scales["cfd_v_mse_sparse"] = 0.01
+    metrics = _sparse_polish_guard_metrics()
+    metrics["cfd_v_mse_sparse"] = 0.03
+    targets = trainer._sparse_curriculum_adaptive_targets(metrics)
+
+    phase = trainer._sparse_curriculum_phase_targets(trainer.global_step)
+    assert targets["cfd_v"] > phase["cfd_v"]
+
+
+def test_vara_sparse_curriculum_reverts_after_two_regression_windows(
+    tmp_path,
+    monkeypatch,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer._initialize_sparse_polish_curriculum()
+    baseline = _sparse_polish_guard_metrics(0.02)
+    first_bad = {**baseline, "continuity_residual_mean": 0.021}
+    second_bad = {**first_bad, "continuity_residual_mean": 0.022}
+    metric_rows = iter([baseline, first_bad, second_bad])
+    monkeypatch.setattr(
+        trainer,
+        "_guard_metrics",
+        lambda _coords: next(metric_rows),
+    )
+    before_update = dict(trainer.sparse_curriculum_multipliers)
+
+    for step in (250, 500, 750):
+        trainer.global_step = step
+        trainer._maybe_update_sparse_polish_curriculum()
+
+    assert trainer.sparse_curriculum_scheduler_reverts == 1
+    assert trainer.sparse_curriculum_frozen_channels
+    assert trainer.sparse_curriculum_multipliers == before_update
+    assert trainer.sparse_curriculum_dynamic_max_change == pytest.approx(0.05)
+
+
+def test_vara_sparse_curriculum_restores_best_checkpoint(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer._initialize_sparse_polish_curriculum()
+    best = _sparse_polish_guard_metrics(0.05)
+    trainer._update_sparse_curriculum_best(best)
+    expected = {
+        name: value.clone()
+        for name, value in trainer.model.state_dict().items()
+    }
+    with torch.no_grad():
+        next(trainer.model.parameters()).add_(1.0)
+
+    restored = trainer._restore_best_sparse_curriculum_if_needed(
+        _sparse_polish_guard_metrics(0.20)
+    )
+
+    assert restored
+    assert trainer._sparse_curriculum_restored_best
+    for name, value in trainer.model.state_dict().items():
+        assert torch.equal(value.cpu(), expected[name].cpu())
+
+
+def test_vara_sparse_curriculum_keeps_optimizer_budget_equal_to_vanilla(
+    tmp_path,
+):
+    config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path,
+            data_supervision_mode="sparse_cfd_polish",
+            n_collocation=16,
+        ),
+        {
+            "training": {
+                "adaptive_cycles": 2,
+                "epochs_per_cycle": 2,
+                "n_boundary": 8,
+                "log_every": 8,
+            },
+            "validation": {"nx": 4, "ny": 4},
+            "test": {"nx": 4, "ny": 4},
+            "patches": {"nx_patches": 2, "ny_patches": 2},
+            "controller_v2": {
+                "total_steps": 4,
+                "warmup_steps": 2,
+                "control_blocks": 1,
+                "block_steps": 2,
+                "probe_steps": 1,
+                "gradient_probe_interior": 8,
+                "gradient_probe_boundary": 4,
+                "sparse_polish_curriculum": {
+                    "enabled": True,
+                    "update_every_steps": 2,
+                    "disable_generic_interventions": True,
+                },
+            },
+            "checkpoint": {"restore_best_before_final": False},
+            "optimizer": {"final_repair": {"enabled": False}},
+        },
+    )
+    vanilla = VARATrainer(
+        deep_update(
+            config,
+            {
+                "experiments": {
+                    "root": str(tmp_path / "vanilla_budget"),
+                    "flat_layout": True,
+                }
+            },
+        ),
+        mode="vanilla",
+    )
+    vara = VARAV2Trainer(
+        deep_update(
+            config,
+            {
+                "experiments": {
+                    "root": str(tmp_path / "vara_budget"),
+                    "flat_layout": True,
+                }
+            },
+        )
+    )
+    vanilla_metrics = vanilla.run()
+    vara_metrics = vara.run()
+
+    assert vanilla_metrics["optimizer_steps"] == 4
+    assert vara_metrics["optimizer_steps"] == 4
+    assert vara_metrics["probe_optimizer_steps"] == 0
+
+
 def test_vara_sparse_polish_score_excludes_dense_cfd_topology_and_vortex_metrics(
     tmp_path,
 ):
