@@ -52,6 +52,70 @@ SPARSE_POLISH_SCORE_WEIGHTS = {
     "near_wall_pde_residual_mean": 0.5,
 }
 
+SPARSE_POLISH_RESCUE_CANDIDATES = (
+    (
+        "continuity_boundary_rescue",
+        {
+            "continuity": 1.45,
+            "top_band_continuity": 1.45,
+            "bc_uvp_balanced": 1.30,
+            "momentum_u": 1.0,
+            "momentum_v": 1.0,
+            "cfd_u_mse": 1.0,
+            "cfd_v_mse": 1.05,
+        },
+    ),
+    (
+        "top_lid_boundary_rescue",
+        {
+            "bc_uvp_balanced": 1.35,
+            "bc_top_u": 1.15,
+            "bc_top_v": 1.15,
+            "bc_left_v": 1.10,
+            "bc_right_v": 1.10,
+            "continuity": 1.15,
+            "cfd_u_mse": 1.0,
+            "cfd_v_mse": 1.05,
+        },
+    ),
+    (
+        "near_wall_physics_rescue",
+        {
+            "momentum_u": 1.10,
+            "momentum_v": 1.10,
+            "top_band_pde": 1.35,
+            "upper_core_pde": 1.15,
+            "top_band_continuity": 1.30,
+            "bc_uvp_balanced": 1.10,
+            "cfd_u_mse": 1.0,
+            "cfd_v_mse": 1.0,
+        },
+    ),
+    (
+        "data_preserving_rescue",
+        {
+            "cfd_u_mse": 1.10,
+            "cfd_v_mse": 1.20,
+            "continuity": 1.20,
+            "bc_uvp_balanced": 1.15,
+            "momentum_u": 1.0,
+            "momentum_v": 1.0,
+        },
+    ),
+    (
+        "balanced_gate_rescue",
+        {
+            "momentum_u": 1.05,
+            "momentum_v": 1.05,
+            "continuity": 1.25,
+            "top_band_continuity": 1.20,
+            "bc_uvp_balanced": 1.20,
+            "cfd_u_mse": 1.05,
+            "cfd_v_mse": 1.10,
+        },
+    ),
+)
+
 
 class VARAV2Trainer(ExperimentTrainer):
     """Fixed-step, trust-region VARA trainer.
@@ -104,6 +168,7 @@ class VARAV2Trainer(ExperimentTrainer):
         self._sparse_polish_initial_score = float("nan")
         self._sparse_polish_final_score = float("nan")
         self._sparse_polish_noop_fallback = False
+        self._sparse_polish_rescue_status = self._empty_sparse_polish_rescue_status()
         sampling_snapshot = self.sampling_state_snapshot()
         self._probe_batch = self._make_probe_batch()
         # The fixed controller probe must not advance the optimization
@@ -199,7 +264,13 @@ class VARAV2Trainer(ExperimentTrainer):
                 self._log_state(block)
                 block_metrics = self.controller_metrics(coords_kept)
                 self.maybe_checkpoint(warmup_cycle + block, block_metrics)
-                self._update_sparse_polish_best(self._guard_metrics(coords_kept))
+                kept_guard_metrics = self._guard_metrics(coords_kept)
+                self._update_sparse_polish_best(kept_guard_metrics)
+                if self._maybe_run_sparse_polish_gate_rescue(
+                    kept_guard_metrics,
+                    coords_kept,
+                ):
+                    break
                 if self.should_stop_early(block_metrics):
                     break
                 continue
@@ -434,13 +505,28 @@ class VARAV2Trainer(ExperimentTrainer):
             self._log_state(block)
             block_metrics = self.controller_metrics(coords_kept)
             self.maybe_checkpoint(warmup_cycle + block, block_metrics)
-            self._update_sparse_polish_best(self._guard_metrics(coords_kept))
+            kept_guard_metrics = self._guard_metrics(coords_kept)
+            self._update_sparse_polish_best(kept_guard_metrics)
+            if self._maybe_run_sparse_polish_gate_rescue(
+                kept_guard_metrics,
+                coords_kept,
+            ):
+                break
             if self.should_stop_early(block_metrics):
                 break
 
         if self.sparse_cfd_polish_v2:
             _, _, final_guard_coords = self.validation_grid()
             pre_restore_metrics = self._guard_metrics(final_guard_coords)
+            if not self._sparse_polish_rescue_status["triggered"]:
+                self._sparse_polish_rescue_status = (
+                    self._run_sparse_polish_gate_rescue(
+                        pre_restore_metrics,
+                        final_guard_coords,
+                    )
+                )
+            if self._sparse_polish_rescue_status["triggered"]:
+                pre_restore_metrics = self._guard_metrics(final_guard_coords)
             self._sparse_polish_final_score = self._sparse_polish_score(
                 pre_restore_metrics
             )
@@ -520,10 +606,16 @@ class VARAV2Trainer(ExperimentTrainer):
                 "vara_sparse_polish_noop_fallback": (
                     self._sparse_polish_noop_fallback
                 ),
+                **self._sparse_polish_rescue_summary(),
             }
         )
         metrics["rollback_count"] = self.rejected_interventions if self.rollback_enabled else 0
         save_json(metrics, self.run_dir / "summary.json")
+        if self.sparse_cfd_polish_v2:
+            save_json(
+                self._sparse_polish_rescue_status["candidate_outcomes"],
+                self.run_dir / "vara_sparse_polish_rescue_candidates.json",
+            )
         pd.DataFrame([metrics]).to_csv(self.run_dir / "summary_table.csv", index=False)
         pd.DataFrame([metrics]).to_csv(self.table_dir / "summary.csv", index=False)
         save_checkpoint(
@@ -545,7 +637,10 @@ class VARAV2Trainer(ExperimentTrainer):
         phase: str,
         probe: bool = False,
         applied: bool = True,
-    ) -> None:
+        weight_multipliers: dict[str, float] | None = None,
+        lr_scale: float = 1.0,
+        ignore_compute_budget: bool = False,
+    ) -> int:
         train_cfg = self.config.get("training", {})
         scalar_weights = dict(train_cfg.get("weights", {}))
         if self.sparse_cfd_polish_v2:
@@ -555,11 +650,24 @@ class VARAV2Trainer(ExperimentTrainer):
                 scalar_weights[name] = float(
                     scalar_weights.get(name, 0.0)
                 ) * float(multiplier)
+        for name, multiplier in dict(weight_multipliers or {}).items():
+            current = float(scalar_weights.get(name, 0.0))
+            if current == 0.0 and name.startswith("bc_") and name != "bc_uvp_balanced":
+                balanced = float(scalar_weights.get("bc_uvp_balanced", 0.0))
+                scalar_weights[name] = balanced * max(float(multiplier) - 1.0, 0.0)
+            else:
+                scalar_weights[name] = current * float(multiplier)
         log_every = max(1, int(train_cfg.get("log_every", 25)))
         self.model.train()
         started = time.perf_counter()
+        completed_steps = 0
         for local_step in range(int(steps)):
-            if not self.compute_tracker.can_start_objective(int(batch["xy_f"].shape[0])):
+            if (
+                not ignore_compute_budget
+                and not self.compute_tracker.can_start_objective(
+                    int(batch["xy_f"].shape[0])
+                )
+            ):
                 break
             self._apply_cavity_curriculum()
             self.optimizer.zero_grad(set_to_none=True)
@@ -603,7 +711,9 @@ class VARAV2Trainer(ExperimentTrainer):
             optimizer_start = time.perf_counter()
             total.backward()
             grad_norm = self._grad_norm()
-            learning_rate = self.prepare_optimizer_step()
+            learning_rate = self.prepare_optimizer_step() * float(lr_scale)
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step(applied=applied)
             self._record_runtime(
@@ -640,7 +750,9 @@ class VARAV2Trainer(ExperimentTrainer):
                     }
                 )
             self.global_step += 1
+            completed_steps += 1
         self.compute_tracker.add_phase_time("optimization", time.perf_counter() - started)
+        return completed_steps
 
     def _diagnose_reference_free(
         self,
@@ -1034,6 +1146,485 @@ class VARAV2Trainer(ExperimentTrainer):
             persistence=int(getattr(primary, "persistence", 1)),
             trend=0.0,
         )
+
+    @staticmethod
+    def _empty_sparse_polish_rescue_status() -> dict[str, Any]:
+        return {
+            "triggered": False,
+            "reason": "",
+            "candidate_count": 0,
+            "candidate_steps": 0,
+            "best_candidate": "",
+            "accepted": False,
+            "score_before": float("nan"),
+            "score_after": float("nan"),
+            "continuity_before": float("nan"),
+            "continuity_after": float("nan"),
+            "boundary_before": float("nan"),
+            "boundary_after": float("nan"),
+            "cfd_mse_before": float("nan"),
+            "cfd_mse_after": float("nan"),
+            "pde_before": float("nan"),
+            "pde_after": float("nan"),
+            "extra_optimizer_steps": 0,
+            "reverted_final_polish": False,
+            "candidate_outcomes": [],
+            "gate_gaps": {},
+            "thresholds": {},
+            "reynolds": float("nan"),
+        }
+
+    def _sparse_polish_gate_thresholds(self) -> dict[str, float]:
+        validity = dict(self.config.get("continuation_validity", {}))
+        return {
+            "continuity_residual_mean": float(
+                validity.get("max_continuity_residual_mean", math.inf)
+            ),
+            "boundary_condition_error": float(
+                validity.get("max_boundary_condition_error", math.inf)
+            ),
+            "pde_residual_mean": float(
+                validity.get("max_pde_residual_mean", math.inf)
+            ),
+            "momentum_residual_mean": float(
+                validity.get("max_momentum_residual_mean", math.inf)
+            ),
+            "speed_pred_max": float(
+                validity.get("max_speed_pred", math.inf)
+            ),
+        }
+
+    def _sparse_polish_gate_gaps(
+        self,
+        metrics: dict[str, float],
+    ) -> dict[str, float]:
+        thresholds = self._sparse_polish_gate_thresholds()
+        gaps: dict[str, float] = {}
+        for metric, label in (
+            ("continuity_residual_mean", "continuity"),
+            ("boundary_condition_error", "boundary"),
+            ("pde_residual_mean", "pde"),
+            ("momentum_residual_mean", "momentum"),
+        ):
+            value = float(metrics.get(metric, float("nan")))
+            target = float(thresholds[metric])
+            gaps[label] = (
+                max(value / target - 1.0, 0.0)
+                if math.isfinite(value)
+                and math.isfinite(target)
+                and target > 0.0
+                else 0.0
+            )
+        gaps["total"] = sum(gaps.values())
+        return gaps
+
+    def _sparse_polish_rescue_score(
+        self,
+        metrics: dict[str, float],
+    ) -> float:
+        gaps = self._sparse_polish_gate_gaps(metrics)
+        normalized = 0.0
+        for name, weight in (
+            ("pde_residual_mean", 1.2),
+            ("momentum_residual_mean", 1.2),
+            ("cfd_velocity_mse_sparse", 1.4),
+            ("top_band_continuity_residual_mean", 0.8),
+            ("near_wall_pde_residual_mean", 0.5),
+        ):
+            value = float(metrics.get(name, float("nan")))
+            scale = float(self._sparse_polish_score_scales.get(name, value))
+            if not math.isfinite(value) or not math.isfinite(scale):
+                return math.inf
+            normalized += weight * max(value, 0.0) / max(scale, 1e-12)
+        speed = float(metrics.get("speed_pred_max", float("nan")))
+        speed_cap = self._sparse_polish_gate_thresholds()["speed_pred_max"]
+        speed_penalty = (
+            (max(speed - speed_cap, 0.0) / max(speed_cap, 1e-12)) ** 2
+            if math.isfinite(speed) and math.isfinite(speed_cap)
+            else 0.0
+        )
+        return float(
+            3.0 * gaps["continuity"]
+            + 2.8 * gaps["boundary"]
+            + normalized
+            + speed_penalty
+        )
+
+    def _should_run_sparse_polish_rescue(
+        self,
+        metrics: dict[str, float],
+    ) -> tuple[bool, str]:
+        if not self.sparse_cfd_polish_v2:
+            return False, "not_sparse_cfd_polish_vara"
+        cfg = dict(
+            self.config.get("controller_v2", {}).get(
+                "sparse_polish_rescue", {}
+            )
+        )
+        if not bool(cfg.get("enabled", True)):
+            return False, "disabled"
+        gaps = self._sparse_polish_gate_gaps(metrics)
+        if gaps["continuity"] <= 0.0 and gaps["boundary"] <= 0.0:
+            return False, "continuity_and_boundary_gates_pass"
+        minimum_rollbacks = int(cfg.get("minimum_rollbacks", 4))
+        low_gain = self._accepted_improvement_per_compute() < float(
+            cfg.get("accepted_gain_threshold", 5e-4)
+        )
+        weak_controller = self.accepted_interventions == 0 or low_gain
+        if self.rejected_interventions < minimum_rollbacks or not weak_controller:
+            return False, "controller_has_not_stalled"
+        thresholds = self._sparse_polish_gate_thresholds()
+        pde = float(metrics.get("pde_residual_mean", math.inf))
+        momentum = float(metrics.get("momentum_residual_mean", math.inf))
+        healthy_factor = float(cfg.get("healthy_physics_factor", 2.0))
+        if (
+            math.isfinite(thresholds["pde_residual_mean"])
+            and pde > healthy_factor * thresholds["pde_residual_mean"]
+        ) or (
+            math.isfinite(thresholds["momentum_residual_mean"])
+            and momentum
+            > healthy_factor * thresholds["momentum_residual_mean"]
+        ):
+            return False, "physics_not_close_enough"
+        return True, "gate_deficit_after_repeated_rollbacks"
+
+    def _restore_sparse_polish_snapshot(
+        self,
+        snapshot: dict[str, Any],
+    ) -> None:
+        self._restore_model_snapshot(snapshot["model"])
+        self.optimizer.load_state_dict(snapshot["optimizer"])
+        self.loss_normalization_state = deepcopy(
+            snapshot["loss_normalization"]
+        )
+        self.v2_controller.state.restore(snapshot["controller"])
+        self.restore_sampling_state(snapshot["sampling"])
+        self._sync_benchmark_corner_to_model()
+
+    def _sparse_polish_rescue_acceptance(
+        self,
+        before: dict[str, float],
+        after: dict[str, float],
+        *,
+        require_gate_gain: bool = True,
+    ) -> tuple[bool, str]:
+        before_score = self._sparse_polish_rescue_score(before)
+        after_score = self._sparse_polish_rescue_score(after)
+        if not math.isfinite(after_score) or after_score >= before_score * 0.995:
+            return False, "insufficient_score_gain"
+        tolerances = {
+            "pde_residual_mean": 0.01,
+            "momentum_residual_mean": 0.01,
+            "continuity_residual_mean": 0.0,
+            "boundary_condition_error": 0.0,
+            "cfd_velocity_mse_sparse": 0.003,
+            "cfd_v_mse_sparse": 0.003,
+        }
+        for name, tolerance in tolerances.items():
+            if name not in before or name not in after:
+                continue
+            change = (float(after[name]) - float(before[name])) / max(
+                abs(float(before[name])), 1e-12
+            )
+            if change > tolerance:
+                return False, {
+                    "continuity_residual_mean": "worsened_continuity",
+                    "boundary_condition_error": "worsened_boundary",
+                    "cfd_velocity_mse_sparse": "worsened_sparse_cfd_mse",
+                    "cfd_v_mse_sparse": "worsened_sparse_cfd_mse",
+                    "pde_residual_mean": "worsened_pde",
+                    "momentum_residual_mean": "worsened_pde",
+                }[name]
+        speed = float(after.get("speed_pred_max", float("nan")))
+        speed_cap = self._sparse_polish_gate_thresholds()["speed_pred_max"]
+        if math.isfinite(speed_cap) and (
+            not math.isfinite(speed) or speed > speed_cap
+        ):
+            return False, "speed_cap_violation"
+        if require_gate_gain:
+            continuity_gain = (
+                float(before["continuity_residual_mean"])
+                - float(after["continuity_residual_mean"])
+            ) / max(abs(float(before["continuity_residual_mean"])), 1e-12)
+            boundary_gain = (
+                float(before["boundary_condition_error"])
+                - float(after["boundary_condition_error"])
+            ) / max(abs(float(before["boundary_condition_error"])), 1e-12)
+            if max(continuity_gain, boundary_gain) < 0.03:
+                return False, "insufficient_gate_improvement"
+        return True, ""
+
+    def _run_sparse_polish_gate_rescue(
+        self,
+        current_metrics: dict[str, float],
+        coords: np.ndarray,
+    ) -> dict[str, Any]:
+        status = self._empty_sparse_polish_rescue_status()
+        status["reynolds"] = float(
+            self.config.get("benchmark_params", {}).get(
+                "reynolds", float("nan")
+            )
+        )
+        status["thresholds"] = self._sparse_polish_gate_thresholds()
+        status["gate_gaps"] = self._sparse_polish_gate_gaps(current_metrics)
+        triggered, reason = self._should_run_sparse_polish_rescue(
+            current_metrics
+        )
+        status["reason"] = reason
+        if not triggered or self._sparse_polish_best is None:
+            return status
+        status["triggered"] = True
+        cfg = dict(
+            self.config.get("controller_v2", {}).get(
+                "sparse_polish_rescue", {}
+            )
+        )
+        max_candidates = min(
+            max(int(cfg.get("max_candidates", 5)), 1),
+            len(SPARSE_POLISH_RESCUE_CANDIDATES),
+        )
+        max_extra = max(int(cfg.get("max_extra_optimizer_steps", 1200)), 0)
+        requested_steps = max(int(cfg.get("candidate_steps", 200)), 1)
+        candidate_steps = min(
+            requested_steps,
+            max_extra // max(max_candidates, 1),
+        )
+        if candidate_steps <= 0:
+            status["reason"] = "extra_optimizer_budget_zero"
+            return status
+        status["candidate_count"] = max_candidates
+        status["candidate_steps"] = candidate_steps
+        lr_scale = float(cfg.get("lr_scale", 0.35))
+        base = deepcopy(self._sparse_polish_best)
+        self._restore_sparse_polish_snapshot(base)
+        base_step = self.global_step
+        base_metrics = self._guard_metrics(coords)
+        base_score = self._sparse_polish_rescue_score(base_metrics)
+        status.update(
+            {
+                "score_before": base_score,
+                "continuity_before": base_metrics["continuity_residual_mean"],
+                "boundary_before": base_metrics["boundary_condition_error"],
+                "cfd_mse_before": base_metrics["cfd_velocity_mse_sparse"],
+                "pde_before": base_metrics["pde_residual_mean"],
+            }
+        )
+        sampling_state = self.sampling_state_snapshot()
+        rescue_batch = self.initial_batch()
+        self.restore_sampling_state(sampling_state)
+        candidates: list[dict[str, Any]] = []
+        total_extra = 0
+        for name, multipliers in SPARSE_POLISH_RESCUE_CANDIDATES[:max_candidates]:
+            self._restore_sparse_polish_snapshot(base)
+            self.global_step = base_step
+            completed = self._train_v2_steps(
+                rescue_batch,
+                candidate_steps,
+                cycle="sparse_polish_rescue",
+                phase=name,
+                probe=True,
+                applied=False,
+                weight_multipliers=multipliers,
+                lr_scale=lr_scale,
+                ignore_compute_budget=True,
+            )
+            total_extra += completed
+            after = self._guard_metrics(coords)
+            accepted, rejection = self._sparse_polish_rescue_acceptance(
+                base_metrics,
+                after,
+            )
+            outcome = {
+                "candidate_name": name,
+                "accepted": accepted,
+                "score_before": base_score,
+                "score_after": self._sparse_polish_rescue_score(after),
+                "continuity_before": base_metrics["continuity_residual_mean"],
+                "continuity_after": after["continuity_residual_mean"],
+                "boundary_before": base_metrics["boundary_condition_error"],
+                "boundary_after": after["boundary_condition_error"],
+                "pde_before": base_metrics["pde_residual_mean"],
+                "pde_after": after["pde_residual_mean"],
+                "cfd_mse_before": base_metrics["cfd_velocity_mse_sparse"],
+                "cfd_mse_after": after["cfd_velocity_mse_sparse"],
+                "rejection_reason": rejection,
+                "optimizer_steps": completed,
+                "snapshot": {
+                    "model": self._model_snapshot(),
+                    "optimizer": deepcopy(self.optimizer.state_dict()),
+                    "loss_normalization": deepcopy(
+                        self.loss_normalization_state
+                    ),
+                    "controller": self.v2_controller.state.snapshot(),
+                    "sampling": self.sampling_state_snapshot(),
+                },
+                "metrics": after,
+            }
+            candidates.append(outcome)
+        accepted_candidates = [
+            item for item in candidates if bool(item["accepted"])
+        ]
+        selected = (
+            min(accepted_candidates, key=lambda item: item["score_after"])
+            if accepted_candidates
+            else None
+        )
+        for item in candidates:
+            if item is not selected:
+                self.compute_tracker.record_rollback_steps(
+                    int(item["optimizer_steps"])
+                )
+        if selected is None:
+            self._restore_sparse_polish_snapshot(base)
+            self.global_step = base_step
+        else:
+            self._restore_sparse_polish_snapshot(selected["snapshot"])
+            selected_steps = int(selected["optimizer_steps"])
+            self.global_step = base_step + selected_steps
+            self.compute_tracker.record_applied_optimizer_steps(selected_steps)
+            self.accepted_interventions += 1
+            status["accepted"] = True
+            status["best_candidate"] = str(selected["candidate_name"])
+            selected_metrics = dict(selected["metrics"])
+            final_polish_steps = (
+                min(50, max(30, int(cfg.get("final_lbfgs_steps", 5)) * 6))
+                if int(cfg.get("final_lbfgs_steps", 5)) > 0
+                else 0
+            )
+            remaining_extra = max(max_extra - total_extra, 0)
+            final_polish_steps = min(final_polish_steps, remaining_extra)
+            if final_polish_steps > 0:
+                pre_polish = deepcopy(selected["snapshot"])
+                completed = self._train_v2_steps(
+                    rescue_batch,
+                    final_polish_steps,
+                    cycle="sparse_polish_rescue",
+                    phase="best_candidate_final_polish",
+                    probe=False,
+                    applied=False,
+                    weight_multipliers=SPARSE_POLISH_RESCUE_CANDIDATES[-1][1],
+                    lr_scale=min(lr_scale, 0.25),
+                    ignore_compute_budget=True,
+                )
+                total_extra += completed
+                polished_metrics = self._guard_metrics(coords)
+                polish_ok, _polish_reason = (
+                    self._sparse_polish_rescue_acceptance(
+                        selected_metrics,
+                        polished_metrics,
+                        require_gate_gain=False,
+                    )
+                )
+                if polish_ok:
+                    self.compute_tracker.record_applied_optimizer_steps(completed)
+                    selected_metrics = polished_metrics
+                else:
+                    self.compute_tracker.record_rollback_steps(completed)
+                    self._restore_sparse_polish_snapshot(pre_polish)
+                    self.global_step -= completed
+                    status["reverted_final_polish"] = True
+            self._update_sparse_polish_best(selected_metrics)
+            status.update(
+                {
+                    "score_after": self._sparse_polish_rescue_score(
+                        selected_metrics
+                    ),
+                    "continuity_after": selected_metrics[
+                        "continuity_residual_mean"
+                    ],
+                    "boundary_after": selected_metrics[
+                        "boundary_condition_error"
+                    ],
+                    "cfd_mse_after": selected_metrics[
+                        "cfd_velocity_mse_sparse"
+                    ],
+                    "pde_after": selected_metrics["pde_residual_mean"],
+                }
+            )
+        status["extra_optimizer_steps"] = total_extra
+        status["candidate_outcomes"] = [
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"snapshot", "metrics"}
+            }
+            for item in candidates
+        ]
+        return status
+
+    def _maybe_run_sparse_polish_gate_rescue(
+        self,
+        metrics: dict[str, float],
+        coords: np.ndarray,
+    ) -> bool:
+        if not self.sparse_cfd_polish_v2:
+            return False
+        triggered, _reason = self._should_run_sparse_polish_rescue(metrics)
+        if not triggered:
+            return False
+        self._sparse_polish_rescue_status = self._run_sparse_polish_gate_rescue(
+            metrics,
+            coords,
+        )
+        return bool(self._sparse_polish_rescue_status["triggered"])
+
+    def _sparse_polish_rescue_summary(self) -> dict[str, Any]:
+        status = self._sparse_polish_rescue_status
+        gaps = dict(status.get("gate_gaps", {}))
+        return {
+            "vara_gate_continuity_gap": float(gaps.get("continuity", 0.0)),
+            "vara_gate_boundary_gap": float(gaps.get("boundary", 0.0)),
+            "vara_gate_pde_gap": float(gaps.get("pde", 0.0)),
+            "vara_gate_momentum_gap": float(gaps.get("momentum", 0.0)),
+            "vara_gate_total_gap": float(gaps.get("total", 0.0)),
+            "vara_sparse_polish_rescue_triggered": bool(status["triggered"]),
+            "vara_sparse_polish_rescue_reason": str(status["reason"]),
+            "vara_sparse_polish_rescue_candidate_count": int(
+                status["candidate_count"]
+            ),
+            "vara_sparse_polish_rescue_candidate_steps": int(
+                status["candidate_steps"]
+            ),
+            "vara_sparse_polish_rescue_best_candidate": str(
+                status["best_candidate"]
+            ),
+            "vara_sparse_polish_rescue_accepted": bool(status["accepted"]),
+            "vara_sparse_polish_rescue_score_before": float(
+                status["score_before"]
+            ),
+            "vara_sparse_polish_rescue_score_after": float(
+                status["score_after"]
+            ),
+            "vara_sparse_polish_rescue_continuity_before": float(
+                status["continuity_before"]
+            ),
+            "vara_sparse_polish_rescue_continuity_after": float(
+                status["continuity_after"]
+            ),
+            "vara_sparse_polish_rescue_boundary_before": float(
+                status["boundary_before"]
+            ),
+            "vara_sparse_polish_rescue_boundary_after": float(
+                status["boundary_after"]
+            ),
+            "vara_sparse_polish_rescue_cfd_mse_before": float(
+                status["cfd_mse_before"]
+            ),
+            "vara_sparse_polish_rescue_cfd_mse_after": float(
+                status["cfd_mse_after"]
+            ),
+            "vara_sparse_polish_rescue_pde_before": float(status["pde_before"]),
+            "vara_sparse_polish_rescue_pde_after": float(status["pde_after"]),
+            "vara_sparse_polish_rescue_extra_optimizer_steps": int(
+                status["extra_optimizer_steps"]
+            ),
+            "vara_sparse_polish_rescue_reverted_final_polish": bool(
+                status["reverted_final_polish"]
+            ),
+            "vara_rescue_reynolds": float(status["reynolds"]),
+            "vara_rescue_used_thresholds": dict(status["thresholds"]),
+            "vara_rescue_normalized_score": float(status["score_after"]),
+        }
 
     def _make_probe_batch(self) -> dict[str, Any]:
         cfg = dict(self.config.get("controller_v2", {}))

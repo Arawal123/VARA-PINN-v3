@@ -1056,6 +1056,284 @@ def test_vara_sparse_polish_noop_fallback_requires_clear_gain(tmp_path):
     assert not trainer._sparse_polish_should_noop(0.02)
 
 
+def test_vara_sparse_polish_rescue_trigger_uses_gate_deficits_and_rollbacks(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.rejected_interventions = 4
+    trainer.accepted_interventions = 0
+    metrics = _sparse_polish_guard_metrics()
+    metrics["continuity_residual_mean"] = 0.02
+    metrics["boundary_condition_error"] = 0.04
+
+    triggered, reason = trainer._should_run_sparse_polish_rescue(metrics)
+    gaps = trainer._sparse_polish_gate_gaps(metrics)
+
+    assert triggered
+    assert reason == "gate_deficit_after_repeated_rollbacks"
+    assert gaps["continuity"] == pytest.approx(1.0)
+    assert gaps["boundary"] == pytest.approx(1.0 / 3.0)
+    assert gaps["total"] > 0.0
+
+
+def test_vara_sparse_polish_rescue_is_mode_scoped(tmp_path):
+    sparse_config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path / "sparse",
+            data_supervision_mode="sparse_cfd",
+        ),
+        {
+            "experiments": {
+                "root": str(tmp_path / "sparse" / "run"),
+                "flat_layout": True,
+            }
+        },
+    )
+    pure_config = deep_update(
+        _small_cavity_trainer_config(tmp_path / "pure"),
+        {
+            "experiments": {
+                "root": str(tmp_path / "pure" / "run"),
+                "flat_layout": True,
+            }
+        },
+    )
+    for trainer in (VARAV2Trainer(sparse_config), VARAV2Trainer(pure_config)):
+        trainer.rejected_interventions = 10
+        triggered, reason = trainer._should_run_sparse_polish_rescue(
+            _sparse_polish_guard_metrics()
+        )
+        assert not triggered
+        assert reason == "not_sparse_cfd_polish_vara"
+
+
+def test_vara_sparse_polish_rescue_rejects_pde_gain_with_continuity_regression(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    before = _sparse_polish_guard_metrics()
+    trainer._update_sparse_polish_best(before)
+    after = dict(before)
+    after["pde_residual_mean"] *= 0.5
+    after["continuity_residual_mean"] *= 1.01
+
+    accepted, reason = trainer._sparse_polish_rescue_acceptance(before, after)
+
+    assert not accepted
+    assert reason == "worsened_continuity"
+
+
+def test_vara_sparse_polish_rescue_rejects_cfd_regression(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    before = _sparse_polish_guard_metrics()
+    trainer._update_sparse_polish_best(before)
+    after = dict(before)
+    after["continuity_residual_mean"] *= 0.90
+    after["cfd_velocity_mse_sparse"] *= 1.01
+
+    accepted, reason = trainer._sparse_polish_rescue_acceptance(before, after)
+
+    assert not accepted
+    assert reason == "worsened_sparse_cfd_mse"
+
+
+def test_vara_sparse_polish_rescue_accepts_safe_gate_improvement(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    before = _sparse_polish_guard_metrics()
+    trainer._update_sparse_polish_best(before)
+    after = dict(before)
+    after["continuity_residual_mean"] *= 0.95
+    after["boundary_condition_error"] *= 0.98
+    after["pde_residual_mean"] *= 0.995
+    after["momentum_residual_mean"] *= 0.995
+
+    accepted, reason = trainer._sparse_polish_rescue_acceptance(before, after)
+
+    assert accepted
+    assert reason == ""
+
+
+def test_vara_sparse_polish_rescue_score_excludes_evaluation_only_metrics(
+    tmp_path,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    metrics = _sparse_polish_guard_metrics()
+    trainer._update_sparse_polish_best(metrics)
+    baseline = trainer._sparse_polish_rescue_score(metrics)
+    contaminated = {
+        **metrics,
+        "cfd_velocity_full_rel_l2_eval_only": 999.0,
+        "ghia_profile_score": 999.0,
+        "topology_aligned": False,
+        "detected_vortex_count": 99,
+        "primary_vortex_center_error": 999.0,
+        "streamline_metric": 999.0,
+    }
+
+    assert trainer._sparse_polish_rescue_score(contaminated) == pytest.approx(
+        baseline
+    )
+
+
+def test_vara_sparse_polish_gate_gaps_use_materialized_config_targets(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer.config["continuation_validity"].update(
+        {
+            "max_continuity_residual_mean": 0.02,
+            "max_boundary_condition_error": 0.04,
+            "max_pde_residual_mean": 0.20,
+            "max_momentum_residual_mean": 0.25,
+        }
+    )
+    metrics = _sparse_polish_guard_metrics()
+    metrics.update(
+        {
+            "continuity_residual_mean": 0.03,
+            "boundary_condition_error": 0.06,
+            "pde_residual_mean": 0.10,
+            "momentum_residual_mean": 0.10,
+        }
+    )
+    gaps = trainer._sparse_polish_gate_gaps(metrics)
+
+    assert gaps["continuity"] == pytest.approx(0.5)
+    assert gaps["boundary"] == pytest.approx(0.5)
+    assert gaps["pde"] == pytest.approx(0.0)
+    assert gaps["momentum"] == pytest.approx(0.0)
+
+
+def test_vara_sparse_polish_rejected_rescue_branches_restore_main_model(
+    tmp_path,
+    monkeypatch,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    metrics = _sparse_polish_guard_metrics()
+    metrics["continuity_residual_mean"] = 0.02
+    metrics["boundary_condition_error"] = 0.04
+    trainer._update_sparse_polish_best(metrics)
+    trainer.rejected_interventions = 4
+    trainer.config["controller_v2"]["sparse_polish_rescue"].update(
+        {
+            "max_candidates": 2,
+            "candidate_steps": 1,
+            "max_extra_optimizer_steps": 2,
+            "final_lbfgs_steps": 0,
+        }
+    )
+    expected = {
+        name: value.clone()
+        for name, value in trainer.model.state_dict().items()
+    }
+
+    def fake_train(*_args, **_kwargs):
+        with torch.no_grad():
+            next(trainer.model.parameters()).add_(1.0)
+        return 1
+
+    monkeypatch.setattr(trainer, "_train_v2_steps", fake_train)
+    monkeypatch.setattr(trainer, "_guard_metrics", lambda _coords: dict(metrics))
+    _, _, coords = trainer.validation_grid()
+    status = trainer._run_sparse_polish_gate_rescue(metrics, coords)
+
+    assert status["triggered"]
+    assert not status["accepted"]
+    assert status["candidate_count"] == 2
+    for name, value in trainer.model.state_dict().items():
+        assert torch.equal(value.cpu(), expected[name].cpu())
+
+
+def test_vara_sparse_polish_rescue_reverts_worse_final_polish(
+    tmp_path,
+    monkeypatch,
+):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    base_metrics = _sparse_polish_guard_metrics()
+    base_metrics["continuity_residual_mean"] = 0.02
+    base_metrics["boundary_condition_error"] = 0.04
+    candidate_metrics = dict(base_metrics)
+    candidate_metrics["continuity_residual_mean"] *= 0.90
+    candidate_metrics["boundary_condition_error"] *= 0.98
+    candidate_metrics["pde_residual_mean"] *= 0.995
+    candidate_metrics["momentum_residual_mean"] *= 0.995
+    polished_metrics = dict(candidate_metrics)
+    polished_metrics["continuity_residual_mean"] *= 1.01
+    trainer._update_sparse_polish_best(base_metrics)
+    trainer.rejected_interventions = 4
+    trainer.config["controller_v2"]["sparse_polish_rescue"].update(
+        {
+            "max_candidates": 1,
+            "candidate_steps": 1,
+            "max_extra_optimizer_steps": 31,
+            "final_lbfgs_steps": 5,
+        }
+    )
+    initial = next(trainer.model.parameters()).detach().clone()
+
+    def fake_train(*_args, **kwargs):
+        phase = kwargs["phase"]
+        with torch.no_grad():
+            next(trainer.model.parameters()).add_(
+                2.0 if phase == "best_candidate_final_polish" else 1.0
+            )
+        return int(_args[1])
+
+    metrics_iter = iter(
+        [dict(base_metrics), dict(candidate_metrics), dict(polished_metrics)]
+    )
+    monkeypatch.setattr(trainer, "_train_v2_steps", fake_train)
+    monkeypatch.setattr(
+        trainer,
+        "_guard_metrics",
+        lambda _coords: next(metrics_iter),
+    )
+    _, _, coords = trainer.validation_grid()
+    status = trainer._run_sparse_polish_gate_rescue(base_metrics, coords)
+
+    assert status["accepted"]
+    assert status["reverted_final_polish"]
+    assert torch.equal(
+        next(trainer.model.parameters()).detach(),
+        initial + 1.0,
+    )
+
+
+def test_vara_sparse_polish_rescue_summary_contains_required_logging(tmp_path):
+    trainer = _sparse_polish_v2_trainer(tmp_path)
+    trainer._sparse_polish_rescue_status.update(
+        {
+            "triggered": True,
+            "reason": "test",
+            "candidate_count": 5,
+            "candidate_steps": 200,
+            "reynolds": 300.0,
+            "thresholds": {"continuity_residual_mean": 0.02},
+            "gate_gaps": {
+                "continuity": 0.2,
+                "boundary": 0.1,
+                "pde": 0.0,
+                "momentum": 0.0,
+                "total": 0.3,
+            },
+        }
+    )
+    summary = trainer._sparse_polish_rescue_summary()
+
+    required = {
+        "vara_sparse_polish_rescue_triggered",
+        "vara_sparse_polish_rescue_reason",
+        "vara_sparse_polish_rescue_candidate_count",
+        "vara_sparse_polish_rescue_candidate_steps",
+        "vara_sparse_polish_rescue_best_candidate",
+        "vara_sparse_polish_rescue_accepted",
+        "vara_sparse_polish_rescue_extra_optimizer_steps",
+        "vara_rescue_reynolds",
+        "vara_rescue_used_thresholds",
+        "vara_rescue_normalized_score",
+    }
+    assert required.issubset(summary)
+    assert summary["vara_gate_total_gap"] == pytest.approx(0.3)
+
+
 def test_vara_sparse_polish_restores_best_safe_state_if_final_is_worse(tmp_path):
     trainer = _sparse_polish_v2_trainer(tmp_path)
     best_metrics = _sparse_polish_guard_metrics(0.05)
