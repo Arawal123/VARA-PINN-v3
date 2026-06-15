@@ -18,5 +18,3 @@ experiments/tables/*
 !experiments/figures/.gitkeep
 !experiments/tables/.gitkeep
 
-# Deterministic cavity CFD references are generated and cached on demand.
-data/cavity_cfd/

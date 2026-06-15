@@ -7,13 +7,11 @@ import pandas as pd
 import pytest
 import torch
 
-import scripts.run_vara_v2_continuation as continuation_script
 from scripts.run_vara_v2_continuation import (
     _apply_data_supervision_settings,
     _apply_re_aware_cavity_settings,
     _continuation_validity,
     _load_base_config,
-    _resolve_cfd_reference_for_re,
     _validate_reliable_config,
     _without_cavity_stabilizers,
 )
@@ -97,148 +95,6 @@ def _write_toy_cfd(path):
         v=(x - y).reshape(-1),
         omega=np.ones(x.size),
     )
-
-
-def test_re100_sparse_continuation_reference_path_is_unchanged(tmp_path):
-    path = tmp_path / "re_0100_existing.npz"
-    _write_toy_cfd(path)
-    info = _resolve_cfd_reference_for_re(
-        100.0,
-        mode="sparse_cfd_polish",
-        reference_map={100.0: path},
-        reference_dir=tmp_path / "cache",
-        generate_missing=True,
-    )
-    assert info["path"] == path.resolve()
-    assert not info["generated"]
-    assert info["resolution"] == "11x11"
-
-
-def test_re200_sparse_continuation_generates_before_supervision_build(
-    tmp_path,
-    monkeypatch,
-):
-    calls = []
-
-    def fake_generate(reynolds, output_path):
-        calls.append(float(reynolds))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_toy_cfd(output_path)
-        return output_path
-
-    monkeypatch.setattr(
-        continuation_script,
-        "generate_cavity_cfd_reference",
-        fake_generate,
-    )
-    info = _resolve_cfd_reference_for_re(
-        200.0,
-        mode="sparse_cfd_polish",
-        reference_map={},
-        reference_dir=tmp_path / "cache",
-        generate_missing=True,
-    )
-    config = {
-        "seed": 0,
-        "benchmark_params": {
-            "reynolds": 200.0,
-            "full_field_reference_path": str(info["path"]),
-        },
-        "data_supervision": {
-            "mode": "sparse_cfd_polish",
-            "reference_path": str(info["path"]),
-            "sample_count": 12,
-            "seed": 7,
-        },
-    }
-    pool = build_cavity_cfd_supervision(
-        config,
-        (0.0, 1.0, 0.0, 1.0),
-        torch.device("cpu"),
-    )
-    assert calls == [200.0]
-    assert info["generated"]
-    assert info["path"].exists()
-    assert pool is not None
-    assert pool.sample_count == 12
-
-
-def test_sparse_continuation_methods_share_reference_and_pool(tmp_path):
-    path = tmp_path / "re_0200.npz"
-    _write_toy_cfd(path)
-    info = _resolve_cfd_reference_for_re(
-        200.0,
-        mode="sparse_cfd_polish",
-        reference_map={200.0: path},
-        reference_dir=tmp_path / "cache",
-        generate_missing=True,
-    )
-    base = {
-        "seed": 5,
-        "benchmark_params": {
-            "reynolds": 200.0,
-            "full_field_reference_path": str(info["path"]),
-        },
-        "data_supervision": {
-            "mode": "sparse_cfd_polish",
-            "reference_path": str(info["path"]),
-            "sample_count": 20,
-            "seed": 13,
-            "cfd": {"sampling": {"mode": "mixed"}},
-        },
-    }
-    vanilla = build_cavity_cfd_supervision(
-        deepcopy(base),
-        (0.0, 1.0, 0.0, 1.0),
-        torch.device("cpu"),
-    )
-    vara = build_cavity_cfd_supervision(
-        deepcopy(base),
-        (0.0, 1.0, 0.0, 1.0),
-        torch.device("cpu"),
-    )
-    assert vanilla is not None and vara is not None
-    assert vanilla.source_path == vara.source_path == str(info["path"])
-    assert vanilla.pool_hash == vara.pool_hash
-    assert torch.equal(vanilla.coords, vara.coords)
-
-
-def test_sparse_continuation_missing_reference_error_is_actionable(tmp_path):
-    with pytest.raises(ValueError) as exc_info:
-        _resolve_cfd_reference_for_re(
-            300.0,
-            mode="sparse_cfd_polish",
-            reference_map={},
-            reference_dir=tmp_path / "cache",
-            generate_missing=False,
-        )
-    message = str(exc_info.value)
-    assert "requested Re=300" in message
-    assert "re_0300" in message
-    assert "python -m src.physics.cavity_cfd_generator" in message
-
-
-def test_pure_pinn_continuation_does_not_require_or_generate_reference(
-    tmp_path,
-    monkeypatch,
-):
-    def fail_generate(*args, **kwargs):
-        raise AssertionError("pure_pinn must not generate CFD references")
-
-    monkeypatch.setattr(
-        continuation_script,
-        "generate_cavity_cfd_reference",
-        fail_generate,
-    )
-    info = _resolve_cfd_reference_for_re(
-        750.0,
-        mode="pure_pinn",
-        reference_map={},
-        reference_dir=tmp_path / "cache",
-        generate_missing=True,
-    )
-    assert info["path"] is None
-    assert not info["generated"]
 
 
 def test_sparse_cfd_sampler_is_deterministic_and_excludes_boundaries_and_corners(tmp_path):
