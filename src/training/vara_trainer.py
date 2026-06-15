@@ -18,7 +18,7 @@ from src.controllers import (
     VARAController,
 )
 from src.diagnostics import DiagnosticMapBuilder
-from src.losses.base_losses import compute_global_losses, weighted_sum
+from src.losses.base_losses import compute_global_losses, compute_pointwise_losses, weighted_sum
 from src.losses.modern_baselines import (
     ReLoBRaLoWeights,
     ResidualAttentionState,
@@ -233,11 +233,6 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.zero_grad(set_to_none=True)
             attention_optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            self._apply_cavity_curriculum()
-            pointwise, construction_logs = self._build_pointwise_losses(
-                batch,
-                scalar_weights,
-            )
             total, losses, attention_logs = self_adaptive_objective(
                 self.model,
                 batch,
@@ -247,7 +242,6 @@ class VARATrainer(ExperimentTrainer):
                 interior_logits,
                 boundary_logits,
                 maximum_attention=float(cfg.get("maximum_attention", 20.0)),
-                pointwise=pointwise,
             )
             anchor_loss, anchor_weight = self.continuation_anchor_loss(batch)
             replay_loss, replay_weight = self.continuation_replay_loss()
@@ -273,8 +267,6 @@ class VARATrainer(ExperimentTrainer):
             self.compute_tracker.record_optimizer_step()
             self.compute_tracker.record_auxiliary_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
-            self._record_effective_loss_diagnostics(losses, scalar_weights)
-            last_losses.update(construction_logs)
             last_losses.update(attention_logs)
             last_losses["total"] = float(total.detach().cpu())
             last_losses["grad_norm"] = grad_norm
@@ -320,11 +312,7 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            self._apply_cavity_curriculum()
-            pointwise, construction_logs = self._build_pointwise_losses(
-                batch,
-                adaptive_weights,
-            )
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
             losses = compute_global_losses(
                 pointwise,
                 reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
@@ -352,11 +340,6 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
-            self._record_effective_loss_diagnostics(
-                losses,
-                adaptive_weights,
-            )
-            last_losses.update(construction_logs)
             last_losses.update({f"adaptive_weight_{name}": value for name, value in adaptive_weights.items()})
             last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
             last_losses["continuation_anchor_weight"] = float(anchor_weight)
@@ -409,12 +392,7 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            self._apply_cavity_curriculum()
-            configured_weights = dict(train_cfg.get("weights", {}))
-            pointwise, construction_logs = self._build_pointwise_losses(
-                batch,
-                configured_weights,
-            )
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
             losses = compute_global_losses(
                 pointwise,
                 reduction=str(train_cfg.get("pointwise_reduction", "legacy_mse")),
@@ -440,8 +418,6 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
-            self._record_effective_loss_diagnostics(losses, adaptive)
-            last_losses.update(construction_logs)
             last_losses.update({f"relobralo_weight_{name}": value for name, value in adaptive.items()})
             last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
             last_losses["continuation_anchor_weight"] = float(anchor_weight)
@@ -490,11 +466,7 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            self._apply_cavity_curriculum()
-            pointwise, construction_logs = self._build_pointwise_losses(
-                batch,
-                weights,
-            )
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
             attention = self._residual_attention_state.update(torch.sqrt(pointwise["pde"] + 1e-18))
             losses: dict[str, torch.Tensor] = {}
             for name, values in pointwise.items():
@@ -513,8 +485,6 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
-            self._record_effective_loss_diagnostics(losses, weights)
-            last_losses.update(construction_logs)
             last_losses["residual_attention_mean"] = float(attention.detach().mean().cpu())
             last_losses["residual_attention_max"] = float(attention.detach().max().cpu())
             last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
@@ -558,11 +528,7 @@ class VARATrainer(ExperimentTrainer):
                 break
             self.optimizer.zero_grad(set_to_none=True)
             self.compute_tracker.record_objective(batch)
-            self._apply_cavity_curriculum()
-            pointwise, construction_logs = self._build_pointwise_losses(
-                batch,
-                scalar_weights,
-            )
+            pointwise = compute_pointwise_losses(self.model, batch, self.benchmark, self.steady)
             total, losses, causal_logs = causal_temporal_objective(
                 pointwise,
                 batch["xy_f"][:, 2],
@@ -580,8 +546,6 @@ class VARATrainer(ExperimentTrainer):
             self.optimizer.step()
             self.compute_tracker.record_optimizer_step()
             last_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
-            self._record_effective_loss_diagnostics(losses, scalar_weights)
-            last_losses.update(construction_logs)
             last_losses.update(causal_logs)
             last_losses["continuation_anchor"] = float(anchor_loss.detach().cpu())
             last_losses["continuation_anchor_weight"] = float(anchor_weight)

@@ -145,8 +145,6 @@ class ExperimentTrainer:
         self.accept_logger = JSONListLogger(self.run_dir / "acceptance_log.json")
         self.action_records: list[dict[str, Any]] = []
         self.last_losses: dict[str, float] = {}
-        self.effective_loss_keys: list[str] = []
-        self.effective_loss_weights: dict[str, float] = {}
         self.last_boundary_sampling_summary: dict[str, float] = {}
         self.last_interior_sampling_summary: dict[str, float] = {}
         self._print_runtime_environment()
@@ -794,11 +792,22 @@ class ExperimentTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
         """Build the train objective used by Adam and guarded repair stages."""
         self.compute_tracker.record_objective(batch)
-        pointwise, construction_logs = self._build_pointwise_losses(
-            batch,
-            weights,
-            runtime_profile=runtime_profile,
-        )
+        if self.mode == "gradient_enhanced_pinn":
+            pointwise = gradient_enhanced_pointwise_losses(self.model, batch, self.benchmark, self.steady)
+        else:
+            residual_mode, residual_delta = self._residual_loss_settings()
+            loss_config = self._active_loss_config()
+            pointwise = compute_pointwise_losses(
+                self.model,
+                batch,
+                self.benchmark,
+                self.steady,
+                residual_loss_mode=residual_mode,
+                pseudo_huber_delta=residual_delta,
+                regularization_config=loss_config,
+                compute_boundary_loss=self._compute_boundary_training_loss(weights),
+                runtime_profile=runtime_profile,
+            )
         if "pressure_poisson" in active_aux_losses:
             pointwise["pressure_poisson"] = pressure_poisson_residual(
                 self.model, batch["xy_f"], self.benchmark.nu
@@ -810,7 +819,6 @@ class ExperimentTrainer:
         reduction = str(self.config.get("training", {}).get("pointwise_reduction", "legacy_mse"))
         losses = compute_global_losses(pointwise, reduction=reduction)
         losses, normalization_logs = self.normalize_training_losses(losses)
-        self._record_effective_loss_diagnostics(losses, weights)
         total = weighted_sum(losses, weights)
         local_loss, local_logs = compute_local_weighted_loss(
             pointwise,
@@ -840,61 +848,12 @@ class ExperimentTrainer:
             local_logs["continuation_replay_weight"] = float(replay_weight)
         if float(gauge_loss.detach().cpu()) > 0.0:
             local_logs["pressure_gauge"] = float(gauge_loss.detach().cpu())
-        local_logs.update(construction_logs)
+        if self.mode != "gradient_enhanced_pinn":
+            local_logs["residual_loss_mode"] = residual_mode
+            local_logs["pseudo_huber_delta"] = float(residual_delta)
         local_logs.update(self._model_auxiliary_logs())
         local_logs.update(normalization_logs)
         return total, losses, local_logs
-
-    def _build_pointwise_losses(
-        self,
-        batch: dict[str, Any],
-        weights: dict[str, float],
-        *,
-        runtime_profile: dict[str, float] | None = None,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, float | str]]:
-        """Construct the active pointwise dictionary before method weighting."""
-        residual_mode, residual_delta = self._residual_loss_settings()
-        loss_config = self._active_loss_config()
-        loss_kwargs = {
-            "residual_loss_mode": residual_mode,
-            "pseudo_huber_delta": residual_delta,
-            "regularization_config": loss_config,
-            "compute_boundary_loss": self._compute_boundary_training_loss(
-                weights
-            ),
-            "runtime_profile": runtime_profile,
-        }
-        if self.mode == "gradient_enhanced_pinn":
-            pointwise = gradient_enhanced_pointwise_losses(
-                self.model,
-                batch,
-                self.benchmark,
-                self.steady,
-                **loss_kwargs,
-            )
-            return pointwise, {}
-        pointwise = compute_pointwise_losses(
-            self.model,
-            batch,
-            self.benchmark,
-            self.steady,
-            **loss_kwargs,
-        )
-        return pointwise, {
-            "residual_loss_mode": residual_mode,
-            "pseudo_huber_delta": float(residual_delta),
-        }
-
-    def _record_effective_loss_diagnostics(
-        self,
-        losses: dict[str, torch.Tensor],
-        weights: dict[str, float],
-    ) -> None:
-        self.effective_loss_keys = sorted(str(name) for name in losses)
-        self.effective_loss_weights = {
-            name: float(weights.get(name, 0.0))
-            for name in self.effective_loss_keys
-        }
 
     def _active_loss_config(self) -> dict[str, Any]:
         cfg = deepcopy(dict(self.config.get("losses", {})))
@@ -1272,10 +1231,6 @@ class ExperimentTrainer:
         optimizer_snapshot = deepcopy(self.optimizer.state_dict())
         previous_optimizer = self.optimizer
         previous_stage = self.optimizer_stage
-        previous_effective_loss_keys = list(self.effective_loss_keys)
-        previous_effective_loss_weights = dict(
-            self.effective_loss_weights
-        )
 
         repair_batch = self._make_final_repair_batch(cfg)
         repair_weights = self._repair_weights(cfg)
@@ -1356,8 +1311,6 @@ class ExperimentTrainer:
             self.optimizer = previous_optimizer
             self.optimizer.load_state_dict(optimizer_snapshot)
             self.optimizer_stage = previous_stage
-        self.effective_loss_keys = previous_effective_loss_keys
-        self.effective_loss_weights = previous_effective_loss_weights
 
         self.final_repair_status = {
             "enabled": True,
@@ -1680,18 +1633,6 @@ class ExperimentTrainer:
         )
         metrics["cfd_supervision_is_oracle"] = bool(
             metrics["cfd_supervision_mode"] == "full_cfd_oracle"
-        )
-        metrics["effective_loss_keys"] = list(self.effective_loss_keys)
-        metrics["effective_loss_weights"] = dict(
-            self.effective_loss_weights
-        )
-        save_json(
-            {
-                "method_mode": self.mode,
-                "loss_keys": metrics["effective_loss_keys"],
-                "effective_weights": metrics["effective_loss_weights"],
-            },
-            self.run_dir / "effective_loss_diagnostics.json",
         )
         if self.cfd_supervision is None:
             metrics["cfd_sparse_sample_count"] = 0

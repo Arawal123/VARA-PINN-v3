@@ -137,11 +137,9 @@ def self_adaptive_objective(
     interior_logits: torch.Tensor,
     boundary_logits: torch.Tensor,
     maximum_attention: float = 20.0,
-    pointwise: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
     """Soft-attention PINN objective with adversarially trained point weights."""
-    if pointwise is None:
-        pointwise = compute_pointwise_losses(model, batch, benchmark, steady)
+    pointwise = compute_pointwise_losses(model, batch, benchmark, steady)
     interior_attention = positive_attention(interior_logits, maximum_attention)
     boundary_attention = positive_attention(boundary_logits, maximum_attention)
     reduced: dict[str, torch.Tensor] = {}
@@ -169,16 +167,9 @@ def gradient_enhanced_pointwise_losses(
     batch: dict[str, Any],
     benchmark: Any,
     steady: bool,
-    **loss_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     """Standard PINN losses plus spatial gradients of governing residuals."""
-    pointwise = compute_pointwise_losses(
-        model,
-        batch,
-        benchmark,
-        steady,
-        **loss_kwargs,
-    )
+    pointwise = compute_pointwise_losses(model, batch, benchmark, steady)
     residuals = navier_stokes_residuals(model, batch["xy_f"], benchmark.nu, steady=steady)
     coords = residuals["coords"]
     gradient_terms = []
