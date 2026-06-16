@@ -77,6 +77,7 @@ class V2ControllerConfig:
     gradient_prefilter_enabled: bool = True
     trust_region_enabled: bool = True
     action_memory_enabled: bool = True
+    variable_awareness_enabled: bool = True
     guard_metrics: tuple[str, ...] = ALLOWED_GUARD_METRICS
 
     @classmethod
@@ -111,6 +112,9 @@ class V2ControllerConfig:
             gradient_prefilter_enabled=bool(data.get("gradient_prefilter_enabled", True)),
             trust_region_enabled=bool(data.get("trust_region_enabled", True)),
             action_memory_enabled=bool(data.get("action_memory_enabled", True)),
+            variable_awareness_enabled=bool(
+                data.get("variable_awareness_enabled", True)
+            ),
             guard_metrics=tuple(data.get("guard_metrics", ALLOWED_GUARD_METRICS)),
         )
 

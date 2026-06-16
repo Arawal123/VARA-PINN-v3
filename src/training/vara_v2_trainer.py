@@ -98,12 +98,24 @@ class VARAV2Trainer(ExperimentTrainer):
     """
 
     def __init__(self, config: dict[str, Any], mode: str = "vara_v2") -> None:
-        if mode != "vara_v2":
-            raise ValueError(f"VARAV2Trainer only supports mode='vara_v2', got {mode!r}.")
-        super().__init__(config, mode)
-        cfg = dict(config.get("controller_v2", {}))
+        allowed_modes = {"vara_v2", "vara_v2_no_variable_awareness"}
+        if mode not in allowed_modes:
+            raise ValueError(
+                "VARAV2Trainer only supports mode='vara_v2' or "
+                f"'vara_v2_no_variable_awareness', got {mode!r}."
+            )
+        effective_config = deepcopy(config)
+        if mode == "vara_v2_no_variable_awareness":
+            effective_config.setdefault("controller_v2", {})[
+                "variable_awareness_enabled"
+            ] = False
+        super().__init__(effective_config, mode)
+        cfg = dict(self.config.get("controller_v2", {}))
+        self.variable_awareness_enabled = bool(
+            cfg.get("variable_awareness_enabled", True)
+        )
         self.sparse_cfd_polish_v2 = (
-            str(config.get("data_supervision", {}).get("mode", "pure_pinn"))
+            str(self.config.get("data_supervision", {}).get("mode", "pure_pinn"))
             == "sparse_cfd_polish"
         )
         if self.sparse_cfd_polish_v2:
@@ -764,6 +776,20 @@ class VARAV2Trainer(ExperimentTrainer):
                 "aggregate_pde_residual",
                 "boundary_violation",
             ]
+        if not self.variable_awareness_enabled:
+            maps = {
+                **maps,
+                "regional_severity": np.nanmean(
+                    np.vstack(
+                        [
+                            np.asarray(maps[name], dtype=float).reshape(1, -1)
+                            for name in names
+                        ]
+                    ),
+                    axis=0,
+                ),
+            }
+            names = ["regional_severity"]
         self.v2_controller.assert_reference_free(names)
         original = self.patch_scorer.diagnostics
         self.patch_scorer.diagnostics = names
@@ -1782,6 +1808,7 @@ class VARAV2Trainer(ExperimentTrainer):
             {
                 "block": block,
                 "trust_radius": self.v2_controller.trust_radius,
+                "variable_awareness_enabled": self.variable_awareness_enabled,
                 **self.v2_controller.state.to_record(),
             }
         )

@@ -14,6 +14,7 @@ from scripts.run_vara_v2_continuation import (
     _apply_re_aware_cavity_settings,
     _continuation_validity,
     _load_base_config,
+    _trainer_for,
     _validate_reliable_config,
     _without_cavity_stabilizers,
 )
@@ -872,6 +873,47 @@ def test_re100_cached_reference_path_remains_paddlescience():
         "data/references/lid_driven_cavity/full_field/"
         "re_0100_paddlescience.npz"
     )
+
+
+def test_vara_v2_no_variable_awareness_method_registration(tmp_path):
+    config = deep_update(
+        _small_cavity_trainer_config(tmp_path / "registration"),
+        {"experiments": {"root": str(tmp_path / "registration" / "run")}},
+    )
+    trainer = _trainer_for("vara_v2_no_variable_awareness", deepcopy(config))
+
+    assert isinstance(trainer, VARAV2Trainer)
+    assert trainer.mode == "vara_v2_no_variable_awareness"
+    assert trainer.variable_awareness_enabled is False
+    with pytest.raises(ValueError, match="Unknown continuation method"):
+        _trainer_for("not_a_method", deepcopy(config))
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "vanilla",
+        "vara_v2",
+        "rar",
+        "residual_attention",
+        "self_adaptive_attention",
+        "relobralo",
+        "gradient_balanced",
+        "gradient_enhanced",
+    ],
+)
+def test_existing_continuation_methods_remain_registered(tmp_path, method):
+    config = deep_update(
+        _small_cavity_trainer_config(tmp_path / method),
+        {"experiments": {"root": str(tmp_path / method / "run")}},
+    )
+    trainer = _trainer_for(method, deepcopy(config))
+
+    assert trainer is not None
+    if method == "vara_v2":
+        assert isinstance(trainer, VARAV2Trainer)
+        assert trainer.mode == "vara_v2"
+        assert trainer.variable_awareness_enabled is True
 
 
 def _force_non_neutral_v2_sampling(trainer):
@@ -1765,6 +1807,136 @@ def test_sparse_cfd_polish_mixed_pool_is_identical_for_vanilla_and_vara(tmp_path
         vanilla.cfd_supervision.coords, vara.cfd_supervision.coords
     )
     assert vanilla.cfd_supervision.pool_hash == vara.cfd_supervision.pool_hash
+
+
+def test_vara_no_variable_ablation_matches_vara_sparse_pool_and_budget(tmp_path):
+    path = tmp_path / "cfd.npz"
+    _write_toy_cfd(path)
+    base = _load_base_config("configs/vara_v2/lid_cavity_continuation_reliable.yaml")
+    base = deep_update(base, load_config("configs/vara_v2/presets/reliable.yaml"))
+    base = _apply_data_supervision_settings(
+        base,
+        mode="sparse_cfd_polish",
+        sample_fraction=0.02,
+        cfd_seed=11,
+    )
+    config = deep_update(
+        _apply_re_aware_cavity_settings(base, 100.0),
+        {
+            "device": "cpu",
+            "benchmark_params": {
+                "full_field_reference_path": str(path),
+                "profile_only": False,
+            },
+            "data_supervision": {"reference_path": str(path)},
+            "model": {"hidden_layers": [8, 8]},
+            "training": {
+                "n_collocation": 16,
+                "n_boundary": 8,
+                "n_data": 0,
+                "collocation_curriculum": {"enabled": False},
+            },
+            "validation": {"nx": 8, "ny": 8},
+            "test": {"nx": 8, "ny": 8},
+            "continuation_replay": {"enabled": False},
+        },
+    )
+    vara = _trainer_for(
+        "vara_v2",
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "vara"), "flat_layout": True}},
+        ),
+    )
+    no_variable = _trainer_for(
+        "vara_v2_no_variable_awareness",
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "no_variable"), "flat_layout": True}},
+        ),
+    )
+
+    assert vara.cfd_supervision is not None
+    assert no_variable.cfd_supervision is not None
+    assert torch.equal(vara.cfd_supervision.coords, no_variable.cfd_supervision.coords)
+    assert vara.cfd_supervision.pool_hash == no_variable.cfd_supervision.pool_hash
+    assert vara.cfd_supervision.sample_count == no_variable.cfd_supervision.sample_count
+    assert vara.cfd_supervision.sample_fraction == no_variable.cfd_supervision.sample_fraction
+
+    assert vara.config["controller_v2"]["total_steps"] == no_variable.config["controller_v2"]["total_steps"]
+    assert vara.config["training"]["n_collocation"] == no_variable.config["training"]["n_collocation"]
+    assert vara.config["training"]["n_boundary"] == no_variable.config["training"]["n_boundary"]
+    assert vara.config["validation"] == no_variable.config["validation"]
+    assert vara.config["optimizer"]["final_repair"] == no_variable.config["optimizer"]["final_repair"]
+    assert vara.config["controller_v2"]["warmup_steps"] == no_variable.config["controller_v2"]["warmup_steps"]
+    assert vara.config["controller_v2"]["block_steps"] == no_variable.config["controller_v2"]["block_steps"]
+
+
+def test_vara_no_variable_disables_only_variable_awareness(tmp_path):
+    path = tmp_path / "cfd.npz"
+    _write_toy_cfd(path)
+    config = deep_update(
+        _small_cavity_trainer_config(
+            tmp_path,
+            data_supervision_mode="sparse_cfd_polish",
+            n_collocation=12,
+        ),
+        {
+            "benchmark_params": {
+                "full_field_reference_path": str(path),
+                "profile_only": False,
+            },
+            "data_supervision": {"reference_path": str(path)},
+            "experiments": {"root": str(tmp_path / "base"), "flat_layout": True},
+        },
+    )
+    vara = _trainer_for(
+        "vara_v2",
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "vara"), "flat_layout": True}},
+        ),
+    )
+    no_variable = _trainer_for(
+        "vara_v2_no_variable_awareness",
+        deep_update(
+            config,
+            {"experiments": {"root": str(tmp_path / "no_var"), "flat_layout": True}},
+        ),
+    )
+
+    assert vara.variable_awareness_enabled is True
+    assert no_variable.variable_awareness_enabled is False
+    assert vara.v2_config.variable_awareness_enabled is True
+    assert no_variable.v2_config.variable_awareness_enabled is False
+    assert vara.sparse_cfd_polish_v2 and no_variable.sparse_cfd_polish_v2
+    assert vara.v2_config.max_candidates == no_variable.v2_config.max_candidates
+    assert vara.v2_config.trust_region_enabled == no_variable.v2_config.trust_region_enabled
+    assert vara.rollback_enabled == no_variable.rollback_enabled
+    assert vara.v2_config.counterfactual_probe_enabled == no_variable.v2_config.counterfactual_probe_enabled
+
+    _maps, raw, names, weak_regions, _coords = no_variable._diagnose_reference_free()
+    assert names == ["regional_severity"]
+    assert raw.shape[0] == 1
+    assert all(region.variable == "regional_severity" for region in weak_regions)
+
+
+def test_vara_no_variable_scope_guard():
+    assert "vara_v2_no_variable_awareness" not in inspect.getsource(
+        ExperimentTrainer.train_epochs
+    )
+    assert "variable_awareness_enabled" not in inspect.getsource(
+        ExperimentTrainer.train_epochs
+    )
+    assert "vara_v2_no_variable_awareness" not in inspect.getsource(
+        VARATrainer._run_rar
+    )
+    assert "variable_awareness_enabled" not in inspect.getsource(
+        VARATrainer._run_rar
+    )
+    assert "variable_awareness_enabled" not in inspect.getsource(
+        VARATrainer._build_active_pointwise_losses_for_baseline
+    )
 
 
 def test_pure_pinn_creates_no_cfd_supervision_tensors(tmp_path):

@@ -1337,11 +1337,14 @@ def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> d
 def _trainer_for(method: str, config: dict[str, Any]) -> Any:
     if method == "vara_v2":
         return VARAV2Trainer(config)
+    if method == "vara_v2_no_variable_awareness":
+        return VARAV2Trainer(config, mode="vara_v2_no_variable_awareness")
     if method == "vara_v1":
         return VARATrainer(config, mode="local_constrained_vara")
     if method not in BASELINE_METHODS:
         raise ValueError(
             f"Unknown continuation method {method!r}; choose vara_v1, vara_v2, "
+            "vara_v2_no_variable_awareness, "
             f"or one of {sorted(BASELINE_METHODS)}."
         )
     mode, overlay = BASELINE_METHODS[method]
