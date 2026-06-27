@@ -1,0 +1,164 @@
+benchmark: taylor_green
+seed: 0
+deterministic: true
+device: auto
+
+benchmark_params:
+  reynolds: 100.0
+  x_min: 0.0
+  x_max: 6.283185307179586
+  y_min: 0.0
+  y_max: 6.283185307179586
+  t_min: 0.0
+  t_max: 1.0
+  evaluation_time: 1.0
+  amplitude: 1.0
+
+pde:
+  steady: false
+
+# Taylor--Green is periodic and spectrally sparse.  Frequency 1 represents
+# sin(x), cos(x), sin(y), cos(y); frequency 2 represents the pressure mode.
+model:
+  architecture: residual_fourier_mlp
+  input_dim: 3
+  output_dim: 3
+  comparison_hidden_layers: [96, 96, 96, 96]
+  frequencies: [1.0, 2.0, 4.0]
+  residual_blocks: 4
+  activation: tanh
+  t_min: 0.0
+  t_max: 1.0
+
+optimizer:
+  name: adam
+  lr: 0.001
+  final_repair:
+    enabled: false
+
+training:
+  adaptive_cycles: 4
+  epochs_per_cycle: 100
+  log_every: 25
+  n_collocation: 4096
+  n_boundary: 1024
+  # The repaired model enforces the complete t=0 state analytically.  Keeping
+  # the legacy data count would spend compute on samples that the shared V2
+  # loss never consumes.
+  n_data: 0
+  pointwise_reduction: mean
+  weights:
+    pde: 0.0
+    momentum_u: 1.0
+    momentum_v: 1.0
+    continuity: 1.0
+    bc: 5.0
+    u: 0.0
+    v: 0.0
+    p: 0.0
+    omega: 0.0
+    pressure_gradient: 0.0
+
+validation:
+  nx: 48
+  ny: 48
+
+test:
+  nx: 64
+  ny: 64
+
+diagnostics:
+  mode: residual_only
+  variables:
+    - continuity_residual
+    - momentum_u_residual
+    - momentum_v_residual
+    - aggregate_pde_residual
+    - boundary_violation
+  aggregation: mean
+  normalization: percentile
+  aggregation_percentile: 90.0
+  ema_rho: 0.7
+
+patches:
+  nx_patches: 4
+  ny_patches: 4
+  nt_patches: 4
+
+weak_regions:
+  percentile_threshold: 75.0
+  top_k_per_variable: 1
+  min_active_patches: 1
+  max_active_patches: 6
+  persistence_cycles: 1
+
+sampling:
+  uniform:
+    engine: sobol
+  mixture:
+    uniform: 0.50
+    pde_residual: 0.25
+    pressure_vorticity: 0.10
+    velocity: 0.10
+    boundary: 0.05
+
+controller_v2:
+  total_steps: 10000
+  warmup_steps: 1000
+  control_blocks: 18
+  block_steps: 500
+  probe_steps: 50
+  gradient_probe_interior: 256
+  gradient_probe_boundary: 128
+  min_uniform_mass: 0.35
+  max_patch_mass: 0.25
+  multiplier_min: 0.5
+  multiplier_max: 2.0
+  max_candidates: 4
+  prefilter_damage_ratio: 0.25
+  trust_radius_initial: 0.10
+  trust_radius_min: 0.025
+  trust_radius_max: 0.20
+  trust_expand: 1.25
+  trust_shrink: 0.5
+  effectiveness_ema: 0.8
+  noise_floor: 0.0001
+  target_noise_ceiling: 0.25
+  guard_noise_ceiling: 0.10
+  reliable_reward_ratio: 0.75
+  counterfactual_probe_enabled: true
+  counterfactual_target_margin: 0.005
+  counterfactual_guard_margin: 0.02
+  gradient_prefilter_enabled: true
+  trust_region_enabled: true
+  action_memory_enabled: true
+  rollback_enabled: true
+  guard_metrics:
+    - pde_residual_mean
+    - continuity_residual_mean
+    - momentum_residual_mean
+    - boundary_condition_error
+    - unweighted_validation_loss
+    - initial_condition_mismatch
+
+# The shared point-pressure gauge is inappropriate here: p(pi, pi, 0)=-0.5,
+# not zero.  Taylor--Green reporting already mean-centers pressure.
+pressure_gauge:
+  weight: 0.0
+
+evaluation:
+  controller_reference_metrics_enabled: false
+  checkpoint_reference_metrics_enabled: false
+
+taylor_green:
+  initial_condition_metric_resolution: 32
+  temporal_metric_resolution: 48
+  evaluation_times: [0.0, 0.25, 0.5, 0.75, 1.0]
+  accuracy_thresholds:
+    velocity_rel_l2: 0.02
+    pressure_rel_l2: 0.05
+    omega_rel_l2: 0.05
+    pde_residual_mean: 0.01
+
+experiments:
+  root: experiments/vara_v2/taylor_green_repaired
