@@ -1,0 +1,11 @@
+benchmark_params:
+  reynolds: 100.0
+training:
+  n_collocation: 1024
+  n_boundary: 256
+controller_v2:
+  total_steps: 4000
+  warmup_steps: 500
+  control_blocks: 7
+  block_steps: 500
+  probe_steps: 25

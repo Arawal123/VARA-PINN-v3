@@ -1,0 +1,12 @@
+# Smoke-only matched comparison; all repaired evaluation settings are inherited.
+benchmark_params:
+  reynolds: 500.0
+training:
+  n_collocation: 1024
+  n_boundary: 256
+controller_v2:
+  total_steps: 1000
+  warmup_steps: 250
+  control_blocks: 3
+  block_steps: 250
+  probe_steps: 25
