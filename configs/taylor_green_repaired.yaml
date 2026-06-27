@@ -170,5 +170,11 @@ taylor_green:
     pde_residual_mean: 0.02
     continuity_residual_mean: 0.005
 
+# Neutral Vanilla uses the same phase boundaries as VARA V2, but leaves every
+# controller allocation at its initial uniform value.
+taylor_green_comparison:
+  warmup_steps: 1000
+  block_steps: 500
+
 experiments:
   root: experiments/vara_v2/taylor_green_repaired

@@ -9,6 +9,7 @@ from src.models.taylor_green_initial import TaylorGreenHardInitialCondition
 from src.physics.navier_stokes import navier_stokes_residuals
 from src.physics.taylor_green_repaired import RepairedTaylorGreenVortex
 from src.training.taylor_green_vara_v2_trainer import TaylorGreenVARAV2Trainer
+from src.training.taylor_green_vanilla_trainer import TaylorGreenVanillaTrainer
 from src.utils.config import deep_update, load_config
 
 
@@ -136,3 +137,73 @@ def test_repaired_trainer_uses_cheap_midtime_diagnostics_and_smokes(tmp_path) ->
         == "quarantined_optional_qualitative"
     )
     assert (trainer.run_dir / "taylor_green_temporal_metrics.csv").exists()
+
+
+def test_repaired_vanilla_matches_wiring_and_runs_exact_neutral_budget(
+    tmp_path,
+) -> None:
+    config = deep_update(
+        load_config("configs/taylor_green_repaired.yaml"),
+        {
+            "device": "cpu",
+            "training": {
+                "n_collocation": 16,
+                "n_boundary": 8,
+                "n_data": 0,
+                "epochs_per_cycle": 1,
+                "log_every": 1,
+            },
+            "validation": {"nx": 4, "ny": 4},
+            "test": {"nx": 8, "ny": 8},
+            "patches": {"nx_patches": 2, "ny_patches": 2, "nt_patches": 1},
+            "controller_v2": {
+                "total_steps": 4,
+                "warmup_steps": 1,
+                "control_blocks": 1,
+                "block_steps": 3,
+                "probe_steps": 1,
+                "gradient_probe_interior": 8,
+                "gradient_probe_boundary": 4,
+            },
+            "taylor_green_comparison": {"warmup_steps": 1, "block_steps": 3},
+            "taylor_green": {
+                "initial_condition_metric_resolution": 4,
+                "controller_diagnostic_resolution": 8,
+                "controller_diagnostic_times": [0.5],
+                "final_evaluation_resolution": 8,
+                "evaluation_times": [0.0, 1.0],
+            },
+            "experiments": {"root": str(tmp_path)},
+        },
+    )
+    vanilla = TaylorGreenVanillaTrainer(config)
+    vara = TaylorGreenVARAV2Trainer(config)
+    for vanilla_parameter, vara_parameter in zip(
+        vanilla.model.parameters(),
+        vara.model.parameters(),
+    ):
+        assert torch.equal(vanilla_parameter, vara_parameter)
+    vanilla_batch = vanilla.initial_batch()
+    vara_batch = vara.initial_batch()
+    for name in ("xy_f", "xy_bc"):
+        assert torch.equal(vanilla_batch[name], vara_batch[name])
+
+    metrics = vanilla.run()
+    assert metrics["method"] == "vanilla"
+    assert metrics["training_mode"] == "taylor_green_repaired_vanilla"
+    assert metrics["controller_enabled"] is False
+    assert metrics["optimizer_steps"] == 4
+    assert metrics["applied_optimizer_steps"] == 4
+    assert metrics["objective_evaluations"] == 4
+    assert metrics["probe_optimizer_steps"] == 0
+    assert metrics["rollback_optimizer_steps"] == 0
+    assert metrics["controller_gradient_evaluations"] == 0
+    assert metrics["accepted_interventions"] == 0
+    assert metrics["rejected_interventions"] == 0
+    assert metrics["taylor_green_neutral_sampling_only"] is True
+    assert metrics["taylor_green_initial_condition_mismatch"] == pytest.approx(
+        0.0,
+        abs=1e-14,
+    )
+    assert metrics["taylor_green_temporal_slices_evaluated"] == 2
+    assert (vanilla.run_dir / "taylor_green_temporal_metrics.csv").exists()

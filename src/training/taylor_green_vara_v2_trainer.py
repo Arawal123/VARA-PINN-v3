@@ -309,6 +309,14 @@ class TaylorGreenVARAV2Trainer(VARAV2Trainer):
     def run(self) -> dict[str, float]:
         run_started = time.perf_counter()
         metrics = super().run()
+        return self._finalize_taylor_green_metrics(metrics, run_started)
+
+    def _finalize_taylor_green_metrics(
+        self,
+        metrics: dict[str, Any],
+        run_started: float,
+    ) -> dict[str, Any]:
+        """Attach the common repaired temporal report to either training method."""
         final_phase_started = time.perf_counter()
         measured_evaluation_before = self.final_full_evaluation_seconds
         temporal, rows = self._temporal_accuracy_metrics()
