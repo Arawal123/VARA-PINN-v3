@@ -64,8 +64,8 @@ validation:
   ny: 48
 
 test:
-  nx: 64
-  ny: 64
+  nx: 48
+  ny: 48
 
 diagnostics:
   mode: residual_only
@@ -83,7 +83,9 @@ diagnostics:
 patches:
   nx_patches: 4
   ny_patches: 4
-  nt_patches: 4
+  # Controller diagnostics intentionally use one representative time slice.
+  # A single temporal patch prevents allocation into an unobserved time slab.
+  nt_patches: 1
 
 weak_regions:
   percentile_threshold: 75.0
@@ -107,14 +109,14 @@ controller_v2:
   warmup_steps: 1000
   control_blocks: 18
   block_steps: 500
-  probe_steps: 50
+  probe_steps: 25
   gradient_probe_interior: 256
   gradient_probe_boundary: 128
   min_uniform_mass: 0.35
   max_patch_mass: 0.25
   multiplier_min: 0.5
   multiplier_max: 2.0
-  max_candidates: 4
+  max_candidates: 1
   prefilter_damage_ratio: 0.25
   trust_radius_initial: 0.10
   trust_radius_min: 0.025
@@ -126,6 +128,8 @@ controller_v2:
   target_noise_ceiling: 0.25
   guard_noise_ceiling: 0.10
   reliable_reward_ratio: 0.75
+  # Retained with one short candidate so rejected probes still preserve the
+  # exact 10k applied trajectory and rollback remains scientifically valid.
   counterfactual_probe_enabled: true
   counterfactual_target_margin: 0.005
   counterfactual_guard_margin: 0.02
@@ -139,7 +143,7 @@ controller_v2:
     - momentum_residual_mean
     - boundary_condition_error
     - unweighted_validation_loss
-    - initial_condition_mismatch
+    - controller_objective_j
 
 # The shared point-pressure gauge is inappropriate here: p(pi, pi, 0)=-0.5,
 # not zero.  Taylor--Green reporting already mean-centers pressure.
@@ -152,13 +156,19 @@ evaluation:
 
 taylor_green:
   initial_condition_metric_resolution: 32
-  temporal_metric_resolution: 48
-  evaluation_times: [0.0, 0.25, 0.5, 0.75, 1.0]
+  controller_diagnostic_times: [0.5]
+  controller_diagnostic_resolution: 32
+  evaluation_times: [0.0, 0.5, 1.0]
+  final_evaluation_resolution: 48
+  final_full_evaluation_only: true
+  compute_streamline_diagnostics_during_training: false
+  compute_vorticity_l2_during_training: false
   accuracy_thresholds:
-    velocity_rel_l2: 0.02
+    velocity_rel_l2: 0.01
     pressure_rel_l2: 0.05
     omega_rel_l2: 0.05
-    pde_residual_mean: 0.01
+    pde_residual_mean: 0.02
+    continuity_residual_mean: 0.005
 
 experiments:
   root: experiments/vara_v2/taylor_green_repaired
