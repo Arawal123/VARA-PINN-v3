@@ -1,0 +1,24 @@
+training:
+  total_steps: 4000
+  n_collocation: 2048
+  n_boundary: 512
+  n_initial: 512
+  n_sparse_data: 256
+
+diagnostics:
+  n_interior: 1024
+  n_boundary: 256
+  n_initial: 256
+
+controller_v2:
+  total_steps: 4000
+  warmup_steps: 500
+  control_blocks: 7
+  block_steps: 500
+  probe_steps: 25
+
+evaluation:
+  nx: 48
+  ny: 48
+  nt: 11
+  residual_chunk_size: 2048

@@ -1,0 +1,96 @@
+benchmark: burgers2d
+benchmark_params:
+  bounds: [0.0, 1.0, 0.0, 1.0]
+  t_bounds: [0.0, 1.0]
+  nu: 0.01
+  amplitude: 0.75
+  sigma: 0.11
+  sparse_sample_fraction: 0.02
+  sparse_seed: 0
+
+model:
+  input_dim: 3
+  output_dim: 2
+  hidden_layers: [96, 96, 96, 96, 96]
+  activation: tanh
+
+training:
+  total_steps: 4000
+  n_collocation: 2048
+  n_boundary: 512
+  n_initial: 512
+  n_sparse_data: 256
+  lr: 0.001
+  gradient_clip: 10.0
+  weights:
+    pde: 1.0
+    bc: 10.0
+    ic: 10.0
+    sparse_data: 2.0
+
+patches:
+  nx_patches: 4
+  ny_patches: 4
+  nt_patches: 3
+
+diagnostics:
+  n_interior: 1024
+  n_boundary: 256
+  n_initial: 256
+  aggregation: percentile
+  aggregation_percentile: 90
+  weak_percentile: 80
+  top_k_per_variable: 2
+  max_active_patches: 8
+  persistence_cycles: 1
+
+controller_v2:
+  total_steps: 4000
+  warmup_steps: 500
+  control_blocks: 7
+  block_steps: 500
+  probe_steps: 25
+  min_uniform_mass: 0.35
+  max_patch_mass: 0.25
+  multiplier_min: 0.5
+  multiplier_max: 2.0
+  max_candidates: 4
+  prefilter_damage_ratio: 0.25
+  trust_radius_initial: 0.10
+  trust_radius_min: 0.025
+  trust_radius_max: 0.20
+  trust_expand: 1.25
+  trust_shrink: 0.5
+  effectiveness_ema: 0.8
+  noise_floor: 0.0001
+  target_noise_ceiling: 0.25
+  guard_noise_ceiling: 0.10
+  reliable_reward_ratio: 0.75
+  counterfactual_probe_enabled: true
+  counterfactual_target_margin: 0.005
+  counterfactual_guard_margin: 0.02
+  gradient_prefilter_enabled: true
+  trust_region_enabled: true
+  action_memory_enabled: true
+  rollback_enabled: true
+  variable_awareness_enabled: true
+  sampling_redistribution_enabled: true
+  local_loss_multipliers_enabled: true
+  guard_metrics:
+    - pde_residual_mean
+    - boundary_condition_error
+    - unweighted_validation_loss
+    - unweighted_physics_validation_loss
+
+evaluation:
+  nx: 48
+  ny: 48
+  nt: 11
+  residual_chunk_size: 2048
+  controller_reference_metrics_enabled: false
+
+plots:
+  enabled: true
+
+device: cpu
+dtype: float32

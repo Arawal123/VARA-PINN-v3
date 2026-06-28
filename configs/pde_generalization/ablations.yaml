@@ -1,0 +1,63 @@
+ablations:
+  no_variable_awareness:
+    controller_v2:
+      variable_awareness_enabled: false
+
+  sampling_only:
+    controller_v2:
+      sampling_redistribution_enabled: true
+      local_loss_multipliers_enabled: false
+
+  local_loss_only:
+    controller_v2:
+      sampling_redistribution_enabled: false
+      local_loss_multipliers_enabled: true
+
+  no_counterfactual_guard:
+    controller_v2:
+      counterfactual_probe_enabled: false
+      rollback_enabled: false
+
+  sparse_1pct:
+    benchmark_params:
+      sparse_sample_fraction: 0.01
+
+  sparse_2pct:
+    benchmark_params:
+      sparse_sample_fraction: 0.02
+
+  sparse_5pct:
+    benchmark_params:
+      sparse_sample_fraction: 0.05
+
+  burgers_nu_002:
+    benchmark_params:
+      nu: 0.02
+
+  burgers_nu_001:
+    benchmark_params:
+      nu: 0.01
+
+  allen_cahn_eps_006:
+    benchmark_params:
+      eps: 0.06
+
+  allen_cahn_eps_004:
+    benchmark_params:
+      eps: 0.04
+
+  allen_cahn_eps_003:
+    benchmark_params:
+      eps: 0.03
+
+  advdiff_kappa_002:
+    benchmark_params:
+      kappa: 0.02
+
+  advdiff_kappa_001:
+    benchmark_params:
+      kappa: 0.01
+
+  advdiff_kappa_0005:
+    benchmark_params:
+      kappa: 0.005
