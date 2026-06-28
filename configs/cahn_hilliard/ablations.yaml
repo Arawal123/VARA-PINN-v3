@@ -18,6 +18,10 @@ ablations:
       counterfactual_probe_enabled: false
       rollback_enabled: false
       gradient_prefilter_enabled: false
+      cahn_hilliard_pareto_policy:
+        enabled: false
+      cahn_hilliard_post_block_guard:
+        enabled: false
 
   legacy_priority_policy:
     controller_v2:

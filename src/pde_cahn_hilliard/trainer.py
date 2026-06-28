@@ -105,12 +105,21 @@ class CahnHilliardTrainer:
         ).detach()
         self.sparse_targets = self.benchmark.exact(self.sparse_coordinates).detach()
         self.sparse_hash = _tensor_hash(self.sparse_coordinates, self.sparse_targets)
+        configured_controller = dict(self.config.get("controller_v2", {}))
+        configured_mass_guard = dict(
+            configured_controller.get("cahn_hilliard_mass_guard", {})
+        )
+        mass_source = str(
+            configured_mass_guard.get("source", "initial_condition")
+        )
+        if mass_source == "initial_condition":
+            mass_target_values = self.initial_targets[:, 0]
+        elif mass_source == "sparse_supervision" and self.sparse_targets.numel():
+            mass_target_values = self.sparse_targets[:, 0]
+        else:
+            mass_target_values = self.initial_targets[:, 0]
         self.mass_proxy_baseline = float(
-            (
-                self.sparse_targets[:, 0].mean()
-                if self.sparse_targets.numel()
-                else self.initial_targets[:, 0].mean()
-            ).cpu()
+            mass_target_values.mean().cpu()
         )
 
         diagnostics_cfg = dict(self.config.get("diagnostics", {}))
@@ -173,6 +182,21 @@ class CahnHilliardTrainer:
         self.u_guard_config = dict(
             controller_cfg.get("cahn_hilliard_guards", {})
         )
+        self.pareto_policy_config = dict(
+            controller_cfg.get("cahn_hilliard_pareto_policy", {})
+        )
+        self.pareto_score_config = dict(
+            controller_cfg.get("cahn_hilliard_pareto_score", {})
+        )
+        self.mass_guard_config = dict(
+            controller_cfg.get("cahn_hilliard_mass_guard", {})
+        )
+        self.phase_guard_config = dict(
+            controller_cfg.get("cahn_hilliard_phase_guard", {})
+        )
+        self.post_block_guard_config = dict(
+            controller_cfg.get("cahn_hilliard_post_block_guard", {})
+        )
         if method != "vanilla":
             controller_cfg["variable_awareness_enabled"] = self.variable_awareness
             controller_cfg.setdefault(
@@ -210,6 +234,16 @@ class CahnHilliardTrainer:
         self.rejected_due_to_phase_range_guard = 0
         self.rejected_due_to_mass_guard = 0
         self.rejected_due_to_interface_proxy_guard = 0
+        self.accepted_pareto_safe_interventions = 0
+        self.rejected_hard_guard_pde = 0
+        self.rejected_hard_guard_ch = 0
+        self.rejected_hard_guard_mass = 0
+        self.rejected_hard_guard_phase = 0
+        self.rejected_hard_guard_sparse_u = 0
+        self.rejected_mu_only = 0
+        self.post_block_rollbacks = 0
+        self.accepted_interface_targets = 0
+        self.accepted_sparse_u_targets = 0
         self.optimization_wall_clock_sec = 0.0
         self.wall_clock_eval_sec = 0.0
         save_config(self.config, self.run_dir / "resolved_config.yaml")
@@ -251,6 +285,19 @@ class CahnHilliardTrainer:
                 "rejected_due_to_phase_range_guard": self.rejected_due_to_phase_range_guard,
                 "rejected_due_to_mass_guard": self.rejected_due_to_mass_guard,
                 "rejected_due_to_interface_proxy_guard": self.rejected_due_to_interface_proxy_guard,
+                "accepted_pareto_safe_interventions": self.accepted_pareto_safe_interventions,
+                "rejected_hard_guard_pde": self.rejected_hard_guard_pde,
+                "rejected_hard_guard_ch": self.rejected_hard_guard_ch,
+                "rejected_hard_guard_mass": self.rejected_hard_guard_mass,
+                "rejected_hard_guard_phase": self.rejected_hard_guard_phase,
+                "rejected_hard_guard_sparse_u": self.rejected_hard_guard_sparse_u,
+                "rejected_mu_only": self.rejected_mu_only,
+                "post_block_rollbacks": self.post_block_rollbacks,
+                "accepted_interface_targets": self.accepted_interface_targets,
+                "accepted_sparse_u_targets": self.accepted_sparse_u_targets,
+                "cahn_hilliard_pareto_policy_enabled": bool(
+                    self.pareto_policy_config.get("enabled", False)
+                ),
                 "cahn_hilliard_u_first_policy_enabled": self.u_first_policy_enabled,
                 "cahn_hilliard_mu_support_only": self.mu_support_only,
                 "final_trust_radius": (
@@ -348,7 +395,9 @@ class CahnHilliardTrainer:
                 continue
             candidate = active[0]
             if self.controller.config.counterfactual_probe_enabled:
-                self._counterfactual_block(block, candidate, schedule)
+                self._counterfactual_block(
+                    block, candidate, before_metrics, schedule
+                )
             else:
                 self._unguarded_block(
                     block, candidate, before, before_metrics, schedule
@@ -359,6 +408,7 @@ class CahnHilliardTrainer:
         self,
         block: int,
         candidate: V2Candidate,
+        pre_block_metrics: dict[str, float],
         schedule: dict[str, int],
     ) -> None:
         assert self.controller is not None
@@ -366,6 +416,8 @@ class CahnHilliardTrainer:
         optimizer_before = deepcopy(self.optimizer.state_dict())
         allocation_before = self.controller.state.snapshot()
         rng_before = deepcopy(self.sampling_rng.bit_generator.state)
+        trust_before = float(self.controller.trust_radius)
+        effectiveness_before = deepcopy(self.controller.effectiveness)
         probe_steps = schedule["probe_steps"]
 
         neutral_batch = self._training_batch(adaptive=True)
@@ -406,8 +458,6 @@ class CahnHilliardTrainer:
             comparison_mode="counterfactual",
         )
         if accepted:
-            self.accepted_interventions += 1
-            self._count_accepted_channel(candidate)
             kept_batch, kept_rows = candidate_batch, candidate_rows
         else:
             self.rejected_interventions += 1
@@ -421,7 +471,7 @@ class CahnHilliardTrainer:
             else:
                 kept_batch, kept_rows = candidate_batch, candidate_rows
         self._commit_rows(kept_rows)
-        self._record_decision(block, candidate, decision)
+        continuation_start = self.applied_optimizer_steps + 1
         self._commit_rows(
             self._train_steps(
                 kept_batch,
@@ -429,6 +479,42 @@ class CahnHilliardTrainer:
                 phase=f"block_{block}_continuation",
             )
         )
+        if accepted and bool(
+            self.post_block_guard_config.get("enabled", False)
+        ):
+            post_metrics = self._controller_metrics(self._diagnose())
+            post_ok, post_reason, post_changes = self._post_block_guard_decision(
+                pre_block_metrics, post_metrics
+            )
+            decision["post_block_guard_changes"] = post_changes
+            decision["post_block_rollback"] = not post_ok
+            if not post_ok:
+                self._restore_model(model_before)
+                self.optimizer.load_state_dict(optimizer_before)
+                self.controller.state.restore(allocation_before)
+                self.sampling_rng.bit_generator.state = deepcopy(rng_before)
+                self.controller.trust_radius = max(
+                    self.controller.config.trust_radius_min,
+                    trust_before * self.controller.config.trust_shrink,
+                )
+                self.controller.effectiveness = effectiveness_before
+                self.post_block_rollbacks += 1
+                self.rollback_count += 1
+                self.rejected_interventions += 1
+                decision["probe_accepted"] = True
+                decision["accepted"] = False
+                decision["rollback_reason"] = post_reason
+                decision["rejection_reason"] = post_reason
+                for row in self.loss_rows:
+                    if int(row.get("step", 0)) >= continuation_start:
+                        row["post_block_rolled_back"] = True
+                if self.controller.decisions:
+                    self.controller.decisions[-1].update(decision)
+                accepted = False
+        if accepted:
+            self.accepted_interventions += 1
+            self._count_accepted_channel(candidate)
+        self._record_decision(block, candidate, decision)
 
     def _unguarded_block(
         self,
@@ -741,36 +827,62 @@ class CahnHilliardTrainer:
         comparison_mode: str,
     ) -> tuple[bool, dict[str, Any]]:
         assert self.controller is not None
+        base_guard_names = set(self.controller.config.guard_metrics)
+        base_before_metrics = {
+            name: value
+            for name, value in before_metrics.items()
+            if name in base_guard_names
+        }
+        base_after_metrics = {
+            name: value
+            for name, value in after_metrics.items()
+            if name in base_guard_names
+        }
         base_accepted, decision = self.controller.evaluate(
             candidate,
             before_target,
             after_target,
-            before_metrics,
-            after_metrics,
+            base_before_metrics,
+            base_after_metrics,
             target_threshold=target_threshold,
             guard_threshold=guard_threshold,
             comparison_mode=comparison_mode,
             update_state=False,
         )
-        u_guard_ok, guard_reason, u_changes = self._u_guard_decision(
-            before_metrics, after_metrics
-        )
-        allow_mu_override = bool(
-            self.u_guard_config.get(
-                "allow_mu_improvement_to_override_u_damage", False
+        pareto_enabled = bool(self.pareto_policy_config.get("enabled", False))
+        if pareto_enabled:
+            accepted, guard_reason, pareto_details = self._pareto_decision(
+                candidate, before_metrics, after_metrics
             )
-        )
-        if (
-            not u_guard_ok
-            and allow_mu_override
-            and self._is_mu_only_candidate(candidate)
-        ):
-            u_guard_ok = True
-            guard_reason = ""
-        accepted = bool(base_accepted and u_guard_ok)
+            decision.update(pareto_details)
+            if accepted:
+                pareto_score = float(pareto_details.get("pareto_score", 0.0))
+                predicted = max(
+                    float(candidate.predicted_target_improvement),
+                    self.controller.config.noise_floor,
+                )
+                decision["observed_target_improvement"] = pareto_score
+                decision["reward_ratio"] = pareto_score / predicted
+        else:
+            u_guard_ok, guard_reason, u_changes = self._u_guard_decision(
+                before_metrics, after_metrics
+            )
+            allow_mu_override = bool(
+                self.u_guard_config.get(
+                    "allow_mu_improvement_to_override_u_damage", False
+                )
+            )
+            if (
+                not u_guard_ok
+                and allow_mu_override
+                and self._is_mu_only_candidate(candidate)
+            ):
+                u_guard_ok = True
+                guard_reason = ""
+            accepted = bool(base_accepted and u_guard_ok)
+            decision["u_guard_changes"] = u_changes
+            decision["guard_metric_changes"] = u_changes
         decision["accepted"] = accepted
-        decision["u_guard_changes"] = u_changes
-        decision["guard_metric_changes"] = u_changes
         decision["target_metric"] = self._candidate_target_name(candidate.variable)
         decision["selected_primary_channel"] = candidate.variable
         decision["selected_patch_id"] = candidate.patch_id
@@ -792,14 +904,181 @@ class CahnHilliardTrainer:
         ]
         decision["ch_residual_change"] = decision["ch_residual_mean_change"]
         decision["mu_residual_change"] = decision["mu_residual_mean_change"]
-        if base_accepted and not u_guard_ok:
+        log_metrics = {
+            "sparse_u": "sparse_u_mse",
+            "pde": "pde_residual_mean",
+            "ch": "ch_residual_mean",
+            "mass_proxy": "mass_proxy_error",
+            "phase_overshoot": "phase_overshoot",
+            "mu_residual": "mu_residual_mean",
+        }
+        for label, metric in log_metrics.items():
+            decision[f"{label}_before"] = before_metrics.get(metric, float("nan"))
+            decision[f"{label}_after"] = after_metrics.get(metric, float("nan"))
+        if not accepted and guard_reason:
             decision["rollback_reason"] = guard_reason
-            decision["u_guard_rejection"] = guard_reason
-            self._count_guard_rejection(guard_reason)
+            decision["rejection_reason"] = guard_reason
+            if pareto_enabled:
+                self._count_pareto_rejection(guard_reason)
+            elif base_accepted:
+                decision["u_guard_rejection"] = guard_reason
+                self._count_guard_rejection(guard_reason)
         committed = self.controller.commit_evaluation(
             candidate, accepted, decision
         )
         return accepted, committed
+
+    def _pareto_decision(
+        self,
+        candidate: V2Candidate,
+        before_metrics: dict[str, float],
+        after_metrics: dict[str, float],
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Score primary improvements subject to hard physics/conservation guards."""
+        primary_targets = list(
+            self.pareto_policy_config.get(
+                "primary_targets",
+                [
+                    "sparse_u_mse",
+                    "interface_proxy_error",
+                    "ic_u_error",
+                    "bc_u_error",
+                    "ch_residual_mean",
+                ],
+            )
+        )
+        score_weights = dict(self.pareto_score_config.get("weights", {}))
+        primary_changes = {
+            metric: _improvement_ratio(
+                before_metrics.get(metric), after_metrics.get(metric)
+            )
+            for metric in primary_targets
+        }
+        primary_reward = float(
+            sum(
+                float(score_weights.get(metric, 1.0))
+                * max(0.0, change)
+                for metric, change in primary_changes.items()
+                if np.isfinite(change)
+            )
+        )
+        hard_guards = dict(self.pareto_policy_config.get("hard_guards", {}))
+        guard_changes: dict[str, float] = {}
+        hard_violation = ""
+        reason_names = {
+            "pde_residual_mean": "hard_guard_pde",
+            "ch_residual_mean": "hard_guard_ch",
+            "mass_proxy_error": "hard_guard_mass",
+            "phase_overshoot": "hard_guard_phase",
+            "sparse_u_mse": "hard_guard_sparse_u",
+            "ic_u_error": "hard_guard_ic_u",
+            "bc_u_error": "hard_guard_bc_u",
+        }
+        for metric, configured_threshold in hard_guards.items():
+            change = _relative_change(
+                before_metrics.get(metric), after_metrics.get(metric)
+            )
+            guard_changes[metric] = change
+            threshold = float(configured_threshold)
+            if metric == "mass_proxy_error" and bool(
+                self.mass_guard_config.get("enabled", True)
+            ):
+                threshold = min(
+                    threshold,
+                    float(
+                        self.mass_guard_config.get(
+                            "max_relative_worsening", threshold
+                        )
+                    ),
+                )
+            if metric == "phase_overshoot" and bool(
+                self.phase_guard_config.get("enabled", True)
+            ):
+                threshold = min(
+                    threshold,
+                    float(
+                        self.phase_guard_config.get(
+                            "max_relative_worsening", threshold
+                        )
+                    ),
+                )
+                absolute_ceiling = float(
+                    self.phase_guard_config.get("absolute_ceiling", float("inf"))
+                )
+                if float(after_metrics.get(metric, 0.0)) > absolute_ceiling:
+                    hard_violation = reason_names.get(metric, f"hard_guard_{metric}")
+            if (
+                not hard_violation
+                and np.isfinite(change)
+                and change > threshold
+            ):
+                hard_violation = reason_names.get(metric, f"hard_guard_{metric}")
+
+        guard_weight_names = {
+            "pde_residual_mean": "pde_residual_mean_guard",
+            "mass_proxy_error": "mass_proxy_guard",
+            "phase_overshoot": "phase_overshoot_guard",
+        }
+        guard_penalty = float(
+            sum(
+                float(
+                    score_weights.get(
+                        guard_weight_names.get(metric, f"{metric}_guard"), 1.0
+                    )
+                )
+                * max(0.0, change)
+                for metric, change in guard_changes.items()
+                if np.isfinite(change)
+            )
+        )
+        pareto_score = primary_reward - guard_penalty
+        soft_changes = {
+            metric: _relative_change(
+                before_metrics.get(metric), after_metrics.get(metric)
+            )
+            for metric in dict(
+                self.pareto_policy_config.get("soft_guards", {})
+            )
+        }
+        minimum_reward = float(
+            self.pareto_score_config.get("min_primary_reward", 0.005)
+        )
+        acceptance_margin = float(
+            self.pareto_score_config.get("acceptance_margin", 0.0)
+        )
+        require_primary = bool(
+            self.pareto_policy_config.get("require_primary_improvement", True)
+        )
+        mu_improvement = _improvement_ratio(
+            before_metrics.get("mu_residual_mean"),
+            after_metrics.get("mu_residual_mean"),
+        )
+        reason = hard_violation
+        if not reason and require_primary and primary_reward <= minimum_reward:
+            if (
+                bool(
+                    self.pareto_policy_config.get(
+                        "reject_if_mu_only_improves", True
+                    )
+                )
+                and np.isfinite(mu_improvement)
+                and mu_improvement > 0.0
+            ):
+                reason = "mu_only"
+            else:
+                reason = "insufficient_primary_reward"
+        if not reason and pareto_score <= acceptance_margin:
+            reason = "pareto_margin"
+        details: dict[str, Any] = {
+            "primary_reward": primary_reward,
+            "guard_penalty": guard_penalty,
+            "pareto_score": pareto_score,
+            "primary_metric_changes": primary_changes,
+            "hard_guard_changes": guard_changes,
+            "soft_guard_changes": soft_changes,
+            "pareto_policy_enabled": True,
+        }
+        return not bool(reason), reason, details
 
     def _u_guard_decision(
         self,
@@ -864,11 +1143,87 @@ class CahnHilliardTrainer:
                 return False, reason, changes
         return True, "", changes
 
+    def _post_block_guard_decision(
+        self,
+        before_metrics: dict[str, float],
+        after_metrics: dict[str, float],
+    ) -> tuple[bool, str, dict[str, float]]:
+        """Detect delayed drift after a probe-safe intervention."""
+        checks = [
+            (
+                "pde_residual_mean",
+                "pde_residual_max_worsening",
+                0.05,
+                "post_block_guard_pde",
+            ),
+            (
+                "ch_residual_mean",
+                "ch_residual_max_worsening",
+                0.05,
+                "post_block_guard_ch",
+            ),
+            (
+                "mass_proxy_error",
+                "mass_proxy_max_worsening",
+                0.075,
+                "post_block_guard_mass",
+            ),
+            (
+                "phase_overshoot",
+                "phase_overshoot_max_worsening",
+                0.05,
+                "post_block_guard_phase",
+            ),
+            (
+                "sparse_u_mse",
+                "sparse_u_max_worsening",
+                0.05,
+                "post_block_guard_sparse_u",
+            ),
+        ]
+        changes: dict[str, float] = {}
+        for metric, config_name, default, reason in checks:
+            change = _relative_change(
+                before_metrics.get(metric), after_metrics.get(metric)
+            )
+            changes[metric] = change
+            threshold = float(
+                self.post_block_guard_config.get(config_name, default)
+            )
+            if np.isfinite(change) and change > threshold:
+                return False, reason, changes
+        return True, "", changes
+
     def _count_accepted_channel(self, candidate: V2Candidate) -> None:
+        if bool(self.pareto_policy_config.get("enabled", False)):
+            self.accepted_pareto_safe_interventions += 1
+            if candidate.variable in {
+                "predicted_interface_proxy",
+                "predicted_interface_mask",
+                "predicted_gradient_norm",
+                "ch_residual",
+            }:
+                self.accepted_interface_targets += 1
+            if candidate.variable == "sparse_u_mismatch":
+                self.accepted_sparse_u_targets += 1
         if self._is_mu_only_candidate(candidate):
             self.accepted_mu_interventions += 1
         else:
             self.accepted_u_interface_interventions += 1
+
+    def _count_pareto_rejection(self, reason: str) -> None:
+        attribute = {
+            "hard_guard_pde": "rejected_hard_guard_pde",
+            "hard_guard_ch": "rejected_hard_guard_ch",
+            "hard_guard_mass": "rejected_hard_guard_mass",
+            "hard_guard_phase": "rejected_hard_guard_phase",
+            "hard_guard_sparse_u": "rejected_hard_guard_sparse_u",
+            "hard_guard_ic_u": "rejected_due_to_ic_u_guard",
+            "hard_guard_bc_u": "rejected_due_to_bc_u_guard",
+            "mu_only": "rejected_mu_only",
+        }.get(reason)
+        if attribute:
+            setattr(self, attribute, int(getattr(self, attribute)) + 1)
 
     def _count_guard_rejection(self, reason: str) -> None:
         attribute = {
@@ -905,6 +1260,8 @@ class CahnHilliardTrainer:
     ) -> None:
         row: dict[str, Any] = {
             "block": block,
+            "candidate_id": candidate.key(),
+            "channel": candidate.variable,
             "policy": "u_first" if self.u_first_policy_enabled else "legacy_priority",
             "selected_primary_channel": candidate.variable,
             "selected_patch_id": candidate.patch_id,
@@ -917,6 +1274,7 @@ class CahnHilliardTrainer:
                 row.update({f"{key}_{nested}": item for nested, item in value.items()})
             else:
                 row[key] = value
+        row.setdefault("rejection_reason", row.get("rollback_reason", ""))
         self.decision_rows.append(row)
 
     def _log_allocation(self, block: int) -> None:
@@ -955,6 +1313,7 @@ class CahnHilliardTrainer:
             "initial_target": self.initial_targets,
             "sparse": self.sparse_coordinates,
             "sparse_target": self.sparse_targets,
+            "mass_target": self.mass_proxy_baseline,
         }
 
     def _sample_adaptive(self, count: int) -> torch.Tensor:
@@ -1046,6 +1405,7 @@ class CahnHilliardTrainer:
             "initial_target": self.benchmark.initial_values(initial).detach(),
             "sparse": self.sparse_coordinates,
             "sparse_target": self.sparse_targets,
+            "mass_target": self.mass_proxy_baseline,
         }
 
     def _model_snapshot(self) -> dict[str, torch.Tensor]:
@@ -1212,6 +1572,11 @@ def _relative_change(
     denominator = max(abs(float(before)), 1e-10)
     change = (float(after) - float(before)) / denominator
     return abs(change) if absolute else change
+
+
+def _improvement_ratio(before: float | None, after: float | None) -> float:
+    change = _relative_change(before, after)
+    return -change if np.isfinite(change) else float("nan")
 
 
 def _cap_mean_one_multiplier(values: np.ndarray, maximum: float) -> np.ndarray:

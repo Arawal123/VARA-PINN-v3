@@ -92,8 +92,9 @@ def compute_training_loss(
         sparse_mu = ch_loss.new_zeros(())
 
     phase_range_weight = float(weights.get("phase_range_penalty", 0.0))
+    mass_weight = float(weights.get("mass_penalty", 0.0))
     proxy_weight = float(weights.get("interface_proxy_regularization", 0.0))
-    if phase_range_weight or proxy_weight:
+    if phase_range_weight or mass_weight or proxy_weight:
         u_pred = model(interior)[:, 0]
         phase_range_values = (
             torch.relu(u_pred - 1.0).square()
@@ -106,10 +107,17 @@ def compute_training_loss(
             patch_grid,
             allocation_state,
         )
+        mass_target = torch.as_tensor(
+            batch.get("mass_target", 0.0),
+            device=u_pred.device,
+            dtype=u_pred.dtype,
+        )
+        mass_penalty = (u_pred.mean() - mass_target).square()
         proxy_regularization = phase_range_values.mean()
     else:
         phase_range_values = interior.new_zeros(interior.shape[0])
         phase_range_penalty = ch_loss.new_zeros(())
+        mass_penalty = ch_loss.new_zeros(())
         proxy_regularization = ch_loss.new_zeros(())
 
     components = {
@@ -122,6 +130,7 @@ def compute_training_loss(
         "sparse_u_mse": sparse_u,
         "sparse_mu_mse": sparse_mu,
         "phase_range_penalty": phase_range_penalty,
+        "mass_penalty": mass_penalty,
         "interface_proxy_regularization": proxy_regularization,
     }
     total = sum(

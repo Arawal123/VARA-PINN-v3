@@ -163,6 +163,16 @@ def metric_groups() -> dict[str, list[str]]:
             "rejected_due_to_ic_u_guard",
             "rejected_due_to_bc_u_guard",
             "rejected_due_to_phase_range_guard",
+            "accepted_pareto_safe_interventions",
+            "rejected_hard_guard_pde",
+            "rejected_hard_guard_ch",
+            "rejected_hard_guard_mass",
+            "rejected_hard_guard_phase",
+            "rejected_hard_guard_sparse_u",
+            "rejected_mu_only",
+            "post_block_rollbacks",
+            "accepted_interface_targets",
+            "accepted_sparse_u_targets",
         ],
     }
 

@@ -208,9 +208,19 @@ def compute_reference_free_pointwise_diagnostics(
         torch.relu(u.detach().squeeze(1) - 1.0).square()
         + torch.relu(-1.0 - u.detach().squeeze(1)).square()
     )
+    phase_overshoot_above = torch.relu(
+        u.detach().squeeze(1) - 1.0
+    ).square()
+    phase_overshoot_below = torch.relu(
+        -1.0 - u.detach().squeeze(1)
+    ).square()
     mass_value = float(u.detach().mean().cpu())
-    mass_violation_value = (mass_value - float(mass_baseline)) ** 2
+    mass_error_value = abs(mass_value - float(mass_baseline))
+    mass_violation_value = mass_error_value**2
     mass_violation = torch.full_like(predicted_proxy, mass_violation_value)
+    interface_proxy_error = (
+        residuals["r_ch"].detach().abs().squeeze(1) * predicted_proxy
+    ).sum() / predicted_proxy.sum().clamp_min(1e-12)
 
     channels: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     if variable_awareness:
@@ -294,13 +304,24 @@ def compute_reference_free_pointwise_diagnostics(
         "mu_residual_mean": float(residuals["r_mu"].detach().abs().mean().cpu()),
         "pde_residual_mean": float(residuals["pde_residual"].detach().mean().cpu()),
         "bc_u_violation": float(boundary_error[:, 0].square().mean().cpu()),
+        "bc_u_error": float(boundary_error[:, 0].square().mean().cpu()),
         "bc_mu_violation": float(boundary_error[:, 1].square().mean().cpu()),
         "ic_u_violation": float(initial_error[:, 0].square().mean().cpu()),
+        "ic_u_error": float(initial_error[:, 0].square().mean().cpu()),
         "ic_mu_violation": float(initial_error[:, 1].square().mean().cpu()),
         "phase_range_violation": float(phase_range.mean().cpu()),
+        "phase_overshoot_above_one": float(
+            phase_overshoot_above.mean().cpu()
+        ),
+        "phase_overshoot_below_minus_one": float(
+            phase_overshoot_below.mean().cpu()
+        ),
+        "phase_overshoot": float(phase_range.mean().cpu()),
         "mass_proxy_value": mass_value,
         "mass_proxy_violation": float(mass_violation_value),
+        "mass_proxy_error": float(mass_error_value),
         "interface_proxy_mean": float(predicted_proxy.mean().cpu()),
+        "interface_proxy_error": float(interface_proxy_error.cpu()),
     }
     if mismatch is not None:
         scalar_metrics["sparse_u_mse"] = float(mismatch[:, 0].square().mean().cpu())
