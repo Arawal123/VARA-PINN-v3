@@ -100,7 +100,9 @@ def aggregate_summary(raw: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     grouped = raw.groupby("method")[numeric].agg(["mean", "std", "median", "count"])
     grouped.columns = [f"{metric}_{stat}" for metric, stat in grouped.columns]
-    return grouped.reset_index()
+    index_frame = grouped.index.to_frame(index=False)
+    value_frame = grouped.reset_index(drop=True).copy()
+    return pd.concat([index_frame, value_frame], axis=1)
 
 
 def winrate_summary(raw: pd.DataFrame) -> pd.DataFrame:

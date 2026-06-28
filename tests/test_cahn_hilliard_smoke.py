@@ -21,6 +21,8 @@ def test_cahn_hilliard_four_step_run_writes_artifacts(tmp_path, method: str) -> 
     assert (run_dir / "metrics.csv").is_file()
     assert (run_dir / "losses.csv").is_file()
     assert (run_dir / "checkpoints" / "final.pt").is_file()
+    assert (run_dir / "figures" / "reference_prediction_error.png").is_file()
+    assert (run_dir / "figures" / "interface_band_error.pdf").is_file()
     assert len(pd.read_csv(run_dir / "losses.csv")) == 4
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["controller_reference_metrics_enabled"] is False
@@ -96,5 +98,5 @@ def tiny_cahn_hilliard_config() -> dict:
             "chunk_size": 32,
             "controller_reference_metrics_enabled": False,
         },
-        "plots": {"enabled": False},
+        "plots": {"enabled": True},
     }

@@ -157,6 +157,12 @@ def metric_groups() -> dict[str, list[str]]:
             "accepted_interventions",
             "rejected_interventions",
             "rollback_count",
+            "accepted_u_interface_interventions",
+            "accepted_mu_interventions",
+            "rejected_due_to_sparse_u_guard",
+            "rejected_due_to_ic_u_guard",
+            "rejected_due_to_bc_u_guard",
+            "rejected_due_to_phase_range_guard",
         ],
     }
 

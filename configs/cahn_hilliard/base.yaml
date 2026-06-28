@@ -24,14 +24,20 @@ training:
   gradient_clip: 10.0
   weights:
     ch_residual: 1.0
-    chemical_potential_residual: 1.0
-    bc_u: 5.0
-    bc_mu: 1.0
-    ic_u: 5.0
-    ic_mu: 1.0
-    sparse_u_mse: 10.0
+    chemical_potential_residual: 0.5
+    bc_u: 8.0
+    bc_mu: 0.5
+    ic_u: 8.0
+    ic_mu: 0.5
+    sparse_u_mse: 20.0
     sparse_mu_mse: 0.0
+    phase_range_penalty: 1.0
     interface_proxy_regularization: 0.0
+
+losses:
+  mu_support_only: true
+  mu_priority_max: 0.5
+  mu_local_multiplier_max: 1.25
 
 patches:
   nx_patches: 5
@@ -49,7 +55,23 @@ diagnostics:
   max_active_patches: 8
   persistence_cycles: 1
   interface_tau: 0.25
-  interface_focus_strength: 1.0
+  interface_threshold: 0.8
+  interface_beta: 2.5
+  priority_weights:
+    sparse_u_mismatch: 3.0
+    predicted_interface_proxy: 2.5
+    predicted_interface_mask: 2.5
+    predicted_gradient_norm: 2.0
+    ic_u_violation: 2.0
+    bc_u_violation: 2.0
+    phase_range_violation: 2.0
+    mass_proxy_violation: 1.5
+    ch_residual: 1.5
+    pde_residual: 1.0
+    chemical_potential_residual: 0.5
+    sparse_mu_mismatch: 0.25
+    bc_mu_violation: 0.25
+    ic_mu_violation: 0.25
 
 controller_v2:
   total_steps: 4000
@@ -60,7 +82,7 @@ controller_v2:
   min_uniform_mass: 0.35
   max_patch_mass: 0.25
   multiplier_min: 0.5
-  multiplier_max: 2.0
+  multiplier_max: 2.5
   max_candidates: 4
   prefilter_damage_ratio: 0.25
   trust_radius_initial: 0.10
@@ -83,6 +105,16 @@ controller_v2:
   variable_awareness_enabled: true
   sampling_redistribution_enabled: true
   local_loss_multipliers_enabled: true
+  cahn_hilliard_u_first_policy: true
+  max_mu_candidates_per_block: 1
+  cahn_hilliard_guards:
+    max_sparse_u_damage_ratio: 0.05
+    max_ic_u_damage_ratio: 0.05
+    max_bc_u_damage_ratio: 0.05
+    max_phase_range_damage_ratio: 0.10
+    max_mass_proxy_damage_ratio: 0.10
+    max_interface_proxy_change_ratio: 0.10
+    allow_mu_improvement_to_override_u_damage: false
   guard_metrics:
     - pde_residual_mean
     - boundary_condition_error

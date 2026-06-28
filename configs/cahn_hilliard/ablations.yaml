@@ -19,6 +19,12 @@ ablations:
       rollback_enabled: false
       gradient_prefilter_enabled: false
 
+  legacy_priority_policy:
+    controller_v2:
+      cahn_hilliard_u_first_policy: false
+    losses:
+      mu_support_only: false
+
   sparse_1pct:
     benchmark:
       sparse_fraction: 0.01

@@ -91,11 +91,25 @@ def compute_training_loss(
         sparse_u = ch_loss.new_zeros(())
         sparse_mu = ch_loss.new_zeros(())
 
+    phase_range_weight = float(weights.get("phase_range_penalty", 0.0))
     proxy_weight = float(weights.get("interface_proxy_regularization", 0.0))
-    if proxy_weight:
+    if phase_range_weight or proxy_weight:
         u_pred = model(interior)[:, 0]
-        proxy_regularization = torch.relu(u_pred.abs() - 1.0).square().mean()
+        phase_range_values = (
+            torch.relu(u_pred - 1.0).square()
+            + torch.relu(-1.0 - u_pred).square()
+        )
+        phase_range_penalty = _localized_mean(
+            phase_range_values,
+            interior,
+            "phase_range_penalty",
+            patch_grid,
+            allocation_state,
+        )
+        proxy_regularization = phase_range_values.mean()
     else:
+        phase_range_values = interior.new_zeros(interior.shape[0])
+        phase_range_penalty = ch_loss.new_zeros(())
         proxy_regularization = ch_loss.new_zeros(())
 
     components = {
@@ -107,6 +121,7 @@ def compute_training_loss(
         "ic_mu": ic_mu,
         "sparse_u_mse": sparse_u,
         "sparse_mu_mse": sparse_mu,
+        "phase_range_penalty": phase_range_penalty,
         "interface_proxy_regularization": proxy_regularization,
     }
     total = sum(
@@ -123,6 +138,7 @@ def compute_training_loss(
         "initial_condition_violation": (initial_error.mean(dim=1), initial),
         "ic_u": (initial_error[:, 0], initial),
         "ic_mu": (initial_error[:, 1], initial),
+        "phase_range_violation": (phase_range_values, interior),
     }
     if sparse_error.numel():
         channels.update(

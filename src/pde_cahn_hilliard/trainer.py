@@ -105,6 +105,13 @@ class CahnHilliardTrainer:
         ).detach()
         self.sparse_targets = self.benchmark.exact(self.sparse_coordinates).detach()
         self.sparse_hash = _tensor_hash(self.sparse_coordinates, self.sparse_targets)
+        self.mass_proxy_baseline = float(
+            (
+                self.sparse_targets[:, 0].mean()
+                if self.sparse_targets.numel()
+                else self.initial_targets[:, 0].mean()
+            ).cpu()
+        )
 
         diagnostics_cfg = dict(self.config.get("diagnostics", {}))
         self.diagnostic_batch = self._make_diagnostic_batch(
@@ -118,8 +125,26 @@ class CahnHilliardTrainer:
         )
         self.interface_tau = float(diagnostics_cfg.get("interface_tau", 0.25))
         self.interface_focus_strength = float(
-            diagnostics_cfg.get("interface_focus_strength", 1.0)
+            diagnostics_cfg.get(
+                "interface_beta",
+                diagnostics_cfg.get("interface_focus_strength", 2.0),
+            )
         )
+        self.interface_threshold = float(
+            diagnostics_cfg.get("interface_threshold", 0.8)
+        )
+        self.diagnostic_priority_weights = {
+            name: float(value)
+            for name, value in dict(
+                diagnostics_cfg.get("priority_weights", {})
+            ).items()
+        }
+        losses_cfg = dict(self.config.get("losses", {}))
+        self.mu_support_only = bool(losses_cfg.get("mu_support_only", True))
+        self.mu_multiplier_max = float(
+            losses_cfg.get("mu_local_multiplier_max", 1.25)
+        )
+        self.mu_priority_max = float(losses_cfg.get("mu_priority_max", 0.5))
         configured_awareness = bool(
             self.config.get("controller_v2", {}).get(
                 "variable_awareness_enabled", True
@@ -138,8 +163,17 @@ class CahnHilliardTrainer:
 
         self.controller: VARAV2Controller | None = None
         self.rollback_enabled = False
+        controller_cfg = deepcopy(dict(self.config.get("controller_v2", {})))
+        self.u_first_policy_enabled = bool(
+            controller_cfg.get("cahn_hilliard_u_first_policy", True)
+        )
+        self.max_mu_candidates_per_block = int(
+            controller_cfg.get("max_mu_candidates_per_block", 1)
+        )
+        self.u_guard_config = dict(
+            controller_cfg.get("cahn_hilliard_guards", {})
+        )
         if method != "vanilla":
-            controller_cfg = deepcopy(dict(self.config.get("controller_v2", {})))
             controller_cfg["variable_awareness_enabled"] = self.variable_awareness
             controller_cfg.setdefault(
                 "guard_metrics",
@@ -168,6 +202,14 @@ class CahnHilliardTrainer:
         self.rejected_interventions = 0
         self.prefiltered_interventions = 0
         self.rollback_count = 0
+        self.accepted_u_interface_interventions = 0
+        self.accepted_mu_interventions = 0
+        self.rejected_due_to_sparse_u_guard = 0
+        self.rejected_due_to_ic_u_guard = 0
+        self.rejected_due_to_bc_u_guard = 0
+        self.rejected_due_to_phase_range_guard = 0
+        self.rejected_due_to_mass_guard = 0
+        self.rejected_due_to_interface_proxy_guard = 0
         self.optimization_wall_clock_sec = 0.0
         self.wall_clock_eval_sec = 0.0
         save_config(self.config, self.run_dir / "resolved_config.yaml")
@@ -201,6 +243,16 @@ class CahnHilliardTrainer:
                 "rejected_interventions": self.rejected_interventions,
                 "prefiltered_interventions": self.prefiltered_interventions,
                 "rollback_count": self.rollback_count,
+                "accepted_u_interface_interventions": self.accepted_u_interface_interventions,
+                "accepted_mu_interventions": self.accepted_mu_interventions,
+                "rejected_due_to_sparse_u_guard": self.rejected_due_to_sparse_u_guard,
+                "rejected_due_to_ic_u_guard": self.rejected_due_to_ic_u_guard,
+                "rejected_due_to_bc_u_guard": self.rejected_due_to_bc_u_guard,
+                "rejected_due_to_phase_range_guard": self.rejected_due_to_phase_range_guard,
+                "rejected_due_to_mass_guard": self.rejected_due_to_mass_guard,
+                "rejected_due_to_interface_proxy_guard": self.rejected_due_to_interface_proxy_guard,
+                "cahn_hilliard_u_first_policy_enabled": self.u_first_policy_enabled,
+                "cahn_hilliard_mu_support_only": self.mu_support_only,
                 "final_trust_radius": (
                     float(self.controller.trust_radius)
                     if self.controller is not None
@@ -277,6 +329,7 @@ class CahnHilliardTrainer:
             candidates = self._filter_ablation_candidates(candidates)
             influence = self._candidate_influence(candidates)
             ranked = self.controller.rank(candidates, influence)
+            ranked = self._rank_u_first_candidates(ranked)
             prefiltered = [candidate for candidate in ranked if candidate.prefiltered]
             active = [candidate for candidate in ranked if not candidate.prefiltered]
             self.prefiltered_interventions += len(prefiltered)
@@ -332,6 +385,7 @@ class CahnHilliardTrainer:
         self.controller.state.restore(allocation_before)
         self.sampling_rng.bit_generator.state = deepcopy(rng_before)
         self.controller.apply(candidate)
+        self._enforce_mu_support_caps()
         candidate_batch = self._training_batch(adaptive=True)
         candidate_rows = self._train_steps(
             candidate_batch,
@@ -341,7 +395,7 @@ class CahnHilliardTrainer:
         candidate_snapshot = self._diagnose()
         candidate_metrics = self._controller_metrics(candidate_snapshot)
         controller_cfg = dict(self.config.get("controller_v2", {}))
-        accepted, decision = self.controller.evaluate(
+        accepted, decision = self._evaluate_with_u_guards(
             candidate,
             self._candidate_score(candidate, neutral_snapshot),
             self._candidate_score(candidate, candidate_snapshot),
@@ -353,6 +407,7 @@ class CahnHilliardTrainer:
         )
         if accepted:
             self.accepted_interventions += 1
+            self._count_accepted_channel(candidate)
             kept_batch, kept_rows = candidate_batch, candidate_rows
         else:
             self.rejected_interventions += 1
@@ -385,6 +440,7 @@ class CahnHilliardTrainer:
     ) -> None:
         assert self.controller is not None
         self.controller.apply(candidate)
+        self._enforce_mu_support_caps()
         self._commit_rows(
             self._train_steps(
                 self._training_batch(adaptive=True),
@@ -393,7 +449,7 @@ class CahnHilliardTrainer:
             )
         )
         after = self._diagnose()
-        accepted, decision = self.controller.evaluate(
+        accepted, decision = self._evaluate_with_u_guards(
             candidate,
             self._candidate_score(candidate, before),
             self._candidate_score(candidate, after),
@@ -403,6 +459,7 @@ class CahnHilliardTrainer:
         )
         if accepted:
             self.accepted_interventions += 1
+            self._count_accepted_channel(candidate)
         else:
             self.rejected_interventions += 1
         self._record_decision(block, candidate, decision)
@@ -494,8 +551,9 @@ class CahnHilliardTrainer:
     def _candidate_target_tensor(
         self, candidate: V2Candidate, result: LossResult
     ) -> torch.Tensor:
+        target_name = self._candidate_target_name(candidate.variable)
         channel = result.channels.get(
-            candidate.variable, result.channels.get("pde_residual")
+            target_name, result.channels.get("pde_residual")
         )
         if channel is None:
             return result.total
@@ -515,7 +573,21 @@ class CahnHilliardTrainer:
             variable_awareness=self.variable_awareness,
             interface_tau=self.interface_tau,
             interface_focus_strength=self.interface_focus_strength,
+            interface_threshold=self.interface_threshold,
+            priority_weights=self.diagnostic_priority_weights,
+            mass_baseline=self.mass_proxy_baseline,
         )
+        if self.mu_support_only:
+            for name in snapshot.names:
+                if self._is_mu_channel(name):
+                    index = snapshot.names.index(name)
+                    configured = min(
+                        self.mu_priority_max,
+                        float(self.diagnostic_priority_weights.get(name, 1.0)),
+                    )
+                    snapshot.priority_scores[index] = (
+                        snapshot.normalized_scores[index] * configured
+                    )
         if float(self.weights.get("sparse_mu_mse", 0.0)) <= 0.0:
             snapshot.adaptation_names = [
                 name
@@ -526,38 +598,27 @@ class CahnHilliardTrainer:
 
     @staticmethod
     def _controller_metrics(snapshot: DiagnosticSnapshot) -> dict[str, float]:
-        means = {
-            name: float(np.mean(snapshot.raw_scores[index]))
-            for index, name in enumerate(snapshot.names)
-        }
-        pde = means.get(
-            "pde_residual",
-            float(
-                np.mean(
-                    [
-                        means.get("ch_residual", 0.0),
-                        means.get("chemical_potential_residual", 0.0),
-                    ]
-                )
-            ),
-        )
-        boundary = means.get("boundary_violation", 0.0)
-        initial = means.get("initial_condition_violation", 0.0)
-        sparse = float(
-            np.mean([value for name, value in means.items() if name.startswith("sparse_")])
-        ) if any(name.startswith("sparse_") for name in means) else 0.0
+        values = dict(snapshot.scalar_metrics)
+        pde = values.get("pde_residual_mean", 0.0)
+        boundary = values.get("bc_u_violation", 0.0)
+        initial = values.get("ic_u_violation", 0.0)
+        sparse = values.get("sparse_u_mse", 0.0)
+        phase = values.get("phase_range_violation", 0.0)
         return {
             "pde_residual_mean": pde,
             "boundary_condition_error": boundary,
-            "unweighted_physics_validation_loss": pde + boundary + initial,
-            "unweighted_validation_loss": pde + boundary + initial + sparse,
+            "unweighted_physics_validation_loss": pde + boundary + initial + phase,
+            "unweighted_validation_loss": pde + boundary + initial + sparse + phase,
+            **values,
         }
 
-    @staticmethod
+    @classmethod
     def _candidate_score(
-        candidate: V2Candidate, snapshot: DiagnosticSnapshot
+        cls, candidate: V2Candidate, snapshot: DiagnosticSnapshot
     ) -> float:
-        name = candidate.variable if candidate.variable in snapshot.names else "pde_residual"
+        name = cls._candidate_target_name(candidate.variable)
+        if name not in snapshot.names:
+            name = "pde_residual"
         return float(snapshot.raw_scores[snapshot.names.index(name), candidate.patch_id])
 
     def _route_candidate_losses(self, candidates: list[V2Candidate]) -> None:
@@ -566,15 +627,260 @@ class CahnHilliardTrainer:
             "chemical_potential_residual": ["chemical_potential_residual"],
             "pde_residual": ["ch_residual", "chemical_potential_residual"],
             "boundary_violation": ["bc_u", "bc_mu"],
+            "bc_u_violation": ["bc_u"],
+            "bc_mu_violation": ["bc_mu"],
             "initial_condition_violation": ["ic_u", "ic_mu"],
+            "ic_u_violation": ["ic_u"],
+            "ic_mu_violation": ["ic_mu"],
             "sparse_u_mismatch": ["sparse_u_mse"],
             "sparse_mu_mismatch": ["sparse_mu_mse"],
             "sparse_data_mismatch": ["sparse_u_mse", "sparse_mu_mse"],
+            "predicted_interface_proxy": ["ch_residual", "sparse_u_mse"],
+            "predicted_interface_mask": ["ch_residual", "sparse_u_mse"],
+            "predicted_gradient_norm": ["ch_residual", "sparse_u_mse"],
+            "phase_range_violation": ["phase_range_penalty"],
+            "mass_proxy_violation": ["ch_residual", "sparse_u_mse"],
         }
         for candidate in candidates:
             candidate.loss_names = routes.get(
                 candidate.variable, ["ch_residual", "chemical_potential_residual"]
             )
+
+    @staticmethod
+    def _candidate_target_name(variable: str) -> str:
+        if variable in {
+            "predicted_interface_proxy",
+            "predicted_interface_mask",
+            "predicted_gradient_norm",
+        }:
+            return "ch_residual"
+        return variable
+
+    @staticmethod
+    def _is_mu_channel(name: str) -> bool:
+        return name in {
+            "chemical_potential_residual",
+            "sparse_mu_mismatch",
+            "bc_mu_violation",
+            "ic_mu_violation",
+            "bc_mu",
+            "ic_mu",
+            "sparse_mu_mse",
+        }
+
+    def _is_mu_only_candidate(self, candidate: V2Candidate) -> bool:
+        return self._is_mu_channel(candidate.variable) or (
+            bool(candidate.loss_names)
+            and all(self._is_mu_channel(name) for name in candidate.loss_names)
+        )
+
+    def _rank_u_first_candidates(
+        self, candidates: list[V2Candidate]
+    ) -> list[V2Candidate]:
+        """Place u/interface candidates before auxiliary mu-only actions."""
+        if not self.u_first_policy_enabled:
+            return candidates
+        interface_channels = {
+            "predicted_interface_proxy",
+            "predicted_interface_mask",
+            "predicted_gradient_norm",
+        }
+
+        def order(candidate: V2Candidate) -> tuple[float, float, float, float]:
+            mu_only = 1.0 if self._is_mu_only_candidate(candidate) else 0.0
+            priority = float(
+                self.diagnostic_priority_weights.get(candidate.variable, 1.0)
+            )
+            sampling_preference = (
+                1.0
+                if candidate.variable in interface_channels
+                and candidate.action_type == "sampling"
+                else 0.0
+            )
+            return (
+                mu_only,
+                -priority,
+                -sampling_preference,
+                -float(candidate.rank_score),
+            )
+
+        ranked = sorted(candidates, key=order)
+        mu_seen = 0
+        limited = []
+        for candidate in ranked:
+            if self._is_mu_only_candidate(candidate):
+                if mu_seen >= max(0, self.max_mu_candidates_per_block):
+                    continue
+                mu_seen += 1
+            limited.append(candidate)
+        return limited
+
+    def _enforce_mu_support_caps(self) -> None:
+        """Preserve mean-one multiplier mass while capping auxiliary mu losses."""
+        if not self.mu_support_only or self.controller is None:
+            return
+        for loss_name, values in list(
+            self.controller.state.loss_multipliers.items()
+        ):
+            if self._is_mu_channel(loss_name):
+                self.controller.state.loss_multipliers[loss_name] = (
+                    _cap_mean_one_multiplier(values, self.mu_multiplier_max)
+                )
+        self.controller.validate_state()
+
+    def _evaluate_with_u_guards(
+        self,
+        candidate: V2Candidate,
+        before_target: float,
+        after_target: float,
+        before_metrics: dict[str, float],
+        after_metrics: dict[str, float],
+        *,
+        target_threshold: float | None = None,
+        guard_threshold: float | None = None,
+        comparison_mode: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        assert self.controller is not None
+        base_accepted, decision = self.controller.evaluate(
+            candidate,
+            before_target,
+            after_target,
+            before_metrics,
+            after_metrics,
+            target_threshold=target_threshold,
+            guard_threshold=guard_threshold,
+            comparison_mode=comparison_mode,
+            update_state=False,
+        )
+        u_guard_ok, guard_reason, u_changes = self._u_guard_decision(
+            before_metrics, after_metrics
+        )
+        allow_mu_override = bool(
+            self.u_guard_config.get(
+                "allow_mu_improvement_to_override_u_damage", False
+            )
+        )
+        if (
+            not u_guard_ok
+            and allow_mu_override
+            and self._is_mu_only_candidate(candidate)
+        ):
+            u_guard_ok = True
+            guard_reason = ""
+        accepted = bool(base_accepted and u_guard_ok)
+        decision["accepted"] = accepted
+        decision["u_guard_changes"] = u_changes
+        decision["guard_metric_changes"] = u_changes
+        decision["target_metric"] = self._candidate_target_name(candidate.variable)
+        decision["selected_primary_channel"] = candidate.variable
+        decision["selected_patch_id"] = candidate.patch_id
+        decision["selected_action_type"] = candidate.action_type
+        for metric_name in (
+            "sparse_u_mse",
+            "sparse_mu_mse",
+            "interface_proxy_mean",
+            "ch_residual_mean",
+            "mu_residual_mean",
+        ):
+            decision[f"{metric_name}_change"] = _relative_change(
+                before_metrics.get(metric_name), after_metrics.get(metric_name)
+            )
+        decision["sparse_u_change"] = decision["sparse_u_mse_change"]
+        decision["sparse_mu_change"] = decision["sparse_mu_mse_change"]
+        decision["interface_proxy_change"] = decision[
+            "interface_proxy_mean_change"
+        ]
+        decision["ch_residual_change"] = decision["ch_residual_mean_change"]
+        decision["mu_residual_change"] = decision["mu_residual_mean_change"]
+        if base_accepted and not u_guard_ok:
+            decision["rollback_reason"] = guard_reason
+            decision["u_guard_rejection"] = guard_reason
+            self._count_guard_rejection(guard_reason)
+        committed = self.controller.commit_evaluation(
+            candidate, accepted, decision
+        )
+        return accepted, committed
+
+    def _u_guard_decision(
+        self,
+        before_metrics: dict[str, float],
+        after_metrics: dict[str, float],
+    ) -> tuple[bool, str, dict[str, float]]:
+        """Apply Cahn--Hilliard primary-field Pareto guards."""
+        checks = [
+            (
+                "sparse_u_mse",
+                "max_sparse_u_damage_ratio",
+                0.05,
+                "sparse_u_guard",
+                False,
+            ),
+            (
+                "ic_u_violation",
+                "max_ic_u_damage_ratio",
+                0.05,
+                "ic_u_guard",
+                False,
+            ),
+            (
+                "bc_u_violation",
+                "max_bc_u_damage_ratio",
+                0.05,
+                "bc_u_guard",
+                False,
+            ),
+            (
+                "phase_range_violation",
+                "max_phase_range_damage_ratio",
+                0.10,
+                "phase_range_guard",
+                False,
+            ),
+            (
+                "mass_proxy_violation",
+                "max_mass_proxy_damage_ratio",
+                0.10,
+                "mass_guard",
+                False,
+            ),
+            (
+                "interface_proxy_mean",
+                "max_interface_proxy_change_ratio",
+                0.10,
+                "interface_proxy_guard",
+                True,
+            ),
+        ]
+        changes: dict[str, float] = {}
+        for metric, config_name, default, reason, absolute in checks:
+            before = before_metrics.get(metric)
+            after = after_metrics.get(metric)
+            if before is None or after is None:
+                continue
+            change = _relative_change(before, after, absolute=absolute)
+            changes[metric] = change
+            threshold = float(self.u_guard_config.get(config_name, default))
+            if np.isfinite(change) and change > threshold:
+                return False, reason, changes
+        return True, "", changes
+
+    def _count_accepted_channel(self, candidate: V2Candidate) -> None:
+        if self._is_mu_only_candidate(candidate):
+            self.accepted_mu_interventions += 1
+        else:
+            self.accepted_u_interface_interventions += 1
+
+    def _count_guard_rejection(self, reason: str) -> None:
+        attribute = {
+            "sparse_u_guard": "rejected_due_to_sparse_u_guard",
+            "ic_u_guard": "rejected_due_to_ic_u_guard",
+            "bc_u_guard": "rejected_due_to_bc_u_guard",
+            "phase_range_guard": "rejected_due_to_phase_range_guard",
+            "mass_guard": "rejected_due_to_mass_guard",
+            "interface_proxy_guard": "rejected_due_to_interface_proxy_guard",
+        }.get(reason)
+        if attribute:
+            setattr(self, attribute, int(getattr(self, attribute)) + 1)
 
     def _filter_ablation_candidates(
         self, candidates: list[V2Candidate]
@@ -597,7 +903,15 @@ class CahnHilliardTrainer:
         candidate: V2Candidate,
         decision: dict[str, Any],
     ) -> None:
-        row: dict[str, Any] = {"block": block, **candidate.to_record()}
+        row: dict[str, Any] = {
+            "block": block,
+            "policy": "u_first" if self.u_first_policy_enabled else "legacy_priority",
+            "selected_primary_channel": candidate.variable,
+            "selected_patch_id": candidate.patch_id,
+            "selected_action_type": candidate.action_type,
+            "target_metric": self._candidate_target_name(candidate.variable),
+            **candidate.to_record(),
+        }
         for key, value in decision.items():
             if isinstance(value, dict):
                 row.update({f"{key}_{nested}": item for nested, item in value.items()})
@@ -613,6 +927,8 @@ class CahnHilliardTrainer:
                 "applied_optimizer_steps": self.applied_optimizer_steps,
                 "trust_radius": self.controller.trust_radius,
                 "variable_awareness_enabled": self.variable_awareness,
+                "cahn_hilliard_u_first_policy": self.u_first_policy_enabled,
+                "mu_support_only": self.mu_support_only,
                 "patch_grid_shape": [
                     self.patch_grid.nt,
                     self.patch_grid.ny,
@@ -883,6 +1199,35 @@ def _cosine(left: torch.Tensor, right: torch.Tensor) -> float:
     if float(denominator.cpu()) <= 1e-20:
         return 0.0
     return float((torch.dot(left, right) / denominator).cpu())
+
+
+def _relative_change(
+    before: float | None,
+    after: float | None,
+    *,
+    absolute: bool = False,
+) -> float:
+    if before is None or after is None:
+        return float("nan")
+    denominator = max(abs(float(before)), 1e-10)
+    change = (float(after) - float(before)) / denominator
+    return abs(change) if absolute else change
+
+
+def _cap_mean_one_multiplier(values: np.ndarray, maximum: float) -> np.ndarray:
+    """Cap a multiplier vector without changing its mean-one loss mass."""
+    if maximum < 1.0:
+        raise ValueError("A mean-one local multiplier cap must be at least 1.0.")
+    out = np.minimum(np.asarray(values, dtype=float).copy(), float(maximum))
+    deficit = float(out.size) - float(np.sum(out))
+    if deficit > 1e-12:
+        room = np.maximum(float(maximum) - out, 0.0)
+        room_total = float(np.sum(room))
+        if room_total <= 1e-12:
+            raise RuntimeError("Unable to conserve mu multiplier mass under cap.")
+        out += deficit * room / room_total
+    out += (float(out.size) - float(np.sum(out))) / float(out.size)
+    return np.minimum(out, float(maximum))
 
 
 def _git_commit() -> str:
