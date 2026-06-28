@@ -1,0 +1,3 @@
+benchmark:
+  epsilon: 0.025
+  sparse_fraction: 0.02

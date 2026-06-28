@@ -1,0 +1,48 @@
+ablations:
+  no_variable_awareness:
+    controller_v2:
+      variable_awareness_enabled: false
+
+  sampling_only:
+    controller_v2:
+      sampling_redistribution_enabled: true
+      local_loss_multipliers_enabled: false
+
+  local_loss_only:
+    controller_v2:
+      sampling_redistribution_enabled: false
+      local_loss_multipliers_enabled: true
+
+  no_counterfactual_guard:
+    controller_v2:
+      counterfactual_probe_enabled: false
+      rollback_enabled: false
+      gradient_prefilter_enabled: false
+
+  sparse_1pct:
+    benchmark:
+      sparse_fraction: 0.01
+
+  sparse_2pct:
+    benchmark:
+      sparse_fraction: 0.02
+
+  sparse_5pct:
+    benchmark:
+      sparse_fraction: 0.05
+
+  epsilon_006:
+    benchmark:
+      epsilon: 0.06
+
+  epsilon_004:
+    benchmark:
+      epsilon: 0.04
+
+  epsilon_003:
+    benchmark:
+      epsilon: 0.03
+
+  epsilon_0025:
+    benchmark:
+      epsilon: 0.025

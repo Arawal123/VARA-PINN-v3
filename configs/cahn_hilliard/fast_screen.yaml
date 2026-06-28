@@ -1,0 +1,24 @@
+training:
+  total_steps: 1000
+  n_collocation: 1024
+  n_boundary: 256
+  n_initial: 256
+  n_sparse_data: 128
+
+diagnostics:
+  n_interior: 512
+  n_boundary: 128
+  n_initial: 128
+
+controller_v2:
+  total_steps: 1000
+  warmup_steps: 250
+  control_blocks: 3
+  block_steps: 250
+  probe_steps: 25
+
+evaluation:
+  nx: 32
+  ny: 32
+  nt: 9
+  chunk_size: 512
