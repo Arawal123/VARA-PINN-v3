@@ -173,6 +173,18 @@ def metric_groups() -> dict[str, list[str]]:
             "post_block_rollbacks",
             "accepted_interface_targets",
             "accepted_sparse_u_targets",
+            "all_rejected_blocks",
+            "consecutive_all_rejected_blocks_max",
+            "best_safe_candidate_activations",
+            "accepted_by_standard_pareto",
+            "accepted_by_best_safe_fallback",
+            "rejected_due_to_primary_reward",
+            "rejected_due_to_hard_guard",
+            "inactivity_recovery_activations",
+            "mean_primary_reward_accepted",
+            "mean_primary_reward_rejected",
+            "mean_guard_penalty_accepted",
+            "mean_guard_penalty_rejected",
         ],
     }
 

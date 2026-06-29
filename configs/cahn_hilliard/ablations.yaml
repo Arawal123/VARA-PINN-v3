@@ -22,6 +22,10 @@ ablations:
         enabled: false
       cahn_hilliard_post_block_guard:
         enabled: false
+      cahn_hilliard_best_safe_candidate:
+        enabled: false
+      cahn_hilliard_inactivity_recovery:
+        enabled: false
 
   legacy_priority_policy:
     controller_v2:

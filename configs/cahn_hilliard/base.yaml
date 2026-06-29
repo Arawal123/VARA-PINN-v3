@@ -110,6 +110,10 @@ controller_v2:
   max_mu_candidates_per_block: 1
   cahn_hilliard_pareto_policy:
     enabled: true
+    adaptive_guard_tolerance: true
+    noise_floor_multiplier: 1.5
+    absolute_guard_floor: 0.00001
+    small_metric_denominator_floor: 0.000001
     primary_targets:
       - sparse_u_mse
       - interface_proxy_error
@@ -117,46 +121,68 @@ controller_v2:
       - bc_u_error
       - ch_residual_mean
     hard_guards:
-      pde_residual_mean: 0.035
-      ch_residual_mean: 0.035
-      mass_proxy_error: 0.050
-      phase_overshoot: 0.025
-      sparse_u_mse: 0.030
-      ic_u_error: 0.030
-      bc_u_error: 0.030
+      pde_residual_mean: 0.060
+      ch_residual_mean: 0.060
+      mass_proxy_error: 0.075
+      phase_overshoot: 0.050
+      sparse_u_mse: 0.050
+      ic_u_error: 0.050
+      bc_u_error: 0.050
     soft_guards:
-      mu_residual_mean: 0.100
-      sparse_mu_mse: 0.150
+      mu_residual_mean: 0.150
+      sparse_mu_mse: 0.200
     reject_if_mu_only_improves: true
     require_primary_improvement: true
+    safe_worsening_band:
+      enabled: true
+      max_mild_guard_violations: 2
+      mild_guard_fraction: 0.50
   cahn_hilliard_pareto_score:
-    min_primary_reward: 0.005
-    acceptance_margin: 0.0
+    min_primary_reward: 0.0015
+    acceptance_margin: -0.001
     weights:
       sparse_u_mse: 3.0
       interface_proxy_error: 2.5
       ic_u_error: 1.5
       bc_u_error: 1.5
       ch_residual_mean: 1.25
-      pde_residual_mean_guard: 2.0
+      pde_residual_mean_guard: 1.5
       mass_proxy_guard: 2.0
       phase_overshoot_guard: 2.0
   cahn_hilliard_mass_guard:
     enabled: true
     source: initial_condition
-    max_relative_worsening: 0.05
+    max_relative_worsening: 0.075
     weight_in_acceptance: 1.0
   cahn_hilliard_phase_guard:
     enabled: true
-    max_relative_worsening: 0.025
+    max_relative_worsening: 0.050
     absolute_ceiling: 0.05
   cahn_hilliard_post_block_guard:
     enabled: true
-    pde_residual_max_worsening: 0.05
-    ch_residual_max_worsening: 0.05
-    mass_proxy_max_worsening: 0.075
-    phase_overshoot_max_worsening: 0.05
-    sparse_u_max_worsening: 0.05
+    pde_residual_max_worsening: 0.075
+    ch_residual_max_worsening: 0.075
+    mass_proxy_max_worsening: 0.10
+    phase_overshoot_max_worsening: 0.075
+    sparse_u_max_worsening: 0.075
+  cahn_hilliard_best_safe_candidate:
+    enabled: true
+    activate_after_consecutive_all_rejected_blocks: 2
+    min_primary_reward: 0.0005
+    max_guard_worsening:
+      pde_residual_mean: 0.040
+      ch_residual_mean: 0.040
+      mass_proxy_error: 0.050
+      phase_overshoot: 0.035
+      sparse_u_mse: 0.035
+    reject_mu_only: true
+  cahn_hilliard_inactivity_recovery:
+    enabled: true
+    consecutive_rejected_blocks_trigger: 2
+    trust_radius_recovery_factor: 1.10
+    max_recovery_trust_radius: 0.12
+    lower_primary_reward_temporarily: true
+    temporary_reward_multiplier: 0.5
   cahn_hilliard_guards:
     max_sparse_u_damage_ratio: 0.05
     max_ic_u_damage_ratio: 0.05

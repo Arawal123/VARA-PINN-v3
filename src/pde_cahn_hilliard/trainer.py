@@ -197,6 +197,12 @@ class CahnHilliardTrainer:
         self.post_block_guard_config = dict(
             controller_cfg.get("cahn_hilliard_post_block_guard", {})
         )
+        self.best_safe_candidate_config = dict(
+            controller_cfg.get("cahn_hilliard_best_safe_candidate", {})
+        )
+        self.inactivity_recovery_config = dict(
+            controller_cfg.get("cahn_hilliard_inactivity_recovery", {})
+        )
         if method != "vanilla":
             controller_cfg["variable_awareness_enabled"] = self.variable_awareness
             controller_cfg.setdefault(
@@ -244,6 +250,22 @@ class CahnHilliardTrainer:
         self.post_block_rollbacks = 0
         self.accepted_interface_targets = 0
         self.accepted_sparse_u_targets = 0
+        self.all_rejected_blocks = 0
+        self.consecutive_all_rejected_blocks = 0
+        self.consecutive_all_rejected_blocks_max = 0
+        self.best_safe_candidate_activations = 0
+        self.accepted_by_standard_pareto = 0
+        self.accepted_by_best_safe_fallback = 0
+        self.rejected_due_to_primary_reward = 0
+        self.rejected_due_to_hard_guard = 0
+        self.inactivity_recovery_activations = 0
+        self._temporary_reward_multiplier = 1.0
+        self._accepted_primary_rewards: list[float] = []
+        self._rejected_primary_rewards: list[float] = []
+        self._accepted_guard_penalties: list[float] = []
+        self._rejected_guard_penalties: list[float] = []
+        self.pareto_metric_history: dict[str, list[float]] = {}
+        self.candidate_guard_memory: dict[str, float] = {}
         self.optimization_wall_clock_sec = 0.0
         self.wall_clock_eval_sec = 0.0
         save_config(self.config, self.run_dir / "resolved_config.yaml")
@@ -279,11 +301,11 @@ class CahnHilliardTrainer:
                 "rollback_count": self.rollback_count,
                 "accepted_u_interface_interventions": self.accepted_u_interface_interventions,
                 "accepted_mu_interventions": self.accepted_mu_interventions,
-                "rejected_due_to_sparse_u_guard": self.rejected_due_to_sparse_u_guard,
+                "rejected_legacy_sparse_u_guard": self.rejected_due_to_sparse_u_guard,
                 "rejected_due_to_ic_u_guard": self.rejected_due_to_ic_u_guard,
                 "rejected_due_to_bc_u_guard": self.rejected_due_to_bc_u_guard,
                 "rejected_due_to_phase_range_guard": self.rejected_due_to_phase_range_guard,
-                "rejected_due_to_mass_guard": self.rejected_due_to_mass_guard,
+                "rejected_legacy_mass_guard": self.rejected_due_to_mass_guard,
                 "rejected_due_to_interface_proxy_guard": self.rejected_due_to_interface_proxy_guard,
                 "accepted_pareto_safe_interventions": self.accepted_pareto_safe_interventions,
                 "rejected_hard_guard_pde": self.rejected_hard_guard_pde,
@@ -295,6 +317,32 @@ class CahnHilliardTrainer:
                 "post_block_rollbacks": self.post_block_rollbacks,
                 "accepted_interface_targets": self.accepted_interface_targets,
                 "accepted_sparse_u_targets": self.accepted_sparse_u_targets,
+                "all_rejected_blocks": self.all_rejected_blocks,
+                "consecutive_all_rejected_blocks_max": self.consecutive_all_rejected_blocks_max,
+                "best_safe_candidate_activations": self.best_safe_candidate_activations,
+                "accepted_by_standard_pareto": self.accepted_by_standard_pareto,
+                "accepted_by_best_safe_fallback": self.accepted_by_best_safe_fallback,
+                "rejected_due_to_primary_reward": self.rejected_due_to_primary_reward,
+                "rejected_due_to_hard_guard": self.rejected_due_to_hard_guard,
+                "rejected_due_to_mu_only": self.rejected_mu_only,
+                "rejected_due_to_pde_guard": self.rejected_hard_guard_pde,
+                "rejected_due_to_ch_guard": self.rejected_hard_guard_ch,
+                "rejected_due_to_mass_guard": self.rejected_hard_guard_mass,
+                "rejected_due_to_phase_guard": self.rejected_hard_guard_phase,
+                "rejected_due_to_sparse_u_guard": self.rejected_hard_guard_sparse_u,
+                "mean_primary_reward_accepted": _safe_mean(
+                    self._accepted_primary_rewards
+                ),
+                "mean_primary_reward_rejected": _safe_mean(
+                    self._rejected_primary_rewards
+                ),
+                "mean_guard_penalty_accepted": _safe_mean(
+                    self._accepted_guard_penalties
+                ),
+                "mean_guard_penalty_rejected": _safe_mean(
+                    self._rejected_guard_penalties
+                ),
+                "inactivity_recovery_activations": self.inactivity_recovery_activations,
                 "cahn_hilliard_pareto_policy_enabled": bool(
                     self.pareto_policy_config.get("enabled", False)
                 ),
@@ -363,6 +411,7 @@ class CahnHilliardTrainer:
             before = self._diagnose()
             _adaptation_raw, adaptation_normalized = before.adaptation_scores()
             before_metrics = self._controller_metrics(before)
+            self._record_pareto_metric_history(before_metrics)
             self.controller.update_history(
                 before.adaptation_names, adaptation_normalized, before_metrics
             )
@@ -391,17 +440,19 @@ class CahnHilliardTrainer:
                         phase=f"block_{block}_no_action",
                     )
                 )
+                self._register_block_outcome(False)
                 self._log_allocation(block)
                 continue
             candidate = active[0]
             if self.controller.config.counterfactual_probe_enabled:
-                self._counterfactual_block(
+                block_accepted = self._counterfactual_block(
                     block, candidate, before_metrics, schedule
                 )
             else:
-                self._unguarded_block(
+                block_accepted = self._unguarded_block(
                     block, candidate, before, before_metrics, schedule
                 )
+            self._register_block_outcome(block_accepted)
             self._log_allocation(block)
 
     def _counterfactual_block(
@@ -410,7 +461,7 @@ class CahnHilliardTrainer:
         candidate: V2Candidate,
         pre_block_metrics: dict[str, float],
         schedule: dict[str, int],
-    ) -> None:
+    ) -> bool:
         assert self.controller is not None
         model_before = self._model_snapshot()
         optimizer_before = deepcopy(self.optimizer.state_dict())
@@ -515,6 +566,8 @@ class CahnHilliardTrainer:
             self.accepted_interventions += 1
             self._count_accepted_channel(candidate)
         self._record_decision(block, candidate, decision)
+        self._record_acceptance_health(accepted, decision)
+        return accepted
 
     def _unguarded_block(
         self,
@@ -523,7 +576,7 @@ class CahnHilliardTrainer:
         before: DiagnosticSnapshot,
         before_metrics: dict[str, float],
         schedule: dict[str, int],
-    ) -> None:
+    ) -> bool:
         assert self.controller is not None
         self.controller.apply(candidate)
         self._enforce_mu_support_caps()
@@ -549,6 +602,8 @@ class CahnHilliardTrainer:
         else:
             self.rejected_interventions += 1
         self._record_decision(block, candidate, decision)
+        self._record_acceptance_health(accepted, decision)
+        return accepted
 
     def _train_steps(
         self,
@@ -772,10 +827,19 @@ class CahnHilliardTrainer:
             "predicted_gradient_norm",
         }
 
-        def order(candidate: V2Candidate) -> tuple[float, float, float, float]:
+        def order(
+            candidate: V2Candidate,
+        ) -> tuple[float, float, float, float, float, float]:
             mu_only = 1.0 if self._is_mu_only_candidate(candidate) else 0.0
             priority = float(
                 self.diagnostic_priority_weights.get(candidate.variable, 1.0)
+            )
+            prior_damage = self.candidate_guard_memory.get(candidate.key(), 0.0)
+            predicted_safety = 1.0 / (1.0 + max(0.0, prior_damage))
+            effectiveness = (
+                float(self.controller.effectiveness.get(candidate.key(), 1.0))
+                if self.controller is not None
+                else 1.0
             )
             sampling_preference = (
                 1.0
@@ -786,6 +850,8 @@ class CahnHilliardTrainer:
             return (
                 mu_only,
                 -priority,
+                -predicted_safety,
+                -effectiveness,
                 -sampling_preference,
                 -float(candidate.rank_score),
             )
@@ -800,6 +866,144 @@ class CahnHilliardTrainer:
                 mu_seen += 1
             limited.append(candidate)
         return limited
+
+    def _record_pareto_metric_history(self, metrics: dict[str, float]) -> None:
+        for name, value in metrics.items():
+            if not np.isfinite(float(value)):
+                continue
+            history = self.pareto_metric_history.setdefault(name, [])
+            history.append(float(value))
+            del history[:-8]
+
+    def _observed_metric_noise(self, metric: str) -> float:
+        history = self.pareto_metric_history.get(metric, [])
+        if len(history) < 3:
+            return 0.0
+        values = np.asarray(history, dtype=float)
+        denominator_floor = float(
+            self.pareto_policy_config.get(
+                "small_metric_denominator_floor", 1e-6
+            )
+        )
+        changes = np.diff(values) / np.maximum(
+            np.abs(values[:-1]), denominator_floor
+        )
+        median = float(np.median(changes))
+        mad = float(np.median(np.abs(changes - median)))
+        return max(0.0, 1.4826 * mad)
+
+    def _effective_guard_tolerance(
+        self, metric: str, configured_tolerance: float
+    ) -> float:
+        if not bool(
+            self.pareto_policy_config.get("adaptive_guard_tolerance", True)
+        ):
+            return float(configured_tolerance)
+        noise_multiplier = float(
+            self.pareto_policy_config.get("noise_floor_multiplier", 1.5)
+        )
+        return max(
+            float(configured_tolerance),
+            noise_multiplier * self._observed_metric_noise(metric),
+            float(self.pareto_policy_config.get("absolute_guard_floor", 1e-5)),
+        )
+
+    def _guard_worsening_ratio(
+        self,
+        metric: str,
+        before: float | None,
+        after: float | None,
+    ) -> float:
+        if before is None or after is None:
+            return float("nan")
+        delta = float(after) - float(before)
+        absolute_floor = float(
+            self.pareto_policy_config.get("absolute_guard_floor", 1e-5)
+        )
+        if delta <= absolute_floor:
+            return 0.0
+        denominator_floor = float(
+            self.pareto_policy_config.get(
+                "small_metric_denominator_floor", 1e-6
+            )
+        )
+        return delta / max(abs(float(before)), denominator_floor)
+
+    def _register_block_outcome(self, accepted: bool) -> None:
+        if accepted:
+            self.consecutive_all_rejected_blocks = 0
+            self._temporary_reward_multiplier = 1.0
+            return
+        self.all_rejected_blocks += 1
+        self.consecutive_all_rejected_blocks += 1
+        self.consecutive_all_rejected_blocks_max = max(
+            self.consecutive_all_rejected_blocks_max,
+            self.consecutive_all_rejected_blocks,
+        )
+        if not bool(self.inactivity_recovery_config.get("enabled", True)):
+            return
+        trigger = int(
+            self.inactivity_recovery_config.get(
+                "consecutive_rejected_blocks_trigger", 2
+            )
+        )
+        if self.consecutive_all_rejected_blocks < trigger:
+            return
+        if self.controller is not None:
+            factor = float(
+                self.inactivity_recovery_config.get(
+                    "trust_radius_recovery_factor", 1.10
+                )
+            )
+            maximum = float(
+                self.inactivity_recovery_config.get(
+                    "max_recovery_trust_radius", 0.12
+                )
+            )
+            self.controller.trust_radius = min(
+                maximum,
+                max(
+                    self.controller.config.trust_radius_min,
+                    self.controller.trust_radius * factor,
+                ),
+            )
+        if bool(
+            self.inactivity_recovery_config.get(
+                "lower_primary_reward_temporarily", True
+            )
+        ):
+            self._temporary_reward_multiplier = float(
+                self.inactivity_recovery_config.get(
+                    "temporary_reward_multiplier", 0.5
+                )
+            )
+        self.inactivity_recovery_activations += 1
+
+    def _record_acceptance_health(
+        self, accepted: bool, decision: dict[str, Any]
+    ) -> None:
+        primary_reward = float(decision.get("primary_reward", 0.0))
+        guard_penalty = float(decision.get("guard_penalty", 0.0))
+        key = str(decision.get("candidate_id", ""))
+        previous_damage = self.candidate_guard_memory.get(key, 0.0)
+        self.candidate_guard_memory[key] = (
+            0.8 * previous_damage + 0.2 * max(0.0, guard_penalty)
+        )
+        if accepted:
+            self._accepted_primary_rewards.append(primary_reward)
+            self._accepted_guard_penalties.append(guard_penalty)
+            if decision.get("acceptance_mode") == "best_safe_fallback":
+                self.accepted_by_best_safe_fallback += 1
+            elif bool(self.pareto_policy_config.get("enabled", False)):
+                self.accepted_by_standard_pareto += 1
+        else:
+            self._rejected_primary_rewards.append(primary_reward)
+            self._rejected_guard_penalties.append(guard_penalty)
+            reason = str(decision.get("rejection_reason", ""))
+            if reason.startswith("hard_guard_"):
+                self.rejected_due_to_hard_guard += 1
+            if reason in {"insufficient_primary_reward", "pareto_margin"}:
+                self.rejected_due_to_primary_reward += 1
 
     def _enforce_mu_support_caps(self) -> None:
         """Preserve mean-one multiplier mass while capping auxiliary mu losses."""
@@ -856,7 +1060,20 @@ class CahnHilliardTrainer:
             )
             decision.update(pareto_details)
             if accepted:
-                pareto_score = float(pareto_details.get("pareto_score", 0.0))
+                decision["acceptance_mode"] = "standard_pareto"
+            else:
+                fallback_accepted, fallback_reason = (
+                    self._best_safe_candidate_decision(candidate, decision)
+                )
+                if fallback_accepted:
+                    accepted = True
+                    guard_reason = ""
+                    decision["acceptance_mode"] = "best_safe_fallback"
+                    decision["standard_pareto_rejection_reason"] = fallback_reason
+                    decision["rejection_reason"] = ""
+                    self.best_safe_candidate_activations += 1
+            if accepted:
+                pareto_score = float(decision.get("pareto_score", 0.0))
                 predicted = max(
                     float(candidate.predicted_target_improvement),
                     self.controller.config.noise_floor,
@@ -883,6 +1100,8 @@ class CahnHilliardTrainer:
             decision["u_guard_changes"] = u_changes
             decision["guard_metric_changes"] = u_changes
         decision["accepted"] = accepted
+        decision["candidate_id"] = candidate.key()
+        decision["channel"] = candidate.variable
         decision["target_metric"] = self._candidate_target_name(candidate.variable)
         decision["selected_primary_channel"] = candidate.variable
         decision["selected_patch_id"] = candidate.patch_id
@@ -890,19 +1109,30 @@ class CahnHilliardTrainer:
         for metric_name in (
             "sparse_u_mse",
             "sparse_mu_mse",
+            "interface_proxy_error",
             "interface_proxy_mean",
+            "pde_residual_mean",
             "ch_residual_mean",
+            "mass_proxy_error",
+            "phase_overshoot",
+            "ic_u_error",
+            "bc_u_error",
             "mu_residual_mean",
         ):
-            decision[f"{metric_name}_change"] = _relative_change(
+            decision[f"{metric_name}_change"] = self._guard_worsening_ratio(
+                metric_name,
                 before_metrics.get(metric_name), after_metrics.get(metric_name)
             )
         decision["sparse_u_change"] = decision["sparse_u_mse_change"]
         decision["sparse_mu_change"] = decision["sparse_mu_mse_change"]
         decision["interface_proxy_change"] = decision[
-            "interface_proxy_mean_change"
+            "interface_proxy_error_change"
         ]
+        decision["pde_residual_change"] = decision["pde_residual_mean_change"]
         decision["ch_residual_change"] = decision["ch_residual_mean_change"]
+        decision["mass_proxy_change"] = decision["mass_proxy_error_change"]
+        decision["ic_u_change"] = decision["ic_u_error_change"]
+        decision["bc_u_change"] = decision["bc_u_error_change"]
         decision["mu_residual_change"] = decision["mu_residual_mean_change"]
         log_metrics = {
             "sparse_u": "sparse_u_mse",
@@ -964,7 +1194,8 @@ class CahnHilliardTrainer:
         )
         hard_guards = dict(self.pareto_policy_config.get("hard_guards", {}))
         guard_changes: dict[str, float] = {}
-        hard_violation = ""
+        effective_tolerances: dict[str, float] = {}
+        violated_guard_names: list[str] = []
         reason_names = {
             "pde_residual_mean": "hard_guard_pde",
             "ch_residual_mean": "hard_guard_ch",
@@ -975,8 +1206,10 @@ class CahnHilliardTrainer:
             "bc_u_error": "hard_guard_bc_u",
         }
         for metric, configured_threshold in hard_guards.items():
-            change = _relative_change(
-                before_metrics.get(metric), after_metrics.get(metric)
+            change = self._guard_worsening_ratio(
+                metric,
+                before_metrics.get(metric),
+                after_metrics.get(metric),
             )
             guard_changes[metric] = change
             threshold = float(configured_threshold)
@@ -1006,19 +1239,39 @@ class CahnHilliardTrainer:
                     self.phase_guard_config.get("absolute_ceiling", float("inf"))
                 )
                 if float(after_metrics.get(metric, 0.0)) > absolute_ceiling:
-                    hard_violation = reason_names.get(metric, f"hard_guard_{metric}")
-            if (
-                not hard_violation
-                and np.isfinite(change)
-                and change > threshold
-            ):
-                hard_violation = reason_names.get(metric, f"hard_guard_{metric}")
+                    violated_guard_names.append(metric)
+            threshold = self._effective_guard_tolerance(metric, threshold)
+            effective_tolerances[metric] = threshold
+            if np.isfinite(change) and change > threshold:
+                violated_guard_names.append(metric)
+
+        hard_violation = ""
+        if violated_guard_names:
+            first_violation = violated_guard_names[0]
+            hard_violation = reason_names.get(
+                first_violation, f"hard_guard_{first_violation}"
+            )
 
         guard_weight_names = {
             "pde_residual_mean": "pde_residual_mean_guard",
             "mass_proxy_error": "mass_proxy_guard",
             "phase_overshoot": "phase_overshoot_guard",
         }
+        safe_band = dict(
+            self.pareto_policy_config.get("safe_worsening_band", {})
+        )
+        mild_fraction = float(safe_band.get("mild_guard_fraction", 0.5))
+        mild_metrics = [
+            metric
+            for metric, change in guard_changes.items()
+            if np.isfinite(change)
+            and change > 0.0
+            and change
+            <= mild_fraction * effective_tolerances.get(metric, 0.0)
+        ]
+        exclude_mild = bool(safe_band.get("enabled", True)) and len(
+            mild_metrics
+        ) <= int(safe_band.get("max_mild_guard_violations", 2))
         guard_penalty = float(
             sum(
                 float(
@@ -1026,21 +1279,28 @@ class CahnHilliardTrainer:
                         guard_weight_names.get(metric, f"{metric}_guard"), 1.0
                     )
                 )
-                * max(0.0, change)
+                * (
+                    0.0
+                    if exclude_mild and metric in mild_metrics
+                    else max(0.0, change)
+                )
                 for metric, change in guard_changes.items()
                 if np.isfinite(change)
             )
         )
         pareto_score = primary_reward - guard_penalty
+        soft_tolerances = dict(
+            self.pareto_policy_config.get("soft_guards", {})
+        )
         soft_changes = {
-            metric: _relative_change(
-                before_metrics.get(metric), after_metrics.get(metric)
+            metric: self._guard_worsening_ratio(
+                metric,
+                before_metrics.get(metric),
+                after_metrics.get(metric),
             )
-            for metric in dict(
-                self.pareto_policy_config.get("soft_guards", {})
-            )
+            for metric in soft_tolerances
         }
-        minimum_reward = float(
+        minimum_reward = self._temporary_reward_multiplier * float(
             self.pareto_score_config.get("min_primary_reward", 0.005)
         )
         acceptance_margin = float(
@@ -1076,9 +1336,47 @@ class CahnHilliardTrainer:
             "primary_metric_changes": primary_changes,
             "hard_guard_changes": guard_changes,
             "soft_guard_changes": soft_changes,
+            "effective_guard_tolerances": effective_tolerances,
+            "violated_guard_names": sorted(set(violated_guard_names)),
+            "mild_guard_names": mild_metrics,
+            "mild_guard_penalty_waived": exclude_mild,
+            "min_required_primary_reward": minimum_reward,
+            "rejection_reason": reason,
             "pareto_policy_enabled": True,
         }
         return not bool(reason), reason, details
+
+    def _best_safe_candidate_decision(
+        self,
+        candidate: V2Candidate,
+        decision: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Allow a low-reward but demonstrably safe candidate after inactivity."""
+        reason = str(decision.get("rejection_reason", ""))
+        config = self.best_safe_candidate_config
+        if not bool(config.get("enabled", True)):
+            return False, reason
+        trigger = int(
+            config.get("activate_after_consecutive_all_rejected_blocks", 2)
+        )
+        if self.consecutive_all_rejected_blocks < trigger:
+            return False, reason
+        if bool(config.get("reject_mu_only", True)) and self._is_mu_only_candidate(
+            candidate
+        ):
+            return False, reason
+        if float(decision.get("primary_reward", 0.0)) < float(
+            config.get("min_primary_reward", 0.0005)
+        ):
+            return False, reason
+        guard_changes = dict(decision.get("hard_guard_changes", {}))
+        for metric, threshold in dict(
+            config.get("max_guard_worsening", {})
+        ).items():
+            change = float(guard_changes.get(metric, float("nan")))
+            if not np.isfinite(change) or change > float(threshold):
+                return False, reason
+        return True, reason
 
     def _u_guard_decision(
         self,
@@ -1153,43 +1451,46 @@ class CahnHilliardTrainer:
             (
                 "pde_residual_mean",
                 "pde_residual_max_worsening",
-                0.05,
+                0.075,
                 "post_block_guard_pde",
             ),
             (
                 "ch_residual_mean",
                 "ch_residual_max_worsening",
-                0.05,
+                0.075,
                 "post_block_guard_ch",
             ),
             (
                 "mass_proxy_error",
                 "mass_proxy_max_worsening",
-                0.075,
+                0.10,
                 "post_block_guard_mass",
             ),
             (
                 "phase_overshoot",
                 "phase_overshoot_max_worsening",
-                0.05,
+                0.075,
                 "post_block_guard_phase",
             ),
             (
                 "sparse_u_mse",
                 "sparse_u_max_worsening",
-                0.05,
+                0.075,
                 "post_block_guard_sparse_u",
             ),
         ]
         changes: dict[str, float] = {}
         for metric, config_name, default, reason in checks:
-            change = _relative_change(
-                before_metrics.get(metric), after_metrics.get(metric)
+            change = self._guard_worsening_ratio(
+                metric,
+                before_metrics.get(metric),
+                after_metrics.get(metric),
             )
             changes[metric] = change
             threshold = float(
                 self.post_block_guard_config.get(config_name, default)
             )
+            threshold = self._effective_guard_tolerance(metric, threshold)
             if np.isfinite(change) and change > threshold:
                 return False, reason, changes
         return True, "", changes
@@ -1262,6 +1563,22 @@ class CahnHilliardTrainer:
             "block": block,
             "candidate_id": candidate.key(),
             "channel": candidate.variable,
+            "candidate_rank_score": candidate.rank_score,
+            "predicted_pareto_safety": 1.0
+            / (
+                1.0
+                + max(
+                    0.0,
+                    self.candidate_guard_memory.get(candidate.key(), 0.0),
+                )
+            ),
+            "previous_candidate_effectiveness": (
+                float(self.controller.effectiveness.get(candidate.key(), 1.0))
+                if self.controller is not None
+                else 1.0
+            ),
+            "is_mu_only": self._is_mu_only_candidate(candidate),
+            "is_u_interface_candidate": not self._is_mu_only_candidate(candidate),
             "policy": "u_first" if self.u_first_policy_enabled else "legacy_priority",
             "selected_primary_channel": candidate.variable,
             "selected_patch_id": candidate.patch_id,
@@ -1577,6 +1894,10 @@ def _relative_change(
 def _improvement_ratio(before: float | None, after: float | None) -> float:
     change = _relative_change(before, after)
     return -change if np.isfinite(change) else float("nan")
+
+
+def _safe_mean(values: list[float]) -> float:
+    return float(np.mean(values)) if values else float("nan")
 
 
 def _cap_mean_one_multiplier(values: np.ndarray, maximum: float) -> np.ndarray:

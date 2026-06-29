@@ -29,6 +29,19 @@ def test_cahn_hilliard_four_step_run_writes_artifacts(tmp_path, method: str) -> 
     if method == "vara_v2":
         assert (run_dir / "vara_v2_decisions.csv").is_file()
         assert (run_dir / "vara_v2_allocation_history.json").is_file()
+        acceptance_health_fields = {
+            "all_rejected_blocks",
+            "consecutive_all_rejected_blocks_max",
+            "best_safe_candidate_activations",
+            "accepted_by_standard_pareto",
+            "accepted_by_best_safe_fallback",
+            "rejected_due_to_primary_reward",
+            "rejected_due_to_hard_guard",
+            "rejected_due_to_mu_only",
+            "mean_primary_reward_accepted",
+            "mean_guard_penalty_rejected",
+        }
+        assert acceptance_health_fields <= summary["metrics"].keys()
 
 
 def tiny_cahn_hilliard_config() -> dict:
