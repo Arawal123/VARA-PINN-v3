@@ -35,6 +35,9 @@ from src.sampling.boundary_sampler import boundary_side_fractions
 from src.sampling.residual_sampler import sample_from_score_grid
 from src.training.checkpointing import load_checkpoint, save_checkpoint
 from src.training.compute_budget import ComputeTracker
+from src.training.cavity_fair_revision import (
+    assert_fair_final_state, fair_revision_enabled, tensor_mapping_sha256,
+)
 from src.training.lbfgs_utils import make_lbfgs_closure
 from src.utils.config import save_config
 from src.utils.device import get_device
@@ -77,6 +80,8 @@ class ExperimentTrainer:
         self.continuation_replay_points: torch.Tensor | None = None
         self.continuation_replay_targets: torch.Tensor | None = None
         self.warm_start_status = self._maybe_load_warm_start(config)
+        if fair_revision_enabled(config):
+            self.fair_initial_model_sha256 = tensor_mapping_sha256(self.model.state_dict())
         continuation_enabled = bool(config.get("continuation_anchor", {}).get("enabled", False))
         replay_enabled = bool(config.get("continuation_replay", {}).get("enabled", False))
         if self.warm_start_status.get("loaded") and (continuation_enabled or replay_enabled):
@@ -1207,6 +1212,12 @@ class ExperimentTrainer:
         builds a fresh global batch, ignores local controller weights, and keeps
         the result only when validation score improves.
         """
+        if fair_revision_enabled(self.config):
+            self.final_repair_status = {
+                "enabled": False, "executed": False, "accepted": False,
+                "reason": "fair_revision_disabled",
+            }
+            return self.final_repair_status
         cfg = self._final_repair_config()
         if self.compute_tracker.enabled and self.compute_tracker.exhausted():
             self.final_repair_status = {
@@ -1559,6 +1570,9 @@ class ExperimentTrainer:
         return result
 
     def evaluate_and_save_final(self) -> dict[str, float]:
+        if fair_revision_enabled(self.config):
+            assert_fair_final_state(self)
+            self.final_repair_status.update({"enabled": False, "executed": False, "accepted": False})
         self._restore_best_checkpoint_if_enabled()
         self._validate_final_cavity_state()
         X, Y, coords = self.test_grid()
@@ -1596,6 +1610,12 @@ class ExperimentTrainer:
             or bool(self.config.get("cavity_curriculum", {}).get("enabled", False))
         )
         metrics["optimizer_stage"] = self.optimizer_stage
+        if fair_revision_enabled(self.config):
+            metrics.update({
+                "final_model_source": "final_primary_adam_step",
+                "checkpoint_restoration_executed": False,
+                "topology_continuation_gate_enabled": False,
+            })
         for key, value in self.final_repair_status.items():
             metrics[f"final_repair_{key}"] = value
         for key, value in self.warm_start_status.items():
@@ -1923,6 +1943,8 @@ class ExperimentTrainer:
         )
 
     def maybe_checkpoint(self, cycle: int, metrics: dict[str, float]) -> None:
+        if fair_revision_enabled(self.config):
+            return  # Only final.pt is eligible; no best-state selection.
         score = self._checkpoint_score(metrics)
         started = time.perf_counter()
         checkpoint_cfg = dict(self.config.get("checkpoint", {}))
@@ -2059,6 +2081,8 @@ class ExperimentTrainer:
 
     def should_stop_early(self, metrics: dict[str, Any]) -> bool:
         """Stop only after a valid, stable reference-free convergence window."""
+        if fair_revision_enabled(self.config):
+            return False
         cfg = dict(self.config.get("convergence_early_stopping", {}))
         if not bool(cfg.get("enabled", False)):
             return False
@@ -2121,6 +2145,8 @@ class ExperimentTrainer:
         )
 
     def _restore_best_checkpoint_if_enabled(self) -> None:
+        if fair_revision_enabled(self.config):
+            return
         cfg = dict(self.config.get("checkpoint", {}))
         path = self.checkpoint_dir / "best.pt"
         if bool(cfg.get("restore_best_before_final", False)) and path.exists():

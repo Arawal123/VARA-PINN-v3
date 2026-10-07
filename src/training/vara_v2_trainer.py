@@ -21,6 +21,7 @@ from src.evaluation.metrics import evaluate_on_grid
 from src.losses.base_losses import compute_pointwise_losses, weighted_sum
 from src.losses.local_losses import LOSS_COORD_SOURCE, compute_budgeted_patch_losses
 from src.training.trainer import ExperimentTrainer
+from src.training.cavity_fair_revision import fair_revision_enabled
 from src.training.checkpointing import save_checkpoint
 from src.utils.io import save_json
 from src.utils.logging import CSVLogger, JSONListLogger
@@ -136,6 +137,8 @@ class VARAV2Trainer(ExperimentTrainer):
             )
             # Rejected polish probes must resume the exact neutral trajectory.
             cfg["counterfactual_probe_enabled"] = True
+        if fair_revision_enabled(self.config):
+            cfg["counterfactual_probe_enabled"] = False
         self.v2_config = V2ControllerConfig.from_dict(cfg, self.patch_grid.num_patches)
         self.v2_controller = VARAV2Controller(self.v2_config)
         self.v2_decision_logger = CSVLogger(self.run_dir / "vara_v2_decisions.csv")
@@ -1554,6 +1557,7 @@ class VARAV2Trainer(ExperimentTrainer):
     ) -> bool:
         if (
             not self.sparse_polish_curriculum_enabled
+            or not self.sparse_curriculum_cfg.get("restore_best_before_final", True)
             or self._sparse_curriculum_best is None
         ):
             return False

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import json
 import math
 from pathlib import Path
 import shutil
@@ -12,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -31,6 +33,11 @@ from scripts.run_lid_cavity_re_continuation import (
 from scripts.run_modern_baselines import METHODS as BASELINE_METHODS
 from src.training.vara_trainer import VARATrainer
 from src.training.vara_v2_trainer import VARAV2Trainer
+from src.data import build_cavity_cfd_supervision
+from src.training.cavity_fair_revision import (
+    apply_fair_revision, fair_revision_enabled, fairness_manifest,
+    paired_fairness_report, pool_evidence, prepare_fair_revision_args,
+)
 from src.utils.config import deep_update, load_config, save_config
 from src.utils.io import save_json
 
@@ -112,6 +119,14 @@ def main() -> None:
     )
     parser.add_argument("--quick", action="store_true")
     parser.add_argument(
+        "--fair_revision", action="store_true",
+        help="Opt-in Re=100 sparse-polish pairs: 4000 Adam steps, no repair, final-step evaluation.",
+    )
+    parser.add_argument(
+        "--plan_only", action="store_true",
+        help="With --fair_revision, resolve configs/pool evidence without training or writing outputs.",
+    )
+    parser.add_argument(
         "--disable_stabilizers",
         action="store_true",
         help="Ablation: retain the formulation/budget but disable numerical stabilizers.",
@@ -126,6 +141,11 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
+    fair = bool(getattr(args, "fair_revision", False))
+    if fair:
+        prepare_fair_revision_args(args)
+    elif bool(getattr(args, "plan_only", False)):
+        raise ValueError("--plan_only is supported only with --fair_revision.")
     base = _load_base_config(args.config)
     base = deep_update(base, load_config("configs/vara_v2/controller.yaml"))
     base = deep_update(base, load_config("configs/vara_v2/continuation.yaml"))
@@ -197,6 +217,12 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     if args.device:
         base["device"] = args.device
     reference_map = _load_full_field_reference_map(args.full_field_reference_map)
+    if fair:
+        base = apply_fair_revision(base)
+        plan = _fair_revision_plan(base, args, reference_map)
+        if bool(getattr(args, "plan_only", False)):
+            print(json.dumps(plan, indent=2))
+            return {"raw": pd.DataFrame(), "comparisons": pd.DataFrame()}
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
         if not bool(getattr(args, "overwrite", False)):
@@ -208,14 +234,18 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     output.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     comparison_rows: list[dict[str, Any]] = []
+    fairness_pairs: list[dict[str, Any]] = []
 
     for seed in args.seeds:
         previous: dict[str, Path | None] = {method: None for method in args.methods}
         failed_methods: set[str] = set()
         for reynolds in args.reynolds:
             per_method: dict[str, dict[str, Any]] = {}
+            per_method_manifest: dict[str, dict[str, Any]] = {}
             re_name = f"re_{int(round(reynolds)):04d}"
             re_base = _apply_re_aware_cavity_settings(base, float(reynolds))
+            if fair:
+                re_base = apply_fair_revision(re_base)
             for method in args.methods:
                 if method in failed_methods:
                     continue
@@ -260,6 +290,10 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                         str(full_field) if full_field is not None else None
                     ),
                 }
+                if fair:
+                    config["data_supervision"]["seed"] = (
+                        int(seed) if args.cfd_seed is None else int(args.cfd_seed)
+                    )
                 config["warm_start_checkpoint"] = str(previous[method]) if previous[method] else None
                 config["warm_start"] = {"load_optimizer": False}
                 if previous[method] is None:
@@ -273,6 +307,10 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     }
                 trainer = _trainer_for(method, config)
                 metrics = trainer.run()
+                if fair:
+                    manifest = fairness_manifest(trainer, method)
+                    save_json(manifest, trainer.run_dir / "fairness_manifest.json")
+                    per_method_manifest[method] = manifest
                 validity = _continuation_validity(metrics, config)
                 metrics.update(validity)
                 checkpoint = trainer.checkpoint_dir / "final.pt"
@@ -299,6 +337,14 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
                     )
 
             if "vanilla" in per_method and "vara_v2" in per_method:
+                if fair:
+                    report = paired_fairness_report(
+                        per_method_manifest["vanilla"], per_method_manifest["vara_v2"],
+                    )
+                    fairness_pairs.append(report)
+                    save_json(fairness_pairs, output / "summary" / "fairness_pairs.json")
+                    if not report["matched"]:
+                        raise RuntimeError(f"Fair revision pair failed: {report['mismatches']}")
                 pair_rows = _comparison_rows(
                     seed,
                     reynolds,
@@ -359,7 +405,53 @@ def run(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
     _save_summary_bar_plots(comparisons, summary)
     _save_validity_aware_montages(output, raw, summary)
     save_config(base, summary / "resolved_base_config.yaml")
+    if fair:
+        save_json(plan, summary / "fair_revision_plan.json")
+        pd.DataFrame(fairness_pairs).to_csv(summary / "fairness_pairs.csv", index=False)
     return {"raw": raw, "comparisons": comparisons}
+
+
+def _fair_revision_plan(
+    base: dict[str, Any], args: argparse.Namespace, reference_map: dict[float, Path],
+) -> dict[str, Any]:
+    """Preflight all pools before any training/output directory is created."""
+    config = apply_fair_revision(_apply_re_aware_cavity_settings(base, 100.0))
+    model = config["model"]
+    train = config["training"]
+    if (model.get("architecture") != "mlp" or model.get("hidden_layers") != [64, 64, 64]
+            or model.get("input_dim") != 2 or model.get("output_dim") != 3
+            or model.get("activation") != "tanh"
+            or model.get("physics_formulation") != "cavity_uvp_soft_bc"):
+        raise ValueError("Fair revision requires the historical 2-64-64-64-3 tanh soft-BC model.")
+    if int(train["adaptive_cycles"]) * int(train["epochs_per_cycle"]) != 4000:
+        raise ValueError("Fair revision requires exactly 4000 primary scheduled steps.")
+    if int(config["controller_v2"]["total_steps"]) != 4000:
+        raise ValueError("Fair revision requires the historical 4000-step curriculum schedule.")
+    ctrl = config["controller_v2"]
+    if int(ctrl["warmup_steps"]) + int(ctrl["control_blocks"]) * int(ctrl["block_steps"]) != 4000:
+        raise ValueError("Fair revision V2 warmup/block schedule must total 4000.")
+    reference = _full_field_reference_for_re(100.0, reference_map)
+    if reference is None:
+        raise ValueError("Fair Re=100 requires an existing CFD reference in the map.")
+    config["benchmark_params"].update({
+        "reynolds": 100.0, "reference": "ghia",
+        "full_field_reference_path": str(reference), "profile_only": False,
+    })
+    config["data_supervision"]["reference_path"] = str(reference)
+    pools = []
+    for seed in args.seeds:
+        pool_config = deepcopy(config)
+        pool_config["data_supervision"].update({
+            "reference_path": str(reference),
+            "seed": int(seed) if args.cfd_seed is None else int(args.cfd_seed),
+        })
+        pool = build_cavity_cfd_supervision(pool_config, (0.0, 1.0, 0.0, 1.0), torch.device("cpu"))
+        pools.append({"training_seed": int(seed), **pool_evidence(pool)})
+    return {
+        "config": config, "methods": args.methods, "seeds": args.seeds,
+        "reynolds": [100.0], "pools": pools, "output_dir": str(args.output_dir),
+        "continuation": "disabled_pending_manuscript_confirmation",
+    }
 
 
 def _without_cavity_stabilizers(config: dict[str, Any]) -> dict[str, Any]:
@@ -1243,6 +1335,12 @@ def _continuation_sort_key(path: Path) -> tuple[int, float, str]:
 
 
 def _continuation_validity(metrics: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    if fair_revision_enabled(config):
+        return {
+            "continuation_stage_valid": True,
+            "continuation_invalid_reasons": "",
+            "topology_continuation_gate_enabled": False,
+        }
     cfg = dict(config.get("continuation_validity", {}))
     if not bool(cfg.get("enabled", False)):
         return {
