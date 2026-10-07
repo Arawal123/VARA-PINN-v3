@@ -5,6 +5,9 @@ __pycache__/
 .ruff_cache/
 .venv/
 *.egg-info/
+experiments/revision_full_guard/
+supplement_full_guard_cavity_*/
+supplement_full_guard_cavity_*.zip
 
 # Keep generated experiment artifacts local unless intentionally archived.
 experiments/logs/*

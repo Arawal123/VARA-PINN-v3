@@ -1,0 +1,360 @@
+benchmark: lid_driven_cavity
+seed: 0
+deterministic: true
+dtype: float32
+device: cuda
+benchmark_params:
+  reynolds: 100.0
+  x_min: 0.0
+  x_max: 1.0
+  y_min: 0.0
+  y_max: 1.0
+  lid_velocity: 1.0
+  reference: none
+  reference_path: null
+  full_field_reference_path: null
+  profile_only: true
+  lid_corner_regularization_width: 0.05
+pde:
+  steady: true
+data_supervision:
+  mode: sparse_cfd
+  sample_fraction: 0.02
+  sample_count: null
+  seed: 0
+  include_pressure: false
+  include_vorticity: false
+  exclude_near_corners: true
+  boundary_margin: 1.0e-06
+  corner_margin: 0.05
+  oracle_label: ''
+  cfd:
+    sampling:
+      mode: uniform
+      uniform_fraction: 0.45
+      top_band_fraction: 0.25
+      right_band_fraction: 0.12
+      lower_core_fraction: 0.1
+      left_band_fraction: 0.08
+  sparse_cfd_velocity_weight: 3.0
+  sparse_continuity_weight: 6.0
+  sparse_raw_pde_tail_weight: 0.04
+  formulation_explicit_override: false
+  oracle: false
+  sparse_cfd_polish_enabled: false
+  reference_path: data/references/lid_driven_cavity/full_field/re_0100_paddlescience.npz
+model:
+  architecture: mlp
+  input_dim: 2
+  output_dim: 3
+  hidden_layers:
+  - 64
+  - 64
+  - 64
+  activation: tanh
+  physics_formulation: cavity_uvp_soft_bc
+optimizer:
+  name: adam
+  lr: 0.001
+  final_repair:
+    enabled: false
+  scheduler:
+    enabled: true
+    total_steps: 4000
+    warmup_steps: 300
+    warmup_start_ratio: 0.2
+    min_lr_ratio: 0.08
+  lbfgs:
+    enabled: false
+training:
+  pointwise_reduction: mean
+  adaptive_cycles: 20
+  epochs_per_cycle: 200
+  log_every: 50
+  n_collocation: 2048
+  n_boundary: 512
+  n_data: 0
+  weights:
+    pde: 0.0
+    momentum_u: 1.0
+    momentum_v: 1.0
+    continuity: 6.0
+    bc: 0.0
+    u: 0.0
+    v: 0.0
+    p: 0.0
+    omega: 0.0
+    pressure_gradient: 0.0
+    cfd_u_mse: 0.0
+    cfd_v_mse: 0.0
+    cfd_velocity_mse: 3.0
+    cfd_p_mse: 0.0
+    cfd_omega_mse: 0.0
+    speed_cap: 0.0
+    raw_psi_l2: 0.0
+    raw_psi_mean_l2: 0.0
+    scaled_correction_mean_l2: 0.0
+    scaled_correction_abs_max_hinge: 0.0
+    top_reverse_u: 0.0
+    bottom_positive_u: 0.0
+    raw_pde_tail: 0.04
+    pressure_gradient_l2: 0.0
+    vorticity_smoothness: 0.0
+    near_wall_vorticity_l2: 0.0
+    bc_uvp_balanced: 27.0
+    top_band_pde: 0.0
+    top_band_momentum_u: 0.0
+    top_band_continuity: 0.0
+    upper_core_pde: 0.0
+    right_wall_interior_pde: 0.0
+    lower_core_pde: 0.0
+    bc_top_u: 0.0
+    bc_top_v: 0.0
+    bc_bottom_u: 0.0
+    bc_bottom_v: 0.0
+    bc_left_u: 0.0
+    bc_left_v: 0.0
+    bc_right_u: 0.0
+    bc_right_v: 0.0
+  residual_loss_mode:
+    initial: pseudo_huber
+    switch_step: 3800
+    final: pseudo_huber
+    pseudo_huber_delta: 1.0
+  skip_boundary_loss_if_hard_enforced: false
+  collocation_curriculum:
+    enabled: true
+    stages:
+    - until_step: 1000
+      n_collocation: 1024
+      n_boundary: 512
+    - until_step: 3000
+      n_collocation: 1536
+      n_boundary: 512
+    - until_step: 4000
+      n_collocation: 2048
+      n_boundary: 512
+pressure_gauge:
+  weight: 0.001
+validation:
+  nx: 64
+  ny: 64
+test:
+  nx: 96
+  ny: 96
+evaluation:
+  controller_reference_metrics_enabled: false
+  checkpoint_reference_metrics_enabled: false
+  residual_interior_only: true
+  controller_streamfunction_metrics: false
+  topology_interval_cycles: 5
+diagnostics:
+  mode: residual_only
+  variables:
+  - continuity_residual
+  - momentum_u_residual
+  - momentum_v_residual
+  - aggregate_pde_residual
+  - boundary_violation
+  aggregation: mean
+  aggregation_percentile: 90.0
+  normalization: percentile
+  ema_rho: 0.7
+patches:
+  nx_patches: 4
+  ny_patches: 4
+  nt_patches: 1
+weak_regions:
+  percentile_threshold: 75.0
+  top_k_per_variable: 1
+  min_active_patches: 1
+  max_active_patches: 6
+  persistence_cycles: 1
+controller_v2:
+  total_steps: 4000
+  warmup_steps: 800
+  control_blocks: 16
+  block_steps: 200
+  probe_steps: 10
+  gradient_probe_interior: 256
+  gradient_probe_boundary: 32
+  min_uniform_mass: 0.35
+  max_patch_mass: 0.25
+  multiplier_min: 0.5
+  multiplier_max: 2.0
+  max_candidates: 4
+  prefilter_damage_ratio: 0.25
+  trust_radius_initial: 0.1
+  trust_radius_min: 0.025
+  trust_radius_max: 0.2
+  trust_expand: 1.25
+  trust_shrink: 0.5
+  effectiveness_ema: 0.8
+  noise_floor: 0.0001
+  target_noise_ceiling: 0.25
+  guard_noise_ceiling: 0.1
+  reliable_reward_ratio: 0.75
+  counterfactual_probe_enabled: true
+  counterfactual_target_margin: 0.005
+  counterfactual_guard_margin: 0.02
+  gradient_prefilter_enabled: true
+  trust_region_enabled: true
+  action_memory_enabled: true
+  rollback_enabled: true
+  sparse_polish_rescue:
+    enabled: false
+  sparse_polish_curriculum:
+    enabled: false
+    disable_generic_interventions: false
+  guard_metrics:
+  - pde_residual_mean
+  - continuity_residual_mean
+  - momentum_residual_mean
+  - boundary_condition_error
+  - unweighted_physics_validation_loss
+  variable_awareness_enabled: true
+sampling:
+  mixture:
+    uniform: 0.35
+    pde_residual: 0.25
+    pressure_vorticity: 0.1
+    velocity: 0.1
+    boundary: 0.2
+  cavity_boundary:
+    enabled: true
+    lid_fraction: 0.31
+    corner_fraction: 0.1
+    corner_width: 0.05
+    mode: focused
+  uniform:
+    engine: sobol
+  cavity_near_wall:
+    enabled: true
+    fraction: 0.2
+    band_width: 0.12
+  cavity_lid_interior_band:
+    enabled: true
+    fraction: 0.2
+    y_min: 0.72
+    y_max: 0.98
+    corner_width: 0.05
+    minimum_core_fraction: 0.35
+  cavity_circulation_bands:
+    enabled: false
+    top_band_fraction: 0.2
+    right_band_fraction: 0.15
+    lower_band_fraction: 0.1
+    left_band_fraction: 0.1
+experiments:
+  root: experiments/vara_v2/lid_driven_cavity
+losses:
+  speed_cap:
+    enabled: false
+    cap: 2.0
+  raw_psi_l2:
+    enabled: false
+  correction_bubble:
+    enabled: false
+    abs_max_cap: 0.3
+  lid_shear_direction:
+    enabled: false
+    band_width: 0.12
+    corner_width: 0.09
+    bottom_u_tolerance: 0.04
+  raw_residual_tail:
+    enabled: true
+    threshold: 0.525
+    core_margin: 0.08
+    core_emphasis: 1.5
+  pressure_gradient_l2:
+    enabled: false
+  near_wall_momentum:
+    enabled: false
+    normalize_mean: true
+    max_weight: 3.0
+    stages:
+    - until_step: 800
+      band_width: 0.12
+      weight: 1.0
+    - until_step: 1800
+      band_width: 0.12
+      weight: 1.15
+    - until_step: 3000
+      band_width: 0.12
+      weight: 1.25
+    - until_step: 4000
+      band_width: 0.12
+      weight: 1.25
+  near_wall_vorticity_l2:
+    enabled: false
+    band_width: 0.12
+    quantile: 0.95
+  vorticity_smoothness:
+    enabled: false
+  uvp_boundary_balance:
+    enabled: true
+    relative_weights:
+      bc_top_u: 1.55
+      bc_top_v: 1.0
+      bc_bottom_u: 1.3
+      bc_bottom_v: 1.0
+      bc_left_u: 1.1
+      bc_left_v: 1.1
+      bc_right_u: 1.1
+      bc_right_v: 1.1
+  uvp_regional_residuals:
+    enabled: false
+cavity_curriculum:
+  enabled: false
+  stages:
+  - until_step: 1000
+    corner_width: 0.1
+    lid_vertical_power: 2
+    correction_scale: 18.0
+  - until_step: 3000
+    corner_width: 0.09
+    lid_vertical_power: 2
+    correction_scale: 22.0
+  - until_step: 4000
+    corner_width: 0.09
+    lid_vertical_power: 2
+    correction_scale: 22.0
+loss_normalization:
+  enabled: false
+  names:
+  - momentum_u
+  - momentum_v
+  - continuity
+  - bc
+  ema: 0.98
+  min_scale: 1.0e-05
+  max_scale: 1.0e4
+  warmup_steps: 0
+continuation_anchor:
+  enabled: false
+continuation_replay:
+  enabled: false
+checkpoint:
+  restore_best_before_final: false
+  require_final_cavity_stage: false
+  low_re_vortex_tiebreaker:
+    enabled: false
+convergence_early_stopping:
+  enabled: false
+visualization:
+  nx: 192
+  ny: 192
+runtime_profiling:
+  enabled: true
+  detailed_every_steps: 50
+continuation_validity:
+  enabled: false
+revision_full_guard:
+  enabled: true
+  base_sha: f14e1d21039e2bc3938830e255eb291f4fea7401
+  final_state_rule: final_committed_adam
+  primary_steps: 4000
+compute_budget:
+  enabled: true
+  type: applied_optimizer_steps
+  value: 4000
