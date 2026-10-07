@@ -79,6 +79,32 @@ def test_guard_rejects_harmful_target_gain():
         controller.evaluate(candidate, 1., .8, {"velocity_full_rel_l2": 1.}, {"velocity_full_rel_l2": .9})
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_repeated_probe_restores_do_not_mutate_adam_snapshot(tmp_path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable; CPU covers same-device Adam tensor aliasing")
+    c = config()
+    c["device"] = device
+    c["experiments"] = {"root": str(tmp_path), "flat_layout": True}
+    trainer = RevisionTrainer(c, "vara_v2_full_guard")
+    def synthetic_adam_step():
+        # Initialize and mutate real Adam moments without PDE training.
+        trainer.optimizer.zero_grad(set_to_none=True)
+        sum(p.square().sum() for p in trainer.model.parameters()).backward()
+        trainer.optimizer.step()
+    synthetic_adam_step()
+    pre = trainer.snapshot()
+    saved_optimizer_hash = state_hash(pre["optimizer"])
+    expected_start = state_hash({"model": pre["model"], "optimizer": pre["optimizer"]})
+    for _ in range(3):
+        trainer.restore(pre)
+        assert state_hash({"model": trainer.model.state_dict(), "optimizer": trainer.optimizer.state_dict()}) == expected_start
+        synthetic_adam_step()
+        assert state_hash(pre["optimizer"]) == saved_optimizer_hash
+    trainer.restore(pre)
+    assert state_hash(trainer.snapshot()) == state_hash(pre)
+
+
 def test_sparse_objective_has_nonzero_gradient(tmp_path):
     from src.losses.base_losses import compute_pointwise_losses
     c = config()

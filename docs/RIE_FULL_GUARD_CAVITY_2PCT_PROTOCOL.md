@@ -77,3 +77,5 @@ Use a new `--supplement_dir` and archive parent for rebuilding a package after a
 ## Local verification scope
 
 Regression tests cover forbidden config changes, historical YAML preservation, sparse-objective gradients, canonical hashes, paired constructor preflight, synthetic rollback/state/step accounting, and a synthetic report/archive with all 36 exports and byte/checksum checks. These fixtures are labeled synthetic and never scientific results. No 4000-step training is executed by the tests. CUDA execution, memory requirements and scientific outcomes remain to be validated in Colab.
+
+Adam restoration deep-copies optimizer state on every load. Same-device tensor aliasing in PyTorch must not allow a probe to mutate a reusable snapshot. A regression initializes real Adam moments, performs several restored synthetic updates, and verifies unchanged saved moments plus byte-identical start hashes. The CUDA case runs when a GPU is available. This fixes the original revision's probe-start assertion failure after a rejected candidate; preserve that failed run and start a fresh timestamped pair with the corrected revision.

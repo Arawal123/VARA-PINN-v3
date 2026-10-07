@@ -227,7 +227,10 @@ class RevisionTrainer(VARAV2Trainer):
 
     def restore(self, state):
         self._restore_model_snapshot(state["model"])
-        self.optimizer.load_state_dict(state["optimizer"])
+        # load_state_dict can retain same-device Adam tensor references. Each
+        # trial needs private moments so optimizer.step cannot mutate the
+        # reusable pre-probe or retained neutral snapshot.
+        self.optimizer.load_state_dict(deepcopy(state["optimizer"]))
         self.v2_controller.state.restore(state["allocation"])
         self.restore_sampling_state(state["sampling"])
         self.loss_normalization_state = deepcopy(state["normalization"])
