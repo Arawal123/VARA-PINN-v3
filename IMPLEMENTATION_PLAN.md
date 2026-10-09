@@ -1,0 +1,15 @@
+# Kovasznay V2 publication implementation plan
+
+Base: ee80c76c6e64a83eb7fa5365e743b2d9789a3c85; audited Allen-Cahn core: cdb27c8be0e681654d8c6c3005d9658c0ae6ee73.
+
+Historical V1 files, configurations and results remain untouched. Add an isolated publication trainer derived from the existing Navier-Stokes VARAV2Trainer, reusing VARAV2Controller, the Kovasznay benchmark, Navier-Stokes derivatives, model and budgeted mean-loss reducers. Override orchestration where necessary for Allen-Cahn parity rather than invoking the existing multi-candidate NS run loop.
+
+Primary protocol, fixed before GPU outcomes: Re40; original domain; five hidden tanh layers of96; outputs u,v,p;4x4 spatial patches;500 warmup +7x500 committed Adam steps;25-step neutral/action probes; one eligible candidate per block; Adam0.001; gradient clip10;2048 collocation;512 fixed boundary observations;1000 fixed permitted interior u/v/p observations. Both arms use the same mean-squared objective, pressure gauge, observations, initialization and neutral sampling cadence. Optional pure-PINN is a separately labeled protocol, never pooled with the primary study.
+
+Freeze configuration and protocol fingerprints before primary execution. Retain historical V2 guard/trust/memory mathematics, including its uncalibrated prediction-scale limitation. Use all model parameters for gradient influence, patch90th-percentile diagnostics and median-positive channel normalization. Additional continuity/momentum guard quantities are declared Navier-Stokes adaptations. Neutral allocations use identical uniform draws in both arms, resolving the audited historical Allen-Cahn neutral-sampler mismatch as an explicit new-protocol deviation.
+
+Persist append-only physical step/probe/gradient events, full diagnostic tensors, all ranked candidates, neutral/action metric snapshots, state hashes and restoration evidence. Atomic checkpoints at completed warmup/control blocks include model, Adam, controller memory, allocations, RNGs, permitted pools, retained trajectories and schedule. Interrupted partial blocks are replayed from the last complete checkpoint; partial attempts remain raw evidence and replay overhead is reported. A crash between an optimizer intent and its completion has an explicitly uncertain call bound and prevents an exact-compute validity badge.
+
+Add a safe runner, strict independent run/ZIP verifier, deterministic supplementary analysis/figures and a Colab launcher with persistent storage, nested live progress and resume. Tests must cover reference isolation, neutral/Vanilla identity, analytic PDE derivatives, counterfactual comparison, immutable restoration, conservation, counts, resume and package roundtrip. Only tiny CPU fixtures execute locally; five-seed GPU outcomes remain PENDING.
+
+Source anchors: src/pde_generalization/trainer.py:244,293,464,524,636; src/pde_generalization/diagnostics.py:122,177,194; src/training/vara_v2_trainer.py:100,303,645,1618,1628,1722; src/controllers/v2_controller.py:240,269,309,347,446,534,554.

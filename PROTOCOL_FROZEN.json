@@ -1,0 +1,337 @@
+{
+  "audited_allen_cahn_revision": "cdb27c8be0e681654d8c6c3005d9658c0ae6ee73",
+  "base_revision": "ee80c76c6e64a83eb7fa5365e743b2d9789a3c85",
+  "frozen_before_primary_execution": true,
+  "implementation_version": "kovasznay_v2_reference_free_v1",
+  "primary_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "primary_study_status": "PENDING",
+  "profiles": {
+    "prescribed_sparse_primary": {
+      "config": {
+        "benchmark": "kovasznay",
+        "benchmark_params": {
+          "reynolds": 40.0,
+          "x_max": 1.0,
+          "x_min": -0.5,
+          "y_max": 1.5,
+          "y_min": -0.5
+        },
+        "checkpoint": {
+          "restore_best_before_final": false
+        },
+        "controller_v2": {
+          "action_memory_enabled": true,
+          "block_steps": 500,
+          "control_blocks": 7,
+          "counterfactual_guard_margin": 0.02,
+          "counterfactual_probe_enabled": true,
+          "counterfactual_target_margin": 0.005,
+          "effectiveness_ema": 0.8,
+          "gradient_prefilter_enabled": true,
+          "guard_metrics": [
+            "pde_residual_mean",
+            "continuity_residual_mean",
+            "momentum_residual_mean",
+            "boundary_condition_error",
+            "unweighted_validation_loss",
+            "unweighted_physics_validation_loss"
+          ],
+          "guard_noise_ceiling": 0.1,
+          "max_candidates": 4,
+          "max_patch_mass": 0.25,
+          "min_uniform_mass": 0.35,
+          "multiplier_max": 2.0,
+          "multiplier_min": 0.5,
+          "noise_floor": 0.0001,
+          "prefilter_damage_ratio": 0.25,
+          "probe_steps": 25,
+          "reliable_reward_ratio": 0.75,
+          "rollback_enabled": true,
+          "target_noise_ceiling": 0.25,
+          "total_steps": 4000,
+          "trust_expand": 1.25,
+          "trust_radius_initial": 0.1,
+          "trust_radius_max": 0.2,
+          "trust_radius_min": 0.025,
+          "trust_region_enabled": true,
+          "trust_shrink": 0.5,
+          "warmup_steps": 500
+        },
+        "deterministic": true,
+        "diagnostics": {
+          "aggregation": "percentile",
+          "aggregation_percentile": 90,
+          "mode": "residual_only",
+          "n_boundary": 256,
+          "n_interior": 1024
+        },
+        "dtype": "float32",
+        "evaluation": {
+          "checkpoint_reference_metrics_enabled": false,
+          "controller_reference_metrics_enabled": false
+        },
+        "model": {
+          "activation": "tanh",
+          "hidden_layers": [
+            96,
+            96,
+            96,
+            96,
+            96
+          ],
+          "input_dim": 2,
+          "output_dim": 3
+        },
+        "optimizer": {
+          "final_repair": {
+            "enabled": false
+          },
+          "lr": 0.001,
+          "max_grad_norm": 10.0,
+          "name": "adam",
+          "scheduler": {}
+        },
+        "patches": {
+          "nt_patches": 1,
+          "nx_patches": 4,
+          "ny_patches": 4
+        },
+        "pde": {
+          "steady": true
+        },
+        "plots": {
+          "enabled": false
+        },
+        "pressure_gauge": {
+          "weight": 0.001
+        },
+        "publication": {
+          "bootstrap_resamples": 20000,
+          "bootstrap_seed": 20261009,
+          "disabled_candidates": false,
+          "final_state_rule": "final_committed_adam_state",
+          "profile": "prescribed_sparse_primary",
+          "progress_every": 25,
+          "protocol_id": "kovasznay_v2_reference_free_v1",
+          "representative_seeds": [
+            0
+          ],
+          "seeds": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "smoke": false
+        },
+        "sampling": {
+          "uniform": {
+            "engine": "random"
+          }
+        },
+        "test": {
+          "nx": 100,
+          "ny": 100
+        },
+        "training": {
+          "epochs_per_cycle": 500,
+          "n_boundary": 512,
+          "n_collocation": 2048,
+          "n_data": 1000,
+          "pointwise_reduction": "mean",
+          "total_steps": 4000,
+          "weights": {
+            "bc": 10.0,
+            "continuity": 1.0,
+            "momentum_u": 1.0,
+            "momentum_v": 1.0,
+            "p": 0.6666666666666666,
+            "u": 0.6666666666666666,
+            "v": 0.6666666666666666
+          }
+        },
+        "validation": {
+          "nx": 32,
+          "ny": 32
+        },
+        "weak_regions": {
+          "max_active_patches": 8,
+          "min_active_patches": 1,
+          "percentile_threshold": 80.0,
+          "persistence_cycles": 1,
+          "top_k_per_variable": 2
+        }
+      },
+      "config_hash": "b0c436fa1f974a525ae24c833a50116c28ba7cd79ec47306900117fb493ec29a"
+    },
+    "pure_pinn_sensitivity": {
+      "config": {
+        "benchmark": "kovasznay",
+        "benchmark_params": {
+          "reynolds": 40.0,
+          "x_max": 1.0,
+          "x_min": -0.5,
+          "y_max": 1.5,
+          "y_min": -0.5
+        },
+        "checkpoint": {
+          "restore_best_before_final": false
+        },
+        "controller_v2": {
+          "action_memory_enabled": true,
+          "block_steps": 500,
+          "control_blocks": 7,
+          "counterfactual_guard_margin": 0.02,
+          "counterfactual_probe_enabled": true,
+          "counterfactual_target_margin": 0.005,
+          "effectiveness_ema": 0.8,
+          "gradient_prefilter_enabled": true,
+          "guard_metrics": [
+            "pde_residual_mean",
+            "continuity_residual_mean",
+            "momentum_residual_mean",
+            "boundary_condition_error",
+            "unweighted_validation_loss",
+            "unweighted_physics_validation_loss"
+          ],
+          "guard_noise_ceiling": 0.1,
+          "max_candidates": 4,
+          "max_patch_mass": 0.25,
+          "min_uniform_mass": 0.35,
+          "multiplier_max": 2.0,
+          "multiplier_min": 0.5,
+          "noise_floor": 0.0001,
+          "prefilter_damage_ratio": 0.25,
+          "probe_steps": 25,
+          "reliable_reward_ratio": 0.75,
+          "rollback_enabled": true,
+          "target_noise_ceiling": 0.25,
+          "total_steps": 4000,
+          "trust_expand": 1.25,
+          "trust_radius_initial": 0.1,
+          "trust_radius_max": 0.2,
+          "trust_radius_min": 0.025,
+          "trust_region_enabled": true,
+          "trust_shrink": 0.5,
+          "warmup_steps": 500
+        },
+        "deterministic": true,
+        "diagnostics": {
+          "aggregation": "percentile",
+          "aggregation_percentile": 90,
+          "mode": "residual_only",
+          "n_boundary": 256,
+          "n_interior": 1024
+        },
+        "dtype": "float32",
+        "evaluation": {
+          "checkpoint_reference_metrics_enabled": false,
+          "controller_reference_metrics_enabled": false
+        },
+        "model": {
+          "activation": "tanh",
+          "hidden_layers": [
+            96,
+            96,
+            96,
+            96,
+            96
+          ],
+          "input_dim": 2,
+          "output_dim": 3
+        },
+        "optimizer": {
+          "final_repair": {
+            "enabled": false
+          },
+          "lr": 0.001,
+          "max_grad_norm": 10.0,
+          "name": "adam",
+          "scheduler": {}
+        },
+        "patches": {
+          "nt_patches": 1,
+          "nx_patches": 4,
+          "ny_patches": 4
+        },
+        "pde": {
+          "steady": true
+        },
+        "plots": {
+          "enabled": false
+        },
+        "pressure_gauge": {
+          "weight": 0.001
+        },
+        "publication": {
+          "bootstrap_resamples": 20000,
+          "bootstrap_seed": 20261009,
+          "disabled_candidates": false,
+          "final_state_rule": "final_committed_adam_state",
+          "profile": "pure_pinn_sensitivity",
+          "progress_every": 25,
+          "protocol_id": "kovasznay_v2_pure_pinn_sensitivity_v1",
+          "representative_seeds": [
+            0
+          ],
+          "seeds": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "smoke": false
+        },
+        "sampling": {
+          "uniform": {
+            "engine": "random"
+          }
+        },
+        "test": {
+          "nx": 100,
+          "ny": 100
+        },
+        "training": {
+          "epochs_per_cycle": 500,
+          "n_boundary": 512,
+          "n_collocation": 2048,
+          "n_data": 0,
+          "pointwise_reduction": "mean",
+          "total_steps": 4000,
+          "weights": {
+            "bc": 10.0,
+            "continuity": 1.0,
+            "momentum_u": 1.0,
+            "momentum_v": 1.0,
+            "p": 0.0,
+            "u": 0.0,
+            "v": 0.0
+          }
+        },
+        "validation": {
+          "nx": 32,
+          "ny": 32
+        },
+        "weak_regions": {
+          "max_active_patches": 8,
+          "min_active_patches": 1,
+          "percentile_threshold": 80.0,
+          "persistence_cycles": 1,
+          "top_k_per_variable": 2
+        }
+      },
+      "config_hash": "ab5aa718c389b767b3b4033a1911147dfaf4b2f19e0dbd3899ef67e4e70f686c"
+    }
+  },
+  "representative_seeds": [
+    0
+  ]
+}

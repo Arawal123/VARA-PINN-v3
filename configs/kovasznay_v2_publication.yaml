@@ -1,0 +1,68 @@
+benchmark: kovasznay
+seed: 0
+deterministic: true
+device: cpu
+dtype: float32
+benchmark_params: {reynolds: 40.0, x_min: -0.5, x_max: 1.0, y_min: -0.5, y_max: 1.5}
+pde: {steady: true}
+model: {input_dim: 2, output_dim: 3, hidden_layers: [96, 96, 96, 96, 96], activation: tanh}
+optimizer: {name: adam, lr: 0.001, max_grad_norm: 10.0, scheduler: {}, final_repair: {enabled: false}}
+training:
+  total_steps: 4000
+  epochs_per_cycle: 500
+  n_collocation: 2048
+  n_boundary: 512
+  n_data: 1000
+  pointwise_reduction: mean
+  weights: {momentum_u: 1.0, momentum_v: 1.0, continuity: 1.0, bc: 10.0, u: 0.6666666666666666, v: 0.6666666666666666, p: 0.6666666666666666}
+patches: {nx_patches: 4, ny_patches: 4, nt_patches: 1}
+diagnostics: {mode: residual_only, aggregation: percentile, aggregation_percentile: 90, n_interior: 1024, n_boundary: 256}
+weak_regions: {percentile_threshold: 80.0, top_k_per_variable: 2, min_active_patches: 1, max_active_patches: 8, persistence_cycles: 1}
+sampling: {uniform: {engine: random}}
+pressure_gauge: {weight: 0.001}
+controller_v2:
+  total_steps: 4000
+  warmup_steps: 500
+  control_blocks: 7
+  block_steps: 500
+  probe_steps: 25
+  min_uniform_mass: 0.35
+  max_patch_mass: 0.25
+  multiplier_min: 0.5
+  multiplier_max: 2.0
+  max_candidates: 4
+  prefilter_damage_ratio: 0.25
+  trust_radius_initial: 0.10
+  trust_radius_min: 0.025
+  trust_radius_max: 0.20
+  trust_expand: 1.25
+  trust_shrink: 0.5
+  effectiveness_ema: 0.8
+  noise_floor: 0.0001
+  target_noise_ceiling: 0.25
+  guard_noise_ceiling: 0.10
+  reliable_reward_ratio: 0.75
+  counterfactual_probe_enabled: true
+  counterfactual_target_margin: 0.005
+  counterfactual_guard_margin: 0.02
+  gradient_prefilter_enabled: true
+  trust_region_enabled: true
+  action_memory_enabled: true
+  rollback_enabled: true
+  guard_metrics: [pde_residual_mean, continuity_residual_mean, momentum_residual_mean, boundary_condition_error, unweighted_validation_loss, unweighted_physics_validation_loss]
+evaluation: {controller_reference_metrics_enabled: false, checkpoint_reference_metrics_enabled: false}
+checkpoint: {restore_best_before_final: false}
+validation: {nx: 32, ny: 32}
+test: {nx: 100, ny: 100}
+plots: {enabled: false}
+publication:
+  protocol_id: kovasznay_v2_reference_free_v1
+  profile: prescribed_sparse_primary
+  seeds: [0, 1, 2, 3, 4]
+  representative_seeds: [0]
+  bootstrap_seed: 20261009
+  bootstrap_resamples: 20000
+  smoke: false
+  disabled_candidates: false
+  progress_every: 25
+  final_state_rule: final_committed_adam_state
