@@ -1,0 +1,22 @@
+{
+  "input_archives": {
+    "ad5": {
+      "path": "D:\\VARA-PINN original submission\\supplement_advection_diffusion_fullguard_5seed.zip",
+      "sha256": "4d86aef428651e152ed2dadb1d5d303957a72868de161a8a9328e372f064f6b6"
+    },
+    "ad15": {
+      "path": "C:\\Users\\Arawal\\Downloads\\supplement_advection_diffusion_fullguard_15seed_5to19.zip",
+      "sha256": "07986bed095e25f4f9190e9009461af447ac9e08b60293c629b9e09a3c2d5701"
+    },
+    "ac": {
+      "path": "C:\\Users\\Arawal\\Downloads\\supplement_allen_cahn_fullguard_5seed.zip",
+      "sha256": "d53c023817278aac6fa9cc98d4294bf4018e5587d5f59e5acf50674fbb6d824a"
+    }
+  },
+  "research_training_executed": false,
+  "optimizer_step_calls": 0,
+  "new_quantities_not_prior_audit_revalidation": true,
+  "torch": "2.12.0+cpu",
+  "shift_rule": "original weighted BC/IC/sparse quadratic minimizer; no dense target used to choose shift",
+  "outputs": "diagnostic only; original checkpoints and metrics unchanged"
+}
